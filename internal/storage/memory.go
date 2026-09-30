@@ -1,24 +1,35 @@
-// Package storage holds implementations of paxos.Storage. Phase 1 ships an
-// in-memory store; SQLite arrives in a later phase behind the same interface.
+// Package storage holds implementations of paxos.Storage and
+// paxos.LogStorage. For now there is only an in-memory store; SQLite arrives
+// in a later phase behind the same interfaces.
 package storage
 
-import "github.com/Shrutij516/paxos-txn-store/internal/paxos"
+import (
+	"maps"
+	"slices"
 
-// Memory is an in-memory paxos.Storage. It survives a simulated crash because
-// the simulator hands the same Memory to the restarted node, which is how a
-// disk would behave. It is not safe for concurrent use.
+	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
+)
+
+// Memory is an in-memory paxos.Storage and paxos.LogStorage. It survives a
+// simulated crash because the simulator hands the same Memory to the
+// restarted node, which is how a disk would behave. It is not safe for concurrent use.
 type Memory struct {
 	acceptor paxos.AcceptorState
 	round    uint64
+	promised paxos.Ballot
+	log      map[uint64]paxos.SlotEntry
 
 	// Saves counts successful writes, for tests.
 	Saves int
 }
 
-var _ paxos.Storage = (*Memory)(nil)
+var (
+	_ paxos.Storage    = (*Memory)(nil)
+	_ paxos.LogStorage = (*Memory)(nil)
+)
 
 // NewMemory returns an empty store.
-func NewMemory() *Memory { return &Memory{} }
+func NewMemory() *Memory { return &Memory{log: make(map[uint64]paxos.SlotEntry)} }
 
 // LoadAcceptor implements paxos.Storage.
 func (m *Memory) LoadAcceptor() (paxos.AcceptorState, error) { return m.acceptor, nil }
@@ -44,3 +55,29 @@ func (m *Memory) SaveRound(r uint64) error {
 // contents. It exists only so tests can show that losing this state breaks
 // safety.
 func (m *Memory) ForgetAcceptor() { m.acceptor = paxos.AcceptorState{} }
+
+// LoadPromised implements paxos.LogStorage.
+func (m *Memory) LoadPromised() (paxos.Ballot, error) { return m.promised, nil }
+
+// SavePromised implements paxos.LogStorage.
+func (m *Memory) SavePromised(b paxos.Ballot) error {
+	m.promised = b
+	m.Saves++
+	return nil
+}
+
+// LoadAccepted implements paxos.LogStorage.
+func (m *Memory) LoadAccepted() ([]paxos.SlotEntry, error) {
+	out := make([]paxos.SlotEntry, 0, len(m.log))
+	for _, s := range slices.Sorted(maps.Keys(m.log)) {
+		out = append(out, m.log[s])
+	}
+	return out, nil
+}
+
+// SaveAccepted implements paxos.LogStorage.
+func (m *Memory) SaveAccepted(e paxos.SlotEntry) error {
+	m.log[e.Slot] = e
+	m.Saves++
+	return nil
+}

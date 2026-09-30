@@ -39,3 +39,28 @@ func TestMemoryRoundTrip(t *testing.T) {
 		t.Fatalf("Saves = %d, want 2", m.Saves)
 	}
 }
+
+func TestMemoryLog(t *testing.T) {
+	m := NewMemory()
+	b := paxos.Ballot{Round: 2, Node: 1}
+	if err := m.SavePromised(b); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []uint64{3, 1, 2} {
+		if err := m.SaveAccepted(paxos.SlotEntry{Slot: s, Ballot: b, Entry: paxos.Entry{Seq: s}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := m.LoadPromised(); got != b {
+		t.Fatalf("LoadPromised = %v", got)
+	}
+	got, _ := m.LoadAccepted()
+	if len(got) != 3 {
+		t.Fatalf("LoadAccepted = %v", got)
+	}
+	for i, se := range got {
+		if se.Slot != uint64(i+1) || se.Entry.Seq != se.Slot {
+			t.Fatalf("LoadAccepted not sorted by slot: %v", got)
+		}
+	}
+}

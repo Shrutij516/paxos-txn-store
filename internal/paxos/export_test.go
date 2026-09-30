@@ -14,3 +14,11 @@ func (n *Node) OmitAcceptedFromPromise() { n.acceptor.omitAccepted = true }
 // DisableAcceptRule makes the acceptor accept every Accept regardless of
 // what it has promised.
 func (n *Node) DisableAcceptRule() { n.acceptor.skipAcceptRule = true }
+
+// SkipPrepareOnTakeover makes the replica start leading right after its
+// election timeout, without running Prepare.
+func (r *Replica) SkipPrepareOnTakeover() { r.skipPrepare = true }
+
+// IgnorePromisedValues makes a new leader disregard the accepted entries
+// reported in promises, as if every slot above its commit index were empty.
+func (r *Replica) IgnorePromisedValues() { r.ignorePromised = true }
