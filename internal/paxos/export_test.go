@@ -22,3 +22,10 @@ func (r *Replica) SkipPrepareOnTakeover() { r.skipPrepare = true }
 // IgnorePromisedValues makes a new leader disregard the accepted entries
 // reported in promises, as if every slot above its commit index were empty.
 func (r *Replica) IgnorePromisedValues() { r.ignorePromised = true }
+
+// TakeoverStats reports how often this replica, on becoming leader, filled
+// a gap with a no-op, re-proposed a value reported in promises, and had to
+// pick between different entries reported for the same slot.
+func (r *Replica) TakeoverStats() (noops, recovered, contested int) {
+	return r.statNoops, r.statRecovered, r.statContested
+}

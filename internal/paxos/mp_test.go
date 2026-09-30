@@ -54,7 +54,7 @@ func runMP(seed uint64, tweak func(*mpOpts)) (*mpCluster, bool) {
 // Tests 1 and 2: log safety, state machine safety (and exactly-once) over
 // 1000 random schedules. Clients must also all finish once faults stop.
 func TestMPLogAndStateMachineSafety(t *testing.T) {
-	for seed := uint64(1); seed <= mpSchedules; seed++ {
+	for seed := uint64(1); seed <= numSeeds(mpSchedules); seed++ {
 		c, ok := runMP(seed, nil)
 		if err := c.checkSafety(); err != nil {
 			t.Fatalf("seed=%d: %v", seed, err)
@@ -65,18 +65,70 @@ func TestMPLogAndStateMachineSafety(t *testing.T) {
 	}
 }
 
-// Test 3: client histories with retries are linearizable.
+// Test 3: client histories with retries are linearizable. Each schedule
+// is checked twice: once cut off at the end of the chaos phase, when many
+// operations are still outstanding (timed out, stuck behind a crashed
+// leader), and once after every client finished.
 func TestMPLinearizable(t *testing.T) {
-	for seed := uint64(1); seed <= mpSchedules; seed++ {
-		c, _ := runMP(seed, nil)
-		h := c.history()
+	for seed := uint64(1); seed <= numSeeds(mpSchedules); seed++ {
+		checkLinearizable(t, seed, nil)
+	}
+}
+
+func checkLinearizable(t *testing.T, seed uint64, tweak func(*mpOpts)) {
+	t.Helper()
+	o := randomMPOpts(rand.New(rand.NewPCG(seed, 2)))
+	if tweak != nil {
+		tweak(&o)
+	}
+	c := newMPCluster(seed, o)
+	c.run(mpChaosSteps, true)
+	cut := c.history()
+	c.calm()
+	c.runUntil(mpCalmLimit, c.clientsDone)
+	for name, h := range map[string][]porcupine.Operation{"after chaos": cut, "at end": c.history()} {
 		if len(h) == 0 {
-			t.Fatalf("seed=%d: empty history", seed)
+			t.Fatalf("seed=%d: empty history %s", seed, name)
 		}
 		if !porcupine.CheckOperations(kvModel, h) {
-			t.Fatalf("seed=%d: history of %d operations is not linearizable", seed, len(h))
+			t.Fatalf("seed=%d: history %s (%d operations) is not linearizable", seed, name, len(h))
 		}
 	}
+}
+
+// Operations with no response stay in the history with an unknown output
+// and a return time after every completed operation; they are never dropped.
+func TestMPHistoryKeepsOutstandingOperations(t *testing.T) {
+	for seed := uint64(1); seed <= 50; seed++ {
+		c := newMPCluster(seed, randomMPOpts(rand.New(rand.NewPCG(seed, 2))))
+		c.run(mpChaosSteps, true)
+		done, open := 0, 0
+		for _, cl := range c.cli {
+			done += len(cl.history)
+			if cl.waiting {
+				open++
+			}
+		}
+		h := c.history()
+		if len(h) != done+open {
+			t.Fatalf("seed=%d: history has %d ops, want %d completed + %d outstanding", seed, len(h), done, open)
+		}
+		var lastReturn int64
+		for _, op := range h {
+			if !op.Output.(kvOutput).unknown {
+				lastReturn = max(lastReturn, op.Return)
+			}
+		}
+		for _, op := range h {
+			if op.Output.(kvOutput).unknown && op.Return <= lastReturn {
+				t.Fatalf("seed=%d: outstanding op returns at %d, not after every completed op (%d)", seed, op.Return, lastReturn)
+			}
+		}
+		if open > 0 {
+			return
+		}
+	}
+	t.Fatal("no schedule left an operation outstanding; the test proves nothing")
 }
 
 // stable builds a fault-free cluster and waits for a leader that has
@@ -98,7 +150,7 @@ func stable(t *testing.T, seed uint64, o mpOpts, minCommit uint64) *mpCluster {
 func TestMPLeaderFailover(t *testing.T) {
 	const bound = 300
 	worst := 0
-	for seed := uint64(1); seed <= 200; seed++ {
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
 		c := stable(t, seed, mpOpts{N: 5, Clients: 3, OpsPerClient: 100, Keys: 2, Faults: transport.Faults{MaxDelay: 2}}, 3)
 		old := c.leader()
 		before := old.Commit()
@@ -121,7 +173,7 @@ func TestMPLeaderFailover(t *testing.T) {
 // Test 5: a crashed follower restarts and catches up to the leader's
 // committed log, including more entries than one catch-up batch.
 func TestMPCatchUp(t *testing.T) {
-	for seed := uint64(1); seed <= 100; seed++ {
+	for seed := uint64(1); seed <= numSeeds(100); seed++ {
 		c := stable(t, seed, mpOpts{N: 3, Clients: 3, OpsPerClient: 60, Keys: 2, Faults: transport.Faults{MaxDelay: 2}}, 2)
 		var lag paxos.NodeID
 		for _, id := range c.ids {
@@ -259,4 +311,58 @@ func TestMPLinearizabilityCheckerCatchesStaleRead(t *testing.T) {
 		}
 	}
 	t.Fatal("history has no completed Get")
+}
+
+// ---- Gap-heavy mode ----
+
+// gapHeavy drops most Accepts during chaos and crashes leaders a few steps
+// after they send Accepts, so new leaders regularly find gaps (filled with
+// no-ops) and partially accepted slots (recovered by highest ballot).
+func gapHeavy(o *mpOpts) {
+	o.AcceptDrop = 0.7
+	o.CrashAfterAccept = 0.03
+	o.Chaos.RestartProb = 0.1
+}
+
+func TestMPGapHeavySafety(t *testing.T) {
+	n := numSeeds(mpSchedules)
+	noopSeeds, recoveredSeeds, contestedSeeds := 0, 0, 0
+	for seed := uint64(1); seed <= n; seed++ {
+		c, ok := runMP(seed, gapHeavy)
+		if err := c.checkSafety(); err != nil {
+			t.Fatalf("seed=%d: %v", seed, err)
+		}
+		if !ok {
+			t.Fatalf("seed=%d: clients did not finish within %d calm steps", seed, mpCalmLimit)
+		}
+		noops, recovered, contested := c.takeoverStats()
+		if noops > 0 {
+			noopSeeds++
+		}
+		if recovered > 0 {
+			recoveredSeeds++
+		}
+		if contested > 0 {
+			contestedSeeds++
+		}
+	}
+	t.Logf("gap-heavy over %d seeds: no-op fill in %d, highest-ballot recovery in %d (with differing entries in %d)",
+		n, noopSeeds, recoveredSeeds, contestedSeeds)
+	if uint64(noopSeeds)*10 < n {
+		t.Fatalf("no-op path hit in only %d of %d seeds; want at least 10%%", noopSeeds, n)
+	}
+}
+
+func TestMPGapHeavyLinearizable(t *testing.T) {
+	for seed := uint64(1); seed <= numSeeds(mpSchedules); seed++ {
+		checkLinearizable(t, seed, gapHeavy)
+	}
+}
+
+func TestMPGapHeavyNegativeSkipPrepare(t *testing.T) {
+	findMPViolation(t, func(o *mpOpts) { gapHeavy(o); o.SkipPrepare = true })
+}
+
+func TestMPGapHeavyNegativeIgnorePromisedValues(t *testing.T) {
+	findMPViolation(t, func(o *mpOpts) { gapHeavy(o); o.IgnorePromised = true })
 }

@@ -30,6 +30,14 @@ type mpOpts struct {
 	Faults       transport.Faults
 	Chaos        chaos
 
+	// Gap-heavy mode: during chaos, each LogAccept is dropped with
+	// probability AcceptDrop, and each LogAccept a replica sends schedules a
+	// crash of that replica 1 to 3 steps later with probability
+	// CrashAfterAccept. This strands slots between leaders so takeovers must
+	// fill gaps and recover partially accepted slots.
+	AcceptDrop       float64
+	CrashAfterAccept float64
+
 	// Broken modes for the negative tests.
 	SkipPrepare    bool
 	IgnorePromised bool
@@ -86,6 +94,37 @@ type mpCluster struct {
 	chosenAt  map[uint64]paxos.Entry
 	violation error
 	h         hash.Hash
+
+	allReps   []*paxos.Replica // every incarnation ever
+	gapActive bool
+	crashIn   map[paxos.NodeID]int // steps until a scheduled crash
+}
+
+// gapNet is the transport replicas use. Outside gap-heavy mode it passes
+// every message straight to the SimNet.
+type gapNet struct{ c *mpCluster }
+
+func (g gapNet) Send(m paxos.Message) {
+	c := g.c
+	if _, ok := m.Body.(paxos.LogAccept); ok && c.gapActive {
+		if _, pending := c.crashIn[m.From]; !pending && c.rng.Float64() < c.opts.CrashAfterAccept {
+			c.crashIn[m.From] = 1 + c.rng.IntN(3)
+		}
+		if c.rng.Float64() < c.opts.AcceptDrop {
+			c.trace(fmt.Sprintf("t=%d gapdrop %v", c.net.Now(), m))
+			return
+		}
+	}
+	c.net.Send(m)
+}
+
+// takeoverStats sums TakeoverStats over every replica incarnation.
+func (c *mpCluster) takeoverStats() (noops, recovered, contested int) {
+	for _, r := range c.allReps {
+		n, rc, ct := r.TakeoverStats()
+		noops, recovered, contested = noops+n, recovered+rc, contested+ct
+	}
+	return
 }
 
 func newMPCluster(seed uint64, o mpOpts) *mpCluster {
@@ -100,6 +139,8 @@ func newMPCluster(seed uint64, o mpOpts) *mpCluster {
 		oracle:    map[oracleKey]map[paxos.NodeID]bool{},
 		chosenAt:  map[uint64]paxos.Entry{},
 		h:         sha256.New(),
+		crashIn:   map[paxos.NodeID]int{},
+		gapActive: o.AcceptDrop > 0 || o.CrashAfterAccept > 0,
 	}
 	c.net.SetFaults(o.Faults)
 	c.net.Trace = c.trace
@@ -144,7 +185,7 @@ func (c *mpCluster) start(id paxos.NodeID) {
 	r, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: c.ids, StateMachine: sm,
 		Rand: rand.New(rand.NewPCG(c.rng.Uint64(), uint64(id))),
-	}, c.store[id], c.net)
+	}, c.store[id], gapNet{c})
 	if err != nil {
 		panic(err)
 	}
@@ -155,6 +196,7 @@ func (c *mpCluster) start(id paxos.NodeID) {
 		r.IgnorePromisedValues()
 	}
 	c.reps[id] = r
+	c.allReps = append(c.allReps, r)
 	c.net.Register(id, r.Handle)
 }
 
@@ -259,6 +301,16 @@ func (c *mpCluster) step(withChaos bool) {
 	if withChaos {
 		c.injectChaos()
 	}
+	for _, id := range c.ids {
+		if n, ok := c.crashIn[id]; ok {
+			if n <= 1 {
+				delete(c.crashIn, id)
+				c.crash(id)
+			} else {
+				c.crashIn[id] = n - 1
+			}
+		}
+	}
 	c.net.Step()
 	for _, id := range c.ids {
 		if r := c.reps[id]; r != nil {
@@ -278,6 +330,8 @@ func (c *mpCluster) run(steps int, withChaos bool) {
 
 // calm stops all faults, heals partitions and restarts every crashed node.
 func (c *mpCluster) calm() {
+	c.gapActive = false
+	clear(c.crashIn)
 	c.net.SetFaults(transport.Faults{MaxDelay: 2})
 	c.net.Heal()
 	for _, id := range c.ids {

@@ -62,6 +62,11 @@ type Replica struct {
 	// Test-only switches, set from export_test.go.
 	skipPrepare    bool
 	ignorePromised bool
+
+	// Takeover counters, read only by tests through export_test.go.
+	statNoops     int // gaps filled with a no-op
+	statRecovered int // slots re-proposed from a value reported in promises
+	statContested int // of those, slots where promises reported different entries
 }
 
 // NewReplica builds a replica and restores acceptor state from store.
@@ -257,10 +262,15 @@ func (r *Replica) onPromise(from NodeID, m LogPromise) {
 // slot, and fills slots nobody reported with no-ops.
 func (r *Replica) becomeLeader() {
 	best := make(map[uint64]SlotEntry)
+	contested := make(map[uint64]bool)
 	if !r.ignorePromised {
 		for _, id := range r.peers {
 			for _, se := range r.promises[id].Entries {
-				if cur, ok := best[se.Slot]; !ok || cur.Ballot.Less(se.Ballot) {
+				cur, ok := best[se.Slot]
+				if ok && cur.Entry != se.Entry {
+					contested[se.Slot] = true
+				}
+				if !ok || cur.Ballot.Less(se.Ballot) {
 					best[se.Slot] = se
 				}
 			}
@@ -281,9 +291,15 @@ func (r *Replica) becomeLeader() {
 	for s := r.commit + 1; s <= top; s++ {
 		e, ok := r.chosen[s]
 		if !ok {
-			e = Entry{Noop: true}
 			if se, found := best[s]; found {
 				e = se.Entry
+				r.statRecovered++
+				if contested[s] {
+					r.statContested++
+				}
+			} else {
+				e = Entry{Noop: true}
+				r.statNoops++
 			}
 		}
 		r.propose(s, e)

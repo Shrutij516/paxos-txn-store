@@ -2,9 +2,14 @@ GO ?= go
 COVER_PKG := ./internal/paxos
 COVER_MIN := 85
 
-.PHONY: test lint race cover
+.PHONY: test test-full lint race cover
 
+# Quick local run: seeded suites use 100 seeds instead of 1000.
 test:
+	$(GO) test -short ./...
+
+# Same seed counts as CI.
+test-full:
 	$(GO) test ./...
 
 lint:

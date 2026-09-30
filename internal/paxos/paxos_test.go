@@ -8,6 +8,16 @@ import (
 	"github.com/Shrutij516/paxos-txn-store/internal/transport"
 )
 
+// numSeeds returns n, or 100 under "go test -short" so local runs stay fast.
+// CI runs without -short and gets the full count. Negative tests keep their
+// full budget either way: they stop at the first violation.
+func numSeeds(n uint64) uint64 {
+	if testing.Short() {
+		return min(n, 100)
+	}
+	return n
+}
+
 const (
 	schedules    = 1000
 	chaosSteps   = 400
@@ -27,7 +37,7 @@ func runSchedule(seed uint64) (*cluster, []paxos.NodeID, bool) {
 
 // Test 1 (agreement) and test 2 (validity) over 1000 random schedules.
 func TestAgreementAndValidityRandomSchedules(t *testing.T) {
-	for seed := uint64(1); seed <= schedules; seed++ {
+	for seed := uint64(1); seed <= numSeeds(schedules); seed++ {
 		c, _, _ := runSchedule(seed)
 		if err := c.checkSafety(); err != nil {
 			t.Fatalf("seed=%d: %v", seed, err)
@@ -37,7 +47,7 @@ func TestAgreementAndValidityRandomSchedules(t *testing.T) {
 
 // Test 2 (validity) on its own: every decision is some node's proposal.
 func TestValidity(t *testing.T) {
-	for seed := uint64(1); seed <= 200; seed++ {
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
 		c, live, ok := runSchedule(seed)
 		if !ok {
 			t.Fatalf("seed=%d: not decided", seed)
@@ -53,7 +63,7 @@ func TestValidity(t *testing.T) {
 // live node decides within the fixed step budget.
 func TestLivenessAfterFaultsStop(t *testing.T) {
 	worst := 0
-	for seed := uint64(1); seed <= schedules; seed++ {
+	for seed := uint64(1); seed <= numSeeds(schedules); seed++ {
 		opts := randomOpts(rand.New(rand.NewPCG(seed, 1)))
 		c := newCluster(seed, opts)
 		c.run(chaosSteps)
@@ -69,7 +79,7 @@ func TestLivenessAfterFaultsStop(t *testing.T) {
 
 // Test 4: every node proposes a different value at the same instant.
 func TestCompetingProposers(t *testing.T) {
-	for seed := uint64(1); seed <= 300; seed++ {
+	for seed := uint64(1); seed <= numSeeds(300); seed++ {
 		n := 3 + 2*int(seed%2)
 		c := newCluster(seed, clusterOpts{
 			N:         n,

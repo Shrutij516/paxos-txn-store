@@ -64,6 +64,11 @@ func NewWithoutDedup() *Store {
 // the current value ("" if absent). A retry of the client's latest request
 // returns the cached result without executing again; an older request than
 // the latest is ignored, since the client has already moved on.
+//
+// Dedup assumes each client has at most one request outstanding and uses
+// increasing sequence numbers. The table keeps only the latest (seq, result)
+// per client, so a client that pipelined requests could have an earlier one
+// silently skipped when a later one is applied first.
 func (s *Store) Apply(_ uint64, e paxos.Entry) paxos.Value {
 	if e.Noop {
 		return ""
