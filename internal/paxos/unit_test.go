@@ -349,3 +349,19 @@ func TestMessageString(t *testing.T) {
 		t.Fatalf("String = %q", s)
 	}
 }
+
+// The learner needs a majority of Accepted for the same ballot. Votes for
+// the same value spread over different ballots must not add up.
+func TestLearnerCountsPerBallotNotPerValue(t *testing.T) {
+	tr := &outbox{}
+	n := newTestNode(t, 1, storage.NewMemory(), tr)
+	drive(n, tr, paxos.Message{From: 2, To: 1, Body: paxos.Accepted{Ballot: b(1, 2), Value: "v"}})
+	drive(n, tr, paxos.Message{From: 3, To: 1, Body: paxos.Accepted{Ballot: b(2, 3), Value: "v"}})
+	if v, ok := n.Decided(); ok {
+		t.Fatalf("decided %q from votes in two different ballots", v)
+	}
+	drive(n, tr, paxos.Message{From: 1, To: 1, Body: paxos.Accepted{Ballot: b(2, 3), Value: "v"}})
+	if v, ok := n.Decided(); !ok || v != "v" {
+		t.Fatalf("majority in ballot (2,3) not decided: %q, %v", v, ok)
+	}
+}

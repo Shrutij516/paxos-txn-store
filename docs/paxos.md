@@ -6,7 +6,7 @@ This note explains, in plain language, how the acceptor in `internal/paxos` keep
 
 - **Proposer** wants a value chosen. It picks a ballot, runs two phases, and retries with a higher ballot if it is rejected or hears nothing.
 - **Acceptor** votes. It is the only role with state that matters for safety, and it writes that state to storage before it answers anyone.
-- **Learner** watches `Accepted` messages and decides a value once a majority of acceptors accepted it in the same ballot.
+- **Learner** watches `Accepted` messages and decides a value once a majority of acceptors accepted it in the same ballot. Votes for the same value in different ballots never add up (`TestLearnerCountsPerBallotNotPerValue`).
 
 Every node runs all three. Nodes only talk through a `Transport`, which may lose, delay, duplicate or reorder messages.
 
@@ -44,15 +44,16 @@ Liveness is not guaranteed by these rules (two proposers can keep preempting eac
 
 ## What breaks without each rule
 
-The tests live in `internal/paxos/paxos_test.go`. Each negative test runs seeded random schedules with a deliberately broken acceptor and **passes only if the safety checker catches a violation**. If the checker ever stopped catching these, the negative tests would fail, which tells us the positive tests had become vacuous.
+The tests live in `internal/paxos/paxos_test.go`. The seed counts come from running each broken mode over seeds 1 to 1000; the tests themselves stop at the first violation. Each negative test runs seeded random schedules with a deliberately broken acceptor and **passes only if the safety checker catches a violation**. If the checker ever stopped catching these, the negative tests would fail, which tells us the positive tests had become vacuous.
 
 | Removed | What goes wrong | Test |
 |---|---|---|
-| Promise rule | The acceptor promises anything, remembers nothing, and does not report what it accepted. A new proposer can collect a "clean" majority even though `v` was already chosen, then propose its own value, which also gets chosen. | `TestNegativeNoPromiseRule` |
-| Accept rule | The acceptor accepts from any ballot, even one lower than it promised. A slow proposer with an old ballot can get a different value accepted by a majority after a newer ballot already chose `v`. | `TestNegativeNoAcceptRule` |
-| Durable state | The acceptor loses its promises and votes on restart. After `v` is chosen by acceptors A and B, B restarts empty, and a new proposer that hears from B and C sees no accepted value, so it gets a second value chosen. | `TestNegativeForgetfulAcceptor` |
+| Promise rule, part 1: refuse lower ballots | The acceptor promises, and records, a ballot lower than the one it already promised. A delayed `Prepare` from an old proposer drags `promised` back down, so that proposer's stale `Accept` is now allowed through and a second value can be chosen in the old ballot after `v` was chosen in a newer one. | `TestNegativePromiseLowerBallot` (196 of 1000 seeds violate) |
+| Promise rule, part 2: report what was accepted | The acceptor promises correctly but leaves its accepted proposal out of the reply. A new proposer collects a majority that looks "clean" even though `v` was already chosen, proposes its own value, and that also gets chosen. | `TestNegativeOmitAcceptedFromPromise` (989 of 1000 seeds violate) |
+| Accept rule | The acceptor accepts from any ballot, even one lower than it promised. A slow proposer with an old ballot can get a different value accepted by a majority after a newer ballot already chose `v`. | `TestNegativeNoAcceptRule` (440 of 1000 seeds violate) |
+| Durable state | The acceptor loses its promises and votes on restart. After `v` is chosen by acceptors A and B, B restarts empty, and a new proposer that hears from B and C sees no accepted value, so it gets a second value chosen. | `TestNegativeForgetfulAcceptor` (965 of 1000 seeds violate) |
 
-In the tests, the two rules are switched off through hooks in `internal/paxos/export_test.go`, which is compiled only under `go test`, so a real binary cannot run with a broken acceptor.
+In the tests, the rules are switched off through hooks in `internal/paxos/export_test.go`, which is compiled only under `go test`, so a real binary cannot run with a broken acceptor.
 
 ## How the safety checker decides
 

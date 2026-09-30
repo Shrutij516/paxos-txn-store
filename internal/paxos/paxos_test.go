@@ -143,10 +143,19 @@ func TestNegativeForgetfulAcceptor(t *testing.T) {
 	})
 }
 
-// Test 6b: without the promise rule, agreement fails.
-func TestNegativeNoPromiseRule(t *testing.T) {
+// Test 6b, promise rule part 1: promising a ballot lower than the current
+// promise breaks agreement.
+func TestNegativePromiseLowerBallot(t *testing.T) {
 	findViolation(t, func(seed uint64) *cluster {
-		return brokenRun(seed, clusterOpts{NoPromiseRule: true})
+		return brokenRun(seed, clusterOpts{PromiseLower: true})
+	})
+}
+
+// Test 6b, promise rule part 2: hiding the previously accepted value in the
+// Promise reply breaks agreement.
+func TestNegativeOmitAcceptedFromPromise(t *testing.T) {
+	findViolation(t, func(seed uint64) *cluster {
+		return brokenRun(seed, clusterOpts{OmitAccepted: true})
 	})
 }
 

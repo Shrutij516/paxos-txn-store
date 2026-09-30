@@ -28,7 +28,8 @@ type clusterOpts struct {
 
 	// Broken modes for the negative tests.
 	ForgetOnRestart    bool
-	NoPromiseRule      bool
+	PromiseLower       bool
+	OmitAccepted       bool
 	NoAcceptRule       bool
 	ReproposeOnRestart bool
 }
@@ -127,8 +128,11 @@ func (c *cluster) start(id paxos.NodeID) {
 	if err != nil {
 		panic(err)
 	}
-	if c.opts.NoPromiseRule {
-		n.DisablePromiseRule()
+	if c.opts.PromiseLower {
+		n.PromiseLowerBallots()
+	}
+	if c.opts.OmitAccepted {
+		n.OmitAcceptedFromPromise()
 	}
 	if c.opts.NoAcceptRule {
 		n.DisableAcceptRule()

@@ -19,8 +19,9 @@ type Acceptor struct {
 
 	// Test-only switches that break the rules on purpose. They are set only
 	// from export_test.go so the negative tests can prove the checker works.
-	skipPromiseRule bool
-	skipAcceptRule  bool
+	promiseLower   bool // promise (and record) ballots below the current promise
+	omitAccepted   bool // leave the accepted proposal out of Promise replies
+	skipAcceptRule bool
 }
 
 func newAcceptor(id NodeID, peers []NodeID, store Storage, tr Transport) (*Acceptor, error) {
@@ -35,13 +36,7 @@ func newAcceptor(id NodeID, peers []NodeID, store Storage, tr Transport) (*Accep
 func (a *Acceptor) State() AcceptorState { return a.state }
 
 func (a *Acceptor) handlePrepare(from NodeID, m Prepare) {
-	if a.skipPromiseRule {
-		// Broken on purpose: promise anything, remember nothing, and hide
-		// what was accepted before.
-		a.tr.Send(Message{From: a.id, To: from, Body: Promise{Ballot: m.Ballot}})
-		return
-	}
-	if m.Ballot.Less(a.state.Promised) {
+	if !a.promiseLower && m.Ballot.Less(a.state.Promised) {
 		a.tr.Send(Message{From: a.id, To: from, Body: Nack{Ballot: m.Ballot, Promised: a.state.Promised}})
 		return
 	}
@@ -50,11 +45,11 @@ func (a *Acceptor) handlePrepare(from NodeID, m Prepare) {
 	if !a.persist(next) {
 		return
 	}
-	a.tr.Send(Message{From: a.id, To: from, Body: Promise{
-		Ballot:   m.Ballot,
-		Accepted: a.state.Accepted,
-		Value:    a.state.Value,
-	}})
+	reply := Promise{Ballot: m.Ballot, Accepted: a.state.Accepted, Value: a.state.Value}
+	if a.omitAccepted {
+		reply = Promise{Ballot: m.Ballot}
+	}
+	a.tr.Send(Message{From: a.id, To: from, Body: reply})
 }
 
 func (a *Acceptor) handleAccept(from NodeID, m Accept) {
