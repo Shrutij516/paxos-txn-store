@@ -8,8 +8,11 @@ on:
 permissions:
   contents: read
 
+# Three jobs run in parallel. The race detector slows the seeded simulation
+# suites about 9x, so it runs on the short seed counts, while the full 1000
+# seed suites run once without -race and also feed the coverage gate.
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +29,26 @@ jobs:
         with:
           version: v2.5.0
 
-      - name: go test -race
-        run: go test -race ./...
+  race-short:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: coverage gate (internal/paxos >= 85%)
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go test -race -short
+        run: go test -race -short ./...
+
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go test (1000 seeds) and coverage gate (internal/paxos >= 85%)
         run: make cover

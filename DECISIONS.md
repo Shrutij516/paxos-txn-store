@@ -64,3 +64,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **Why:** Keeps Phase 2 focused on the replication protocol. Snapshots interact with catch-up, restart, and the dedup table (which must be part of the snapshot), and are easier to add once the storage layer (SQLite) exists.
 - **Rejected:** Snapshotting now (more code and more states to test before the core is proven); truncating the log without snapshots (a lagging replica could never catch up).
 - **Tradeoff:** Memory and storage grow without bound, and a restarted replica replays the whole history. Fine for tests; must be fixed before long-running deployments.
+
+## 10. CI runs the race detector on short seed counts and the full seeds without it
+
+- **What / Why:** The race detector made the 1000-seed suites about 9x slower (about 160 s versus 17 s for internal/paxos) even though the simulator is single-threaded, so CI runs `go test -race -short` (100 seeds) and the full 1000 seeds without `-race` as parallel jobs, keeping both race coverage of all code paths and the full seed sweep at a fraction of the wall time.
