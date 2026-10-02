@@ -66,21 +66,13 @@ const (
 	SyncNormal Sync = "NORMAL"
 )
 
-// FaultPoint names where a fault hook runs inside a write transaction.
-type FaultPoint int
+// faultPoint names where a fault hook runs inside a write transaction.
+type faultPoint int
 
-// Fault points.
 const (
-	BeforeCommit FaultPoint = iota // all statements executed, not yet committed
-	AfterCommit                    // committed and durable, caller not yet told
+	beforeCommit faultPoint = iota // all statements executed, not yet committed
+	afterCommit                    // committed and durable, caller not yet told
 )
-
-func (p FaultPoint) String() string {
-	if p == BeforeCommit {
-		return "before-commit"
-	}
-	return "after-commit"
-}
 
 // SQLite is a durable paxos.Storage and paxos.LogStorage backed by one
 // SQLite file in WAL mode with synchronous=FULL. Every Save or Append is one
@@ -90,11 +82,11 @@ type SQLite struct {
 	db   *sql.DB
 	path string
 
-	// fault, if set, runs at each FaultPoint of every write. An error at
-	// BeforeCommit rolls the transaction back; at AfterCommit the write
-	// stays durable but the error is still returned. Tests use it to crash
-	// a node at exact points.
-	fault func(FaultPoint) error
+	// fault, if set, runs at each faultPoint of every write. An error at
+	// beforeCommit rolls the transaction back; at afterCommit the write
+	// stays durable but the error is still returned. It is unexported and
+	// only set by this package's tests.
+	fault func(faultPoint) error
 }
 
 var (
@@ -130,10 +122,6 @@ func (s *SQLite) Close() error { return s.db.Close() }
 
 // Path returns the database file path.
 func (s *SQLite) Path() string { return s.path }
-
-// SetFaultHook installs a hook that runs at each FaultPoint of every write.
-// It is meant for crash tests only.
-func (s *SQLite) SetFaultHook(f func(FaultPoint) error) { s.fault = f }
 
 // Pragma returns the current value of a pragma, for tests and diagnostics.
 func (s *SQLite) Pragma(name string) (string, error) {
@@ -196,7 +184,7 @@ func (s *SQLite) write(fn func(*sql.Tx) error) error {
 		return err
 	}
 	if s.fault != nil {
-		if err := s.fault(BeforeCommit); err != nil {
+		if err := s.fault(beforeCommit); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -205,7 +193,7 @@ func (s *SQLite) write(fn func(*sql.Tx) error) error {
 		return err
 	}
 	if s.fault != nil {
-		return s.fault(AfterCommit)
+		return s.fault(afterCommit)
 	}
 	return nil
 }
@@ -274,11 +262,13 @@ func (s *SQLite) LoadPromised() (paxos.Ballot, error) {
 
 // SavePromised implements paxos.LogStorage.
 func (s *SQLite) SavePromised(b paxos.Ballot) error {
-	return s.write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(`INSERT INTO log_promise (id, round, node) VALUES (1, ?, ?)
-			ON CONFLICT (id) DO UPDATE SET round = excluded.round, node = excluded.node`, b.Round, int32(b.Node))
-		return err
-	})
+	return s.write(func(tx *sql.Tx) error { return upsertPromise(tx, b) })
+}
+
+func upsertPromise(tx *sql.Tx, b paxos.Ballot) error {
+	_, err := tx.Exec(`INSERT INTO log_promise (id, round, node) VALUES (1, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET round = excluded.round, node = excluded.node`, b.Round, int32(b.Node))
+	return err
 }
 
 // LoadAccepted implements paxos.LogStorage.
@@ -303,9 +293,13 @@ func (s *SQLite) LoadAccepted() ([]paxos.SlotEntry, error) {
 	return out, rows.Err()
 }
 
-// SaveAccepted implements paxos.LogStorage.
-func (s *SQLite) SaveAccepted(se paxos.SlotEntry) error {
+// SaveAccept implements paxos.LogStorage. The promise and the accepted
+// entry are written in one transaction.
+func (s *SQLite) SaveAccept(promised paxos.Ballot, se paxos.SlotEntry) error {
 	return s.write(func(tx *sql.Tx) error {
+		if err := upsertPromise(tx, promised); err != nil {
+			return err
+		}
 		_, err := tx.Exec(`INSERT INTO log_accepted (slot, ballot_round, ballot_node, noop, client_id, seq, cmd)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (slot) DO UPDATE SET ballot_round = excluded.ballot_round,

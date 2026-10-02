@@ -31,8 +31,8 @@ Every row below is written in its own transaction, and the node sends the matchi
 | Event | Written | Then the node may |
 |---|---|---|
 | Proposer starts an election or a new ballot | `proposer.round` | send Prepare with that ballot |
-| Acceptor promises a higher ballot (Prepare, Accept or Heartbeat) | `log_promise` | send Promise, or carry on with the Accept |
-| Acceptor accepts an entry | `log_accepted` row for the slot | send Accepted |
+| Acceptor promises a higher ballot on Prepare or Heartbeat | `log_promise` | send Promise, or follow the new leader |
+| Acceptor accepts an entry | `log_accepted` row for the slot, and `log_promise` if the Accept raises the promise, in one transaction | send Accepted |
 | Slots become committed (contiguous prefix extends) | new `log_committed` rows and `log_commit`, in one transaction | apply them to the KV store and reply to clients |
 | Single-decree acceptor changes state | `acceptor` | send Promise or Accepted |
 
@@ -56,7 +56,8 @@ If a node replies first and crashes before the write reaches disk, it comes back
 
 The tests show both sides:
 
-- `TestSQLiteCrashPoints` crashes nodes right before a transaction commits (the write rolls back and nothing was sent) and right after it commits but before the reply goes out (the state is durable and the reply is lost, which looks like a dropped message). Both stay safe over 100 seeds each, with about 200 injected crashes per mode.
+- `TestSQLiteCrashPoints` crashes nodes right before a write commits (nothing is written and nothing was sent) and right after it commits but before the reply goes out (the state is durable and the reply is lost, which looks like a dropped message). Both stay safe over 100 seeds each, with about 200 injected crashes per mode. In the cluster tests these crashes are injected by a storage wrapper in the test harness (`crashStore`); inside the SQLite store an unexported hook, set only by the storage package's own tests, checks that a fault before commit really rolls the transaction back.
+- `TestSQLiteSurvivesSIGKILL` crashes a real process. The test binary re-executes itself as a child that writes in a loop (an accept with its promise, then a committed entry with the commit index) and prints each index only after both writes returned. The parent kills it with SIGKILL at a random point, reopens the file, runs `PRAGMA integrity_check`, and checks that every confirmed index is on disk. It runs 20 times in the full suite and 3 times under `-short`.
 - `TestSQLiteNegativeReplyBeforePersist` makes acceptors send Promise and Accepted before writing, with crashes before commit. The checker catches it: 28 of 100 seeds violate log safety, while the same schedules without the bug have 0 violations.
 - The `synchronous` setting matters for the same reason. With NORMAL in WAL mode a commit can be lost on power loss after the reply was sent, which is the same failure in a different place. The simulator cannot cut power, so this is argued in DECISIONS.md entry 12 rather than tested.
 
@@ -66,7 +67,7 @@ The tests show both sides:
 
 | Write | synchronous=FULL | synchronous=NORMAL |
 |---|---|---|
-| Promise (`SavePromised`) | about 0.28 ms | about 0.017 ms |
-| Accepted entry (`SaveAccepted`) | about 0.30 ms | about 0.024 ms |
+| Promise (`SavePromised`) | about 0.33 to 0.42 ms | about 0.038 ms |
+| Accept, raising the promise, one transaction (`SaveAccept`) | about 0.28 to 0.32 ms | about 0.065 to 0.072 ms |
 
-Numbers depend heavily on the disk; they are shown here only to make the cost of FULL visible.
+Ranges come from three runs of 1000 writes each. Numbers depend heavily on the disk; they are shown here only to make the cost of FULL visible.

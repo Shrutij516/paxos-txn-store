@@ -360,20 +360,24 @@ func (r *Replica) onAccept(from NodeID, m LogAccept) {
 	if r.replyFirst {
 		r.send(from, LogAccepted(m)) // broken on purpose: vote leaves before it is durable
 	}
-	if !r.savePromised(m.Ballot) {
-		return
+	// Raising the promise and recording the entry are one durable write, so
+	// a crash leaves either neither or both.
+	promised := r.promised
+	if promised.Less(m.Ballot) {
+		promised = m.Ballot
+	}
+	se := SlotEntry{Slot: m.Slot, Ballot: m.Ballot, Entry: m.Entry}
+	if promised != r.promised || r.accepted[m.Slot] != se {
+		if err := r.store.SaveAccept(promised, se); err != nil {
+			return
+		}
+		r.promised = promised
+		r.accepted[m.Slot] = se
 	}
 	if from != r.id {
 		r.yield(m.Ballot)
 		r.leader = from
 		r.resetElectionTimer()
-	}
-	se := SlotEntry{Slot: m.Slot, Ballot: m.Ballot, Entry: m.Entry}
-	if r.accepted[m.Slot] != se {
-		if err := r.store.SaveAccepted(se); err != nil {
-			return
-		}
-		r.accepted[m.Slot] = se
 	}
 	if !r.replyFirst {
 		r.send(from, LogAccepted(m))

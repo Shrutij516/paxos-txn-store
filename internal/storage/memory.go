@@ -78,8 +78,9 @@ func (m *Memory) LoadAccepted() ([]paxos.SlotEntry, error) {
 	return out, nil
 }
 
-// SaveAccepted implements paxos.LogStorage.
-func (m *Memory) SaveAccepted(e paxos.SlotEntry) error {
+// SaveAccept implements paxos.LogStorage.
+func (m *Memory) SaveAccept(promised paxos.Ballot, e paxos.SlotEntry) error {
+	m.promised = promised
 	m.log[e.Slot] = e
 	m.Saves++
 	return nil

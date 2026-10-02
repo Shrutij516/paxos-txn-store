@@ -126,7 +126,7 @@ func TestStorageContract(t *testing.T) {
 				}
 				for _, se := range []paxos.SlotEntry{entry(3, b(1, 1), "c"), entry(1, b(1, 1), "a"), entry(3, b(2, 3), "c2"),
 					{Slot: 2, Ballot: b(2, 3), Entry: paxos.Entry{Noop: true}}} {
-					if err := s.SaveAccepted(se); err != nil {
+					if err := s.SaveAccept(b(2, 3), se); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -164,8 +164,8 @@ func TestStorageContract(t *testing.T) {
 				_ = s.SaveAcceptor(paxos.AcceptorState{Promised: b(8, 1), Accepted: b(7, 2), Value: "x"})
 				_ = s.SaveRound(12)
 				_ = s.SavePromised(b(11, 3))
-				_ = s.SaveAccepted(entry(1, b(11, 3), "a"))
-				_ = s.SaveAccepted(entry(2, b(10, 2), "b"))
+				_ = s.SaveAccept(b(11, 3), entry(1, b(11, 3), "a"))
+				_ = s.SaveAccept(b(11, 3), entry(2, b(10, 2), "b"))
 				_ = s.AppendCommitted([]paxos.SlotEntry{{Slot: 1, Entry: entry(1, b(11, 3), "a").Entry}})
 				before := snap(t, s)
 				after := snap(t, reopen())
@@ -246,12 +246,12 @@ func TestSQLiteFaultHook(t *testing.T) {
 	_ = s.SavePromised(b(1, 1))
 
 	// Before commit: the write is rolled back.
-	s.SetFaultHook(func(p FaultPoint) error {
-		if p == BeforeCommit {
+	s.fault = func(p faultPoint) error {
+		if p == beforeCommit {
 			return errCrash
 		}
 		return nil
-	})
+	}
 	if err := s.SavePromised(b(2, 2)); !errors.Is(err, errCrash) {
 		t.Fatalf("want crash error, got %v", err)
 	}
@@ -266,16 +266,16 @@ func TestSQLiteFaultHook(t *testing.T) {
 	}
 
 	// After commit: durable even though the caller sees an error.
-	s.SetFaultHook(func(p FaultPoint) error {
-		if p == AfterCommit {
+	s.fault = func(p faultPoint) error {
+		if p == afterCommit {
 			return errCrash
 		}
 		return nil
-	})
+	}
 	if err := s.SavePromised(b(3, 3)); !errors.Is(err, errCrash) {
 		t.Fatalf("want crash error, got %v", err)
 	}
-	s.SetFaultHook(nil)
+	s.fault = nil
 	_ = s.Close()
 	r, err := OpenSQLite(path)
 	if err != nil {
@@ -340,16 +340,12 @@ func BenchmarkPersistAccept(bm *testing.B) {
 			e := paxos.Entry{ClientID: 1, Seq: 1, Cmd: "P\x00key\x00value-of-moderate-length"}
 			bm.ResetTimer()
 			for i := 0; i < bm.N; i++ {
-				if err := s.SaveAccepted(paxos.SlotEntry{Slot: uint64(i + 1), Ballot: paxos.Ballot{Round: 1, Node: 1}, Entry: e}); err != nil {
+				// A fresh ballot each time, so every write raises the promise too.
+				bal := paxos.Ballot{Round: uint64(i + 1), Node: 1}
+				if err := s.SaveAccept(bal, paxos.SlotEntry{Slot: uint64(i + 1), Ballot: bal, Entry: e}); err != nil {
 					bm.Fatal(err)
 				}
 			}
 		})
-	}
-}
-
-func TestFaultPointString(t *testing.T) {
-	if BeforeCommit.String() != "before-commit" || AfterCommit.String() != "after-commit" {
-		t.Fatal("FaultPoint names changed")
 	}
 }

@@ -42,11 +42,11 @@ func (f *flakyLog) SavePromised(b paxos.Ballot) error {
 	return f.Memory.SavePromised(b)
 }
 
-func (f *flakyLog) SaveAccepted(e paxos.SlotEntry) error {
+func (f *flakyLog) SaveAccept(p paxos.Ballot, e paxos.SlotEntry) error {
 	if f.failAccepted {
 		return errDisk
 	}
-	return f.Memory.SaveAccepted(e)
+	return f.Memory.SaveAccept(p, e)
 }
 
 func (f *flakyLog) SaveRound(r uint64) error {

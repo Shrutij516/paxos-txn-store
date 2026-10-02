@@ -45,9 +45,9 @@ type mpOpts struct {
 	// file and recovers from it.
 	Dir string
 	// With Dir set, during chaos each storage write crashes its node with
-	// probability CrashBeforeCommit just before the transaction commits (the
-	// write is rolled back), or with probability CrashAfterCommit just after
-	// it commits but before the node can reply.
+	// probability CrashBeforeCommit before the write commits (nothing is
+	// written), or with probability CrashAfterCommit right after it commits
+	// but before the node can reply. See crashStore.
 	CrashBeforeCommit float64
 	CrashAfterCommit  float64
 
@@ -296,27 +296,63 @@ func (c *mpCluster) openStore(id paxos.NodeID) paxos.LogStorage {
 		panic(err)
 	}
 	h := &dbHandle{db: db}
-	db.SetFaultHook(func(p storage.FaultPoint) error {
-		if h.dead {
-			return errCrash // a crashed process writes nothing more
-		}
-		if !c.dbFaults {
-			return nil
-		}
-		prob := c.opts.CrashBeforeCommit
-		if p == storage.AfterCommit {
-			prob = c.opts.CrashAfterCommit
-		}
-		if prob > 0 && c.rng.Float64() < prob {
-			c.dbCrashes[p]++
-			c.trace(fmt.Sprintf("t=%d crash %d at %v", c.net.Now(), id, p))
-			c.crash(id)
-			return errCrash
-		}
-		return nil
-	})
 	c.dbs[id] = h
-	return db
+	return &crashStore{LogStorage: db, c: c, id: id, h: h}
+}
+
+// crashStore wraps a node's SQLite store and injects crashes around every
+// write: before it commits (nothing is written, as if the transaction were
+// rolled back) or right after it commits but before the caller can reply.
+// Once its node has crashed it refuses every write, as a dead process would.
+type crashStore struct {
+	paxos.LogStorage
+	c  *mpCluster
+	id paxos.NodeID
+	h  *dbHandle
+}
+
+func (s *crashStore) maybeCrash(prob float64, where string) bool {
+	c := s.c
+	if !c.dbFaults || prob == 0 || c.rng.Float64() >= prob {
+		return false
+	}
+	if where == "before-commit" {
+		c.dbCrashes[0]++
+	} else {
+		c.dbCrashes[1]++
+	}
+	c.trace(fmt.Sprintf("t=%d crash %d %s", c.net.Now(), s.id, where))
+	c.crash(s.id)
+	return true
+}
+
+func (s *crashStore) write(f func() error) error {
+	if s.h.dead || s.maybeCrash(s.c.opts.CrashBeforeCommit, "before-commit") {
+		return errCrash
+	}
+	if err := f(); err != nil {
+		return err
+	}
+	if s.maybeCrash(s.c.opts.CrashAfterCommit, "after-commit") {
+		return errCrash
+	}
+	return nil
+}
+
+func (s *crashStore) SaveRound(r uint64) error {
+	return s.write(func() error { return s.LogStorage.SaveRound(r) })
+}
+
+func (s *crashStore) SavePromised(b paxos.Ballot) error {
+	return s.write(func() error { return s.LogStorage.SavePromised(b) })
+}
+
+func (s *crashStore) SaveAccept(p paxos.Ballot, e paxos.SlotEntry) error {
+	return s.write(func() error { return s.LogStorage.SaveAccept(p, e) })
+}
+
+func (s *crashStore) AppendCommitted(es []paxos.SlotEntry) error {
+	return s.write(func() error { return s.LogStorage.AppendCommitted(es) })
 }
 
 // closeDead closes databases of nodes that crashed during the step.
