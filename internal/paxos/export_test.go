@@ -29,3 +29,7 @@ func (r *Replica) IgnorePromisedValues() { r.ignorePromised = true }
 func (r *Replica) TakeoverStats() (noops, recovered, contested int) {
 	return r.statNoops, r.statRecovered, r.statContested
 }
+
+// ReplyBeforePersist makes the replica send Promise and Accepted replies
+// before writing the state they vouch for.
+func (r *Replica) ReplyBeforePersist() { r.replyFirst = true }

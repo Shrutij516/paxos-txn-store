@@ -36,7 +36,18 @@ type LogStorage interface {
 	SavePromised(Ballot) error
 	// LoadAccepted returns every accepted entry, sorted by slot.
 	LoadAccepted() ([]SlotEntry, error)
-	SaveAccepted(SlotEntry) error
+	// SaveAccept durably stores e as the accepted entry for its slot and
+	// sets the promise to promised, in one atomic write. promised is the
+	// acceptor's promise after accepting e: at least e.Ballot and at least
+	// the previous promise.
+	SaveAccept(promised Ballot, e SlotEntry) error
+	// LoadCommitted returns the committed prefix of the log, slots 1..n in
+	// order, where n is the stored commit index.
+	LoadCommitted() ([]SlotEntry, error)
+	// AppendCommitted durably appends entries that extend the committed
+	// prefix (the first must be at commit index + 1, the rest contiguous)
+	// and advances the commit index to the last one, all in one atomic step.
+	AppendCommitted([]SlotEntry) error
 }
 
 // LogPrepare asks acceptors to promise Ballot for every slot above Commit,

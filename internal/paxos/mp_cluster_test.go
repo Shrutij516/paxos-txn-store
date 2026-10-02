@@ -3,10 +3,12 @@ package paxos_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"maps"
 	"math/rand/v2"
+	"path/filepath"
 	"slices"
 
 	"github.com/anishathalye/porcupine"
@@ -38,10 +40,22 @@ type mpOpts struct {
 	AcceptDrop       float64
 	CrashAfterAccept float64
 
+	// Dir, if set, makes replicas persist to SQLite files in Dir. A crash
+	// discards the replica and closes its database; a restart reopens the
+	// file and recovers from it.
+	Dir string
+	// With Dir set, during chaos each storage write crashes its node with
+	// probability CrashBeforeCommit before the write commits (nothing is
+	// written), or with probability CrashAfterCommit right after it commits
+	// but before the node can reply. See crashStore.
+	CrashBeforeCommit float64
+	CrashAfterCommit  float64
+
 	// Broken modes for the negative tests.
-	SkipPrepare    bool
-	IgnorePromised bool
-	NoDedup        bool
+	ReplyBeforePersist bool
+	SkipPrepare        bool
+	IgnorePromised     bool
+	NoDedup            bool
 }
 
 // applied is one entry a state machine applied, with its result.
@@ -79,15 +93,16 @@ type oracleKey struct {
 
 // mpCluster runs replicas and clients on one SimNet from one seed.
 type mpCluster struct {
-	seed  uint64
-	opts  mpOpts
-	rng   *rand.Rand
-	net   *transport.SimNet
-	ids   []paxos.NodeID
-	reps  map[paxos.NodeID]*paxos.Replica // nil means crashed
-	store map[paxos.NodeID]*storage.Memory
-	sms   []*recSM // every incarnation ever
-	cli   []*simClient
+	seed uint64
+	opts mpOpts
+	rng  *rand.Rand
+	net  *transport.SimNet
+	ids  []paxos.NodeID
+	reps map[paxos.NodeID]*paxos.Replica  // nil means crashed
+	mem  map[paxos.NodeID]*storage.Memory // Memory backend: survives restarts
+	dbs  map[paxos.NodeID]*dbHandle       // SQLite backend: current handle
+	sms  []*recSM                         // every incarnation ever
+	cli  []*simClient
 
 	committed map[uint64]paxos.Entry // first entry any node applied per slot
 	oracle    map[oracleKey]map[paxos.NodeID]bool
@@ -96,6 +111,9 @@ type mpCluster struct {
 	h         hash.Hash
 
 	allReps   []*paxos.Replica // every incarnation ever
+	toClose   []*dbHandle      // databases of nodes crashed during this step
+	dbFaults  bool             // crash-at-commit faults active
+	dbCrashes [2]int           // crashes injected before / after commit
 	gapActive bool
 	crashIn   map[paxos.NodeID]int // steps until a scheduled crash
 }
@@ -134,13 +152,15 @@ func newMPCluster(seed uint64, o mpOpts) *mpCluster {
 		rng:       rand.New(rand.NewPCG(seed, 0xfeed)),
 		net:       transport.NewSimNet(seed),
 		reps:      map[paxos.NodeID]*paxos.Replica{},
-		store:     map[paxos.NodeID]*storage.Memory{},
+		mem:       map[paxos.NodeID]*storage.Memory{},
+		dbs:       map[paxos.NodeID]*dbHandle{},
 		committed: map[uint64]paxos.Entry{},
 		oracle:    map[oracleKey]map[paxos.NodeID]bool{},
 		chosenAt:  map[uint64]paxos.Entry{},
 		h:         sha256.New(),
 		crashIn:   map[paxos.NodeID]int{},
 		gapActive: o.AcceptDrop > 0 || o.CrashAfterAccept > 0,
+		dbFaults:  o.CrashBeforeCommit > 0 || o.CrashAfterCommit > 0,
 	}
 	c.net.SetFaults(o.Faults)
 	c.net.Trace = c.trace
@@ -149,7 +169,7 @@ func newMPCluster(seed uint64, o mpOpts) *mpCluster {
 		c.ids = append(c.ids, paxos.NodeID(i))
 	}
 	for _, id := range c.ids {
-		c.store[id] = storage.NewMemory()
+		c.mem[id] = storage.NewMemory()
 		c.start(id)
 	}
 	for i := 0; i < o.Clients; i++ {
@@ -185,9 +205,12 @@ func (c *mpCluster) start(id paxos.NodeID) {
 	r, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: c.ids, StateMachine: sm,
 		Rand: rand.New(rand.NewPCG(c.rng.Uint64(), uint64(id))),
-	}, c.store[id], gapNet{c})
+	}, c.openStore(id), gapNet{c})
 	if err != nil {
 		panic(err)
+	}
+	if c.opts.ReplyBeforePersist {
+		r.ReplyBeforePersist()
 	}
 	if c.opts.SkipPrepare {
 		r.SkipPrepareOnTakeover()
@@ -246,6 +269,108 @@ func (c *mpCluster) crash(id paxos.NodeID) {
 	}
 	c.reps[id] = nil
 	c.net.Crash(id)
+	if h := c.dbs[id]; h != nil {
+		// The crash may happen inside a storage write, so the handle is
+		// only marked dead now (refusing any further write) and closed at
+		// the end of the step.
+		h.dead = true
+		c.toClose = append(c.toClose, h)
+		delete(c.dbs, id)
+	}
+}
+
+// dbHandle is one opened database incarnation of a node.
+type dbHandle struct {
+	db   *storage.SQLite
+	dead bool
+}
+
+var errCrash = errors.New("simulated crash")
+
+func (c *mpCluster) openStore(id paxos.NodeID) paxos.LogStorage {
+	if c.opts.Dir == "" {
+		return c.mem[id]
+	}
+	db, err := storage.OpenSQLite(filepath.Join(c.opts.Dir, fmt.Sprintf("node-%d.db", id)))
+	if err != nil {
+		panic(err)
+	}
+	h := &dbHandle{db: db}
+	c.dbs[id] = h
+	return &crashStore{LogStorage: db, c: c, id: id, h: h}
+}
+
+// crashStore wraps a node's SQLite store and injects crashes around every
+// write: before it commits (nothing is written, as if the transaction were
+// rolled back) or right after it commits but before the caller can reply.
+// Once its node has crashed it refuses every write, as a dead process would.
+type crashStore struct {
+	paxos.LogStorage
+	c  *mpCluster
+	id paxos.NodeID
+	h  *dbHandle
+}
+
+func (s *crashStore) maybeCrash(prob float64, where string) bool {
+	c := s.c
+	if !c.dbFaults || prob == 0 || c.rng.Float64() >= prob {
+		return false
+	}
+	if where == "before-commit" {
+		c.dbCrashes[0]++
+	} else {
+		c.dbCrashes[1]++
+	}
+	c.trace(fmt.Sprintf("t=%d crash %d %s", c.net.Now(), s.id, where))
+	c.crash(s.id)
+	return true
+}
+
+func (s *crashStore) write(f func() error) error {
+	if s.h.dead || s.maybeCrash(s.c.opts.CrashBeforeCommit, "before-commit") {
+		return errCrash
+	}
+	if err := f(); err != nil {
+		return err
+	}
+	if s.maybeCrash(s.c.opts.CrashAfterCommit, "after-commit") {
+		return errCrash
+	}
+	return nil
+}
+
+func (s *crashStore) SaveRound(r uint64) error {
+	return s.write(func() error { return s.LogStorage.SaveRound(r) })
+}
+
+func (s *crashStore) SavePromised(b paxos.Ballot) error {
+	return s.write(func() error { return s.LogStorage.SavePromised(b) })
+}
+
+func (s *crashStore) SaveAccept(p paxos.Ballot, e paxos.SlotEntry) error {
+	return s.write(func() error { return s.LogStorage.SaveAccept(p, e) })
+}
+
+func (s *crashStore) AppendCommitted(es []paxos.SlotEntry) error {
+	return s.write(func() error { return s.LogStorage.AppendCommitted(es) })
+}
+
+// closeDead closes databases of nodes that crashed during the step.
+func (c *mpCluster) closeDead() {
+	for _, h := range c.toClose {
+		_ = h.db.Close()
+	}
+	c.toClose = nil
+}
+
+// closeAll closes every database. Tests call it when done.
+func (c *mpCluster) closeAll() {
+	c.closeDead()
+	for _, id := range c.ids {
+		if h := c.dbs[id]; h != nil {
+			_ = h.db.Close()
+		}
+	}
 }
 
 func (c *mpCluster) restart(id paxos.NodeID) {
@@ -320,6 +445,7 @@ func (c *mpCluster) step(withChaos bool) {
 	for _, cl := range c.cli {
 		cl.tick()
 	}
+	c.closeDead()
 }
 
 func (c *mpCluster) run(steps int, withChaos bool) {
@@ -331,6 +457,7 @@ func (c *mpCluster) run(steps int, withChaos bool) {
 // calm stops all faults, heals partitions and restarts every crashed node.
 func (c *mpCluster) calm() {
 	c.gapActive = false
+	c.dbFaults = false
 	clear(c.crashIn)
 	c.net.SetFaults(transport.Faults{MaxDelay: 2})
 	c.net.Heal()

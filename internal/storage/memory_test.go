@@ -47,7 +47,7 @@ func TestMemoryLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, s := range []uint64{3, 1, 2} {
-		if err := m.SaveAccepted(paxos.SlotEntry{Slot: s, Ballot: b, Entry: paxos.Entry{Seq: s}}); err != nil {
+		if err := m.SaveAccept(b, paxos.SlotEntry{Slot: s, Ballot: b, Entry: paxos.Entry{Seq: s}}); err != nil {
 			t.Fatal(err)
 		}
 	}
