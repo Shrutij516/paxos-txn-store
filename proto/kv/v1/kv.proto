@@ -1,0 +1,41 @@
+// Client API of the key-value store. Every request carries the caller's
+// client ID and a per-client sequence number so retries are applied at
+// most once. A client must have at most one request outstanding.
+syntax = "proto3";
+
+package kv.v1;
+
+option go_package = "github.com/Shrutij516/paxos-txn-store/proto/kv/v1;kvv1";
+
+message GetRequest {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  string key = 3;
+}
+
+message GetResponse {
+  // ok is false when this node is not the leader; leader_id and
+  // leader_addr then name the leader it knows of (0 and "" if none).
+  bool ok = 1;
+  string value = 2;
+  int32 leader_id = 3;
+  string leader_addr = 4;
+}
+
+message PutRequest {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  string key = 3;
+  string value = 4;
+}
+
+message PutResponse {
+  bool ok = 1;
+  int32 leader_id = 2;
+  string leader_addr = 3;
+}
+
+service KV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+}

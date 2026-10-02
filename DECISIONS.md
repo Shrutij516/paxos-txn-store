@@ -83,6 +83,35 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **Rejected:** `synchronous=NORMAL` (about 4x to 9x faster per write in our benchmark, durable across process crashes but not power loss); `synchronous=EXTRA` (also syncs the directory after deleting a rollback journal; adds nothing in WAL mode); rollback journal mode (also safe with FULL, but more fsyncs per transaction and readers block writers).
 - **Tradeoff:** Each persisted change costs an fsync, about 0.3 ms in our sandbox benchmark versus about 0.04 to 0.07 ms with NORMAL, and far more on slow disks. That bounds per-node throughput until writes are batched (group commit), which is left for later.
 
+## 13. One event-loop goroutine per replica instead of mutexes
+
+- **What:** Each node runs its replica on a single goroutine. gRPC handlers, the ticker and incoming peer messages send events to it over channels; client handlers wait on a reply channel. The Paxos code has no locks.
+- **Why:** The replica was written as a single-threaded state machine for the simulator, and this keeps it that way in production: the same code, the same order of events, no data races by construction. Reasoning about Paxos invariants is much easier when no other goroutine can change state halfway through a handler. The race detector stays quiet because nothing is shared.
+- **Rejected:** A mutex around the replica (works, but every handler must remember to lock, long operations such as fsync hold the lock while other events queue up anyway, and it is easy to call back into the replica while holding the lock); fine-grained locks per role (more concurrency than the protocol needs and many more ways to deadlock or break invariants).
+- **Tradeoff:** All work for a node, including each fsync, is serialized on one goroutine, which caps per-node throughput. Batching (group commit) can be added inside the loop later without changing the model. A slow event (a large catch-up) delays heartbeats for its duration.
+
+## 14. Protobuf kept out of the Paxos core
+
+- **What:** `internal/paxos` still uses plain Go structs. `internal/wire` converts them to and from `proto/paxos/v1` at the transport boundary.
+- **Why:** The core stays easy to test (comparable structs, no generated code, deterministic simulation unchanged) and the wire format can evolve without touching consensus logic. A fuzz test round-trips every message type through bytes, so the conversion cannot silently drop a field.
+- **Rejected:** Using the generated protobuf types directly in the core (no conversion code, but generated structs are not comparable with `==`, carry internal state, and would tie the simulator and every test to protobuf).
+- **Tradeoff:** One conversion per message in each direction, and a second definition of every message to keep in sync. The fuzz test and the check that every `oneof` case is covered guard the sync.
+
+## 15. Tick duration of 10 ms by default
+
+- **What:** The node binary advances one logical Paxos tick every 10 ms (`-tick`). With the replica's timing in ticks, that means a heartbeat every 40 ms, an election timeout drawn from 200 to 400 ms, and a peer RPC deadline of 200 ms.
+- **Why:** The election timeout must be comfortably above heartbeat interval plus network round trip plus an fsync (about 0.3 ms here), or followers start needless elections. It should also be short enough that failover is quick: in the multi-process test, operations issued after the leader is killed complete about 0.3 to 0.4 s later. Keeping timing in ticks means the same values are used by the simulator and by real nodes, and only the tick length changes per deployment.
+- **Rejected:** 1 ms ticks (faster failover, but the ticker wakes the loop 1000 times a second and timeouts approach scheduling noise on a busy machine); 100 ms ticks (calmer, but a leader failure stalls writes for 2 to 4 seconds).
+- **Tradeoff:** Across data centers or on slow disks the default is too aggressive and must be raised with `-tick`. Tick length is not adaptive.
+
+## 16. Insecure gRPC for now
+
+- **What:** Peers and clients use plaintext gRPC (`insecure.NewCredentials()`), with no authentication.
+- **Why:** Keeps Phase 4 focused on the transport, the event loop and the SDK. Everything runs on localhost in tests.
+- **Rejected:** TLS from the start (certificate generation and rotation in every test and in local runs, for no benefit yet).
+- **Tradeoff:** Anyone who can reach a node's port can send it Paxos messages or client requests, and traffic is readable on the network. Not deployable outside a trusted network until mTLS lands (see Future work).
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
+- **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.

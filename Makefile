@@ -1,7 +1,7 @@
 GO ?= go
 COVER_MIN := 85
 
-.PHONY: test test-full lint race cover bench
+.PHONY: test test-full lint race cover bench proto
 
 # Quick local run: seeded suites use 100 seeds instead of 1000.
 test:
@@ -32,3 +32,10 @@ cover:
 # Persist latency with synchronous=FULL vs NORMAL.
 bench:
 	$(GO) test -run xxx -bench . ./internal/storage/
+
+# Regenerate Go code from proto/. Needs protoc, protoc-gen-go v1.36.6 and
+# protoc-gen-go-grpc v1.5.1 on PATH (see docs/running.md).
+PROTOS := proto/paxos/v1/paxos.proto proto/kv/v1/kv.proto
+proto:
+	protoc --go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative $(PROTOS)
