@@ -68,3 +68,17 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 ## 10. CI runs the race detector on short seed counts and the full seeds without it
 
 - **What / Why:** The race detector made the 1000-seed suites about 9x slower (about 160 s versus 17 s for internal/paxos) even though the simulator is single-threaded, so CI runs `go test -race -short` (100 seeds) and the full 1000 seeds without `-race` as parallel jobs, keeping both race coverage of all code paths and the full seed sweep at a fraction of the wall time.
+
+## 11. modernc.org/sqlite instead of mattn/go-sqlite3
+
+- **What:** The SQLite backend uses `modernc.org/sqlite`, a pure Go translation of SQLite, pinned to v1.44.3 (the newest release that still builds with Go 1.24).
+- **Why:** No cgo: builds and cross-compiles with the plain Go toolchain, works with `-race` and in minimal CI images without a C compiler, and keeps static binaries simple for later chaos tests on real processes. It is the same SQLite code base, so file format, pragmas and durability semantics match.
+- **Rejected:** `mattn/go-sqlite3` (the most widely used driver and somewhat faster, but needs cgo and a C toolchain everywhere, slows builds, and complicates cross-compiling); `ncruces/go-sqlite3` (pure Go via WebAssembly, promising but younger).
+- **Tradeoff:** modernc is slower on CPU-heavy queries and adds a large dependency tree. Our workload is a few small writes per consensus step, dominated by fsync, so CPU cost does not matter yet. Newer modernc releases need a newer Go, so upgrading the driver will mean upgrading Go.
+
+## 12. synchronous=FULL, not NORMAL, with WAL
+
+- **What:** Every database opens with `journal_mode=WAL` and `synchronous=FULL`. Each state change (a promise, an accepted entry, a batch of committed entries plus the commit index, the proposer round) is one transaction, and the node replies only after that transaction commits.
+- **Why:** A Paxos promise or vote is a statement to other nodes about the acceptor's future behavior. Once sent, it must survive any crash, including power loss. In WAL mode, `synchronous=NORMAL` does not fsync the WAL on every commit, only at checkpoints, so after power loss the most recent commits can vanish even though the node already replied. A node could then forget a promise or an accepted value it reported, which is exactly the "forgetful acceptor" that breaks agreement (see the Phase 1 and Phase 3 negative tests). FULL fsyncs the WAL on every commit, so a reply is never ahead of the disk.
+- **Rejected:** `synchronous=NORMAL` (about 17x faster per write in our benchmark, durable across process crashes but not power loss); `synchronous=EXTRA` (also syncs the directory after deleting a rollback journal; adds nothing in WAL mode); rollback journal mode (also safe with FULL, but more fsyncs per transaction and readers block writers).
+- **Tradeoff:** Each persisted change costs an fsync, about 0.3 ms in our sandbox benchmark versus about 0.02 ms with NORMAL, and far more on slow disks. That bounds per-node throughput until writes are batched (group commit), which is left for later.

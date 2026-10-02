@@ -2,6 +2,7 @@ package paxos
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 )
@@ -62,6 +63,7 @@ type Replica struct {
 	// Test-only switches, set from export_test.go.
 	skipPrepare    bool
 	ignorePromised bool
+	replyFirst     bool // reply to Prepare and Accept before persisting
 
 	// Takeover counters, read only by tests through export_test.go.
 	statNoops     int // gaps filled with a no-op
@@ -102,6 +104,22 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 	}
 	for _, se := range acc {
 		r.accepted[se.Slot] = se
+	}
+	// Rebuild the state machine (including its dedup table) by replaying the
+	// durable committed prefix in order. Anything committed after the last
+	// durable write is fetched again through catch-up.
+	committed, err := store.LoadCommitted()
+	if err != nil {
+		return nil, err
+	}
+	for i, se := range committed {
+		if se.Slot != uint64(i+1) {
+			return nil, fmt.Errorf("paxos: committed log has slot %d at position %d", se.Slot, i+1)
+		}
+		r.chosen[se.Slot] = se.Entry
+		r.commit = se.Slot
+		r.applied = se.Slot
+		r.sm.Apply(se.Slot, se.Entry)
 	}
 	r.resetElectionTimer()
 	return r, nil
@@ -231,6 +249,16 @@ func (r *Replica) onPrepare(from NodeID, m LogPrepare) {
 		r.send(from, LogNack{Ballot: m.Ballot, Promised: r.promised})
 		return
 	}
+	var es []SlotEntry
+	for _, s := range slices.Sorted(maps.Keys(r.accepted)) {
+		if s > m.Commit {
+			es = append(es, r.accepted[s])
+		}
+	}
+	reply := LogPromise{Ballot: m.Ballot, Entries: es}
+	if r.replyFirst {
+		r.send(from, reply) // broken on purpose: promise leaves before it is durable
+	}
 	if !r.savePromised(m.Ballot) {
 		return
 	}
@@ -238,13 +266,9 @@ func (r *Replica) onPrepare(from NodeID, m LogPrepare) {
 		r.yield(m.Ballot)
 		r.resetElectionTimer()
 	}
-	var es []SlotEntry
-	for _, s := range slices.Sorted(maps.Keys(r.accepted)) {
-		if s > m.Commit {
-			es = append(es, r.accepted[s])
-		}
+	if !r.replyFirst {
+		r.send(from, reply)
 	}
-	r.send(from, LogPromise{Ballot: m.Ballot, Entries: es})
 }
 
 func (r *Replica) onPromise(from NodeID, m LogPromise) {
@@ -333,6 +357,9 @@ func (r *Replica) onAccept(from NodeID, m LogAccept) {
 		r.send(from, LogNack{Ballot: m.Ballot, Promised: r.promised})
 		return
 	}
+	if r.replyFirst {
+		r.send(from, LogAccepted(m)) // broken on purpose: vote leaves before it is durable
+	}
 	if !r.savePromised(m.Ballot) {
 		return
 	}
@@ -348,7 +375,9 @@ func (r *Replica) onAccept(from NodeID, m LogAccept) {
 		}
 		r.accepted[m.Slot] = se
 	}
-	r.send(from, LogAccepted(m))
+	if !r.replyFirst {
+		r.send(from, LogAccepted(m))
+	}
 }
 
 func (r *Replica) onAccepted(from NodeID, m LogAccepted) {
@@ -437,12 +466,24 @@ func (r *Replica) markChosen(slot uint64, e Entry) {
 		return
 	}
 	r.chosen[slot] = e
-	for {
-		if _, ok := r.chosen[r.commit+1]; !ok {
+	// Make the newly contiguous prefix durable, with the new commit index, in
+	// one atomic write before applying anything. If the write fails the
+	// commit index stays put and the next markChosen retries.
+	var batch []SlotEntry
+	for s := r.commit + 1; ; s++ {
+		ce, ok := r.chosen[s]
+		if !ok {
 			break
 		}
-		r.commit++
+		batch = append(batch, SlotEntry{Slot: s, Entry: ce})
 	}
+	if len(batch) == 0 {
+		return
+	}
+	if err := r.store.AppendCommitted(batch); err != nil {
+		return
+	}
+	r.commit = batch[len(batch)-1].Slot
 	for r.applied < r.commit {
 		r.applied++
 		e := r.chosen[r.applied]

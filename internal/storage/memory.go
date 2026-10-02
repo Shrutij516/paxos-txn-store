@@ -1,9 +1,10 @@
 // Package storage holds implementations of paxos.Storage and
-// paxos.LogStorage. For now there is only an in-memory store; SQLite arrives
-// in a later phase behind the same interfaces.
+// paxos.LogStorage: an in-memory store for fast simulation and a durable
+// SQLite store. Both pass the same contract tests.
 package storage
 
 import (
+	"fmt"
 	"maps"
 	"slices"
 
@@ -12,12 +13,14 @@ import (
 
 // Memory is an in-memory paxos.Storage and paxos.LogStorage. It survives a
 // simulated crash because the simulator hands the same Memory to the
-// restarted node, which is how a disk would behave. It is not safe for concurrent use.
+// restarted node, which is how a disk would behave. It is not safe for
+// concurrent use.
 type Memory struct {
 	acceptor paxos.AcceptorState
 	round    uint64
 	promised paxos.Ballot
 	log      map[uint64]paxos.SlotEntry
+	commit   []paxos.SlotEntry
 
 	// Saves counts successful writes, for tests.
 	Saves int
@@ -79,5 +82,30 @@ func (m *Memory) LoadAccepted() ([]paxos.SlotEntry, error) {
 func (m *Memory) SaveAccepted(e paxos.SlotEntry) error {
 	m.log[e.Slot] = e
 	m.Saves++
+	return nil
+}
+
+// LoadCommitted implements paxos.LogStorage.
+func (m *Memory) LoadCommitted() ([]paxos.SlotEntry, error) {
+	return slices.Clone(m.commit), nil
+}
+
+// AppendCommitted implements paxos.LogStorage.
+func (m *Memory) AppendCommitted(es []paxos.SlotEntry) error {
+	if err := checkAppend(uint64(len(m.commit)), es); err != nil {
+		return err
+	}
+	m.commit = append(m.commit, es...)
+	m.Saves++
+	return nil
+}
+
+// checkAppend verifies that es extends a committed prefix ending at commit.
+func checkAppend(commit uint64, es []paxos.SlotEntry) error {
+	for i, e := range es {
+		if want := commit + uint64(i) + 1; e.Slot != want {
+			return fmt.Errorf("storage: committed append at slot %d, want %d", e.Slot, want)
+		}
+	}
 	return nil
 }

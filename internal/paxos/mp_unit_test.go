@@ -14,6 +14,25 @@ import (
 type flakyLog struct {
 	*storage.Memory
 	failPromised, failAccepted, failRound, failLoad bool
+	failCommit, failLoadCommitted                   bool
+	committed                                       []paxos.SlotEntry // overrides LoadCommitted if set
+}
+
+func (f *flakyLog) AppendCommitted(es []paxos.SlotEntry) error {
+	if f.failCommit {
+		return errDisk
+	}
+	return f.Memory.AppendCommitted(es)
+}
+
+func (f *flakyLog) LoadCommitted() ([]paxos.SlotEntry, error) {
+	if f.failLoadCommitted {
+		return nil, errDisk
+	}
+	if f.committed != nil {
+		return f.committed, nil
+	}
+	return f.Memory.LoadCommitted()
 }
 
 func (f *flakyLog) SavePromised(b paxos.Ballot) error {
@@ -295,5 +314,47 @@ func TestReplicaRestartKeepsAcceptorState(t *testing.T) {
 	r.Handle(paxos.Message{From: 1, To: 3, Body: paxos.LogPrepare{Ballot: b(6, 1), Commit: 2}})
 	if p := bodies[paxos.LogPromise](tr.take()); len(p[0].Entries) != 0 {
 		t.Fatalf("promise must only carry entries above the commit index: %v", p)
+	}
+}
+
+// The commit index never runs ahead of durable storage: if the committed
+// entries cannot be written, nothing is applied, and the next attempt
+// retries the whole batch.
+func TestReplicaCommitWaitsForDurableWrite(t *testing.T) {
+	tr := &outbox{}
+	st := &flakyLog{Memory: storage.NewMemory(), failCommit: true}
+	r := newTestReplica(t, 3, st, tr)
+	e1, e2 := put("a", "1"), put("a", "2")
+	r.Handle(paxos.Message{From: 2, To: 3, Body: paxos.CatchupReply{Entries: []paxos.SlotEntry{{Slot: 1, Entry: e1}}}})
+	if r.Commit() != 0 {
+		t.Fatalf("commit advanced to %d without a durable write", r.Commit())
+	}
+	st.failCommit = false
+	r.Handle(paxos.Message{From: 2, To: 3, Body: paxos.CatchupReply{Entries: []paxos.SlotEntry{{Slot: 2, Entry: e2}}}})
+	if r.Commit() != 2 {
+		t.Fatalf("commit = %d, want 2 after retry", r.Commit())
+	}
+	got, _ := st.LoadCommitted()
+	if len(got) != 2 || got[0].Entry != e1 || got[1].Entry != e2 {
+		t.Fatalf("durable committed log %+v", got)
+	}
+	// A restart replays the durable prefix into a fresh state machine.
+	r2 := newTestReplica(t, 3, st, tr)
+	if r2.Commit() != 2 {
+		t.Fatalf("restarted commit = %d, want 2", r2.Commit())
+	}
+	if e, ok := r2.Committed(2); !ok || e != e2 {
+		t.Fatalf("restarted Committed(2) = %+v, %v", e, ok)
+	}
+}
+
+func TestReplicaRejectsBadCommittedLog(t *testing.T) {
+	cfg := paxos.ReplicaConfig{ID: 1, Peers: peers3, Rand: rand.New(rand.NewPCG(1, 1)), StateMachine: kv.New()}
+	if _, err := paxos.NewReplica(cfg, &flakyLog{Memory: storage.NewMemory(), failLoadCommitted: true}, &outbox{}); !errors.Is(err, errDisk) {
+		t.Errorf("want load error, got %v", err)
+	}
+	gap := &flakyLog{Memory: storage.NewMemory(), committed: []paxos.SlotEntry{{Slot: 1}, {Slot: 3}}}
+	if _, err := paxos.NewReplica(cfg, gap, &outbox{}); err == nil {
+		t.Error("want error for a committed log with a gap")
 	}
 }
