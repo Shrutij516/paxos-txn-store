@@ -1,0 +1,139 @@
+// Peer-to-peer Paxos messages. Each message mirrors a struct in
+// internal/paxos; internal/wire converts between the two. The Paxos core
+// never imports this package.
+syntax = "proto3";
+
+package paxos.v1;
+
+option go_package = "github.com/Shrutij516/paxos-txn-store/proto/paxos/v1;paxosv1";
+
+message Ballot {
+  uint64 round = 1;
+  int32 node = 2;
+}
+
+message Entry {
+  bool noop = 1;
+  uint64 client_id = 2;
+  uint64 seq = 3;
+  bytes cmd = 4;
+}
+
+message SlotEntry {
+  uint64 slot = 1;
+  Ballot ballot = 2;
+  Entry entry = 3;
+}
+
+// Single-decree Paxos (internal/paxos Node).
+message Prepare {
+  Ballot ballot = 1;
+}
+
+message Promise {
+  Ballot ballot = 1;
+  Ballot accepted = 2;
+  bytes value = 3;
+}
+
+message Accept {
+  Ballot ballot = 1;
+  bytes value = 2;
+}
+
+message Accepted {
+  Ballot ballot = 1;
+  bytes value = 2;
+}
+
+message Nack {
+  Ballot ballot = 1;
+  Ballot promised = 2;
+}
+
+// Multi-Paxos (internal/paxos Replica).
+message LogPrepare {
+  Ballot ballot = 1;
+  uint64 commit = 2;
+}
+
+message LogPromise {
+  Ballot ballot = 1;
+  repeated SlotEntry entries = 2;
+}
+
+message LogAccept {
+  Ballot ballot = 1;
+  uint64 slot = 2;
+  Entry entry = 3;
+}
+
+message LogAccepted {
+  Ballot ballot = 1;
+  uint64 slot = 2;
+  Entry entry = 3;
+}
+
+message LogNack {
+  Ballot ballot = 1;
+  Ballot promised = 2;
+}
+
+message Heartbeat {
+  Ballot ballot = 1;
+  uint64 commit = 2;
+}
+
+message CatchupRequest {
+  uint64 from = 1;
+}
+
+message CatchupReply {
+  repeated SlotEntry entries = 1;
+}
+
+message ClientRequest {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  bytes cmd = 3;
+}
+
+message ClientReply {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  bool ok = 3;
+  bytes result = 4;
+  int32 leader = 5;
+}
+
+// Envelope carries exactly one message between two nodes.
+message Envelope {
+  int32 from = 1;
+  int32 to = 2;
+  oneof body {
+    Prepare prepare = 10;
+    Promise promise = 11;
+    Accept accept = 12;
+    Accepted accepted = 13;
+    Nack nack = 14;
+    LogPrepare log_prepare = 20;
+    LogPromise log_promise = 21;
+    LogAccept log_accept = 22;
+    LogAccepted log_accepted = 23;
+    LogNack log_nack = 24;
+    Heartbeat heartbeat = 25;
+    CatchupRequest catchup_request = 26;
+    CatchupReply catchup_reply = 27;
+    ClientRequest client_request = 28;
+    ClientReply client_reply = 29;
+  }
+}
+
+message SendAck {}
+
+// Peer is the node-to-node service. Send is fire and forget from Paxos's
+// point of view: the ack only means the receiver queued the message, and
+// a lost message is handled by Paxos retries.
+service Peer {
+  rpc Send(Envelope) returns (SendAck);
+}

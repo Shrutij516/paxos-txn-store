@@ -1,0 +1,104 @@
+package transport
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
+	"github.com/Shrutij516/paxos-txn-store/internal/wire"
+	paxosv1 "github.com/Shrutij516/paxos-txn-store/proto/paxos/v1"
+)
+
+// peerQueue is the number of outbound messages buffered per peer. When a
+// peer is slow or down its queue fills and new messages are dropped, which
+// Paxos tolerates; the caller never blocks.
+const peerQueue = 1024
+
+// GRPC implements paxos.Transport over gRPC. Send never blocks: messages for
+// a peer go into that peer's queue and a per-peer goroutine delivers them
+// with one unary RPC each, bounded by a deadline. Messages addressed to this
+// node itself, or to any ID that is not a configured peer (such as a local
+// client endpoint), are handed to the local callback instead.
+type GRPC struct {
+	self    paxos.NodeID
+	local   func(paxos.Message)
+	timeout time.Duration
+	peers   map[paxos.NodeID]*peer
+	wg      sync.WaitGroup
+	ctx     context.Context // canceled by Close so queued sends fail fast
+	cancel  context.CancelFunc
+}
+
+type peer struct {
+	conn   *grpc.ClientConn
+	client paxosv1.PeerClient
+	q      chan *paxosv1.Envelope
+}
+
+var _ paxos.Transport = (*GRPC)(nil)
+
+// NewGRPC connects (lazily) to every peer in addrs other than self. local
+// receives messages for self and for non-peer IDs; it is called from Send,
+// on the caller's goroutine. timeout bounds each RPC.
+func NewGRPC(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(paxos.Message), timeout time.Duration) (*GRPC, error) {
+	t := &GRPC{self: self, local: local, timeout: timeout, peers: make(map[paxos.NodeID]*peer)}
+	t.ctx, t.cancel = context.WithCancel(context.Background())
+	for id, addr := range addrs {
+		if id == self {
+			continue
+		}
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Close()
+			return nil, err
+		}
+		p := &peer{conn: conn, client: paxosv1.NewPeerClient(conn), q: make(chan *paxosv1.Envelope, peerQueue)}
+		t.peers[id] = p
+		t.wg.Add(1)
+		go t.deliver(p)
+	}
+	return t, nil
+}
+
+// Send implements paxos.Transport.
+func (t *GRPC) Send(m paxos.Message) {
+	p, ok := t.peers[m.To]
+	if !ok {
+		t.local(m)
+		return
+	}
+	env, err := wire.ToProto(m)
+	if err != nil {
+		return
+	}
+	select {
+	case p.q <- env:
+	default: // queue full: drop, Paxos will retry
+	}
+}
+
+func (t *GRPC) deliver(p *peer) {
+	defer t.wg.Done()
+	for env := range p.q {
+		ctx, cancel := context.WithTimeout(t.ctx, t.timeout)
+		_, _ = p.client.Send(ctx, env) // errors are message loss
+		cancel()
+	}
+}
+
+// Close stops the delivery goroutines, dropping anything still queued, and
+// closes the connections. Send must not be called after Close.
+func (t *GRPC) Close() {
+	t.cancel()
+	for _, p := range t.peers {
+		close(p.q)
+	}
+	t.wg.Wait()
+	for _, p := range t.peers {
+		_ = p.conn.Close()
+	}
+}

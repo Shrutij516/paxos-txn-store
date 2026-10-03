@@ -1,5 +1,5 @@
-// Package transport holds implementations of paxos.Transport. Phase 1 ships
-// only SimNet, a deterministic in-memory network for tests. gRPC comes later.
+// Package transport holds implementations of paxos.Transport: SimNet, a
+// deterministic in-memory network for tests, and GRPC for real nodes.
 package transport
 
 import (
