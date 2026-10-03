@@ -35,6 +35,17 @@ With the default tick, the leader sends a heartbeat every 40 ms and a follower s
 
 Stop a node with Ctrl-C or `kill <pid>` (SIGTERM). It stops accepting requests, waits up to 2 seconds for in-flight ones, stops its event loop and closes its database. Start it again with the same flags and it recovers from its data directory (see docs/storage.md) and catches up from the leader.
 
+## Failover timing
+
+`TestMultiProcessFailover` (in `cmd/paxosd`) starts three real `paxosd` processes, runs 10 SDK clients with a 5 s deadline per operation and 2 with a 300 ms deadline, SIGKILLs the leader, restarts it 1.5 s later, and checks the whole history with porcupine. The peer RPC timeout is the default 200 ms. The replica's timing is fixed in ticks (heartbeat every 4, election timeout drawn from 20 to 40), so changing `-tick` changes the election timeout. The test runs at two tick lengths, 3 runs each:
+
+| `-tick` | Heartbeat | Election timeout | Failover, mean | Failover, max | Ops with unknown outcome (3 runs) |
+|---|---|---|---|---|---|
+| 10 ms (default) | 40 ms | 200 to 400 ms | 278 ms | 345 ms | 23 |
+| 20 ms | 80 ms | 400 to 800 ms | 575 ms | 640 ms | 22 |
+
+Failover is measured from the SIGKILL to the completion of the first operation that was issued after it. It tracks the election timeout: a follower has to notice the missing heartbeats, win a Prepare round and commit before clients get answers again. Each run completes roughly 2800 to 3700 operations. The operations with unknown outcome come from the short-deadline clients giving up during the failover; porcupine treats them as possibly applied and the histories are still linearizable. Numbers are from the development sandbox and vary between runs.
+
 ## Use the SDK
 
 ```go
@@ -74,13 +85,14 @@ What the SDK does for you:
 - **Leader discovery.** Any node can be contacted. A follower answers "not leader" with the leader's address, and the client retries there at once. The client remembers the leader until a request to it fails.
 - **Retries.** Each attempt has a deadline (`AttemptTimeout`, default 1 s). After a failure or timeout the client moves to the next node and waits a randomized, exponentially growing backoff (20 ms up to 500 ms). It keeps going until the call's context ends.
 - **Exactly once.** The client picks a random client ID and numbers its operations. Every retry of an operation reuses its sequence number, and the servers' dedup table applies it at most once, returning the original result to later retries.
+- **No leaked server state on timeouts.** When a request's handler times out or its caller cancels, the node drops the request's entry from its table of waiting handlers right away.
 - **One request at a time.** Calls on one `Client` are serialized, because dedup assumes one outstanding request per client (see docs/multipaxos.md). For concurrency, create one `Client` per goroutine.
 
 Reads go through the log like writes, so `Get` is linearizable.
 
 ## Regenerating protobuf code
 
-The generated files in `proto/` are committed. After editing a `.proto` file, install `protoc` (29.x), then:
+The generated files in `proto/` are committed, and CI regenerates them with pinned tools (`make proto-check`) and fails if anything differs. After editing a `.proto` file, install `protoc` 29.3, then:
 
 ```sh
 go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6

@@ -20,11 +20,14 @@ import (
 	"github.com/anishathalye/porcupine"
 
 	"github.com/Shrutij516/paxos-txn-store/client"
+	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
+	"github.com/Shrutij516/paxos-txn-store/internal/server"
 )
 
 const (
-	numClients = 10
-	numKeys    = 3
+	numClients      = 10 // clients with a generous deadline per operation
+	numShortClients = 2  // clients with a deadline shorter than a failover
+	numKeys         = 3
 )
 
 func freeAddr(t *testing.T) string {
@@ -54,6 +57,9 @@ func (p *proc) start(t *testing.T, bin string) {
 	}
 	p.cmd = exec.Command(bin, p.args...)
 	p.cmd.Stdout, p.cmd.Stderr = f, f
+	if dir := os.Getenv(coverDirEnv); dir != "" {
+		p.cmd.Env = append(os.Environ(), "GOCOVERDIR="+dir)
+	}
 	if err := p.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -107,26 +113,61 @@ var kvModel = porcupine.Model{
 	},
 }
 
+// coverDirEnv, when set to a directory, makes the test build paxosd with
+// coverage instrumentation and has every child process write its coverage
+// data there (GOCOVERDIR). make cover merges it into the report.
+const coverDirEnv = "PAXOSD_GOCOVERDIR"
+
 // TestMultiProcessFailover builds paxosd, runs three real processes, drives
-// them with 10 concurrent SDK clients, SIGKILLs the leader mid-run, restarts
-// it, and checks the recorded history for linearizability. 3 iterations, 1
-// under -short.
+// them with 10 concurrent SDK clients plus 2 clients with short deadlines,
+// SIGKILLs the leader mid-run, restarts it, and checks the recorded history
+// for linearizability. It runs at two tick lengths, which gives two election
+// timeout ranges (the replica's timing is fixed in ticks: heartbeat every 4,
+// election timeout 20 to 40). 3 iterations per setting; under -short, 1
+// iteration at the default tick only.
 func TestMultiProcessFailover(t *testing.T) {
 	iters := 3
+	ticks := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
 	if testing.Short() {
-		iters = 1
+		iters, ticks = 1, ticks[:1]
 	}
 	bin := filepath.Join(t.TempDir(), "paxosd")
-	build := exec.Command("go", "build", "-o", bin, ".")
+	args := []string{"build", "-o", bin}
+	if os.Getenv(coverDirEnv) != "" {
+		args = append(args, "-cover", "-covermode=set", "-coverpkg=github.com/Shrutij516/paxos-txn-store/...")
+	}
+	build := exec.Command("go", append(args, ".")...)
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
-	for it := 0; it < iters; it++ {
-		t.Run(fmt.Sprintf("iter%d", it), func(t *testing.T) { runFailover(t, bin, uint64(it)+1) })
+	tm := paxos.DefaultLogTiming
+	for _, tick := range ticks {
+		var total, worst time.Duration
+		var unknown int64
+		for it := 0; it < iters; it++ {
+			t.Run(fmt.Sprintf("tick%v/iter%d", tick, it), func(t *testing.T) {
+				r := runFailover(t, bin, uint64(it)+1, tick)
+				total += r.failover
+				worst = max(worst, r.failover)
+				unknown += r.unknown
+			})
+		}
+		if unknown == 0 {
+			t.Errorf("tick %v: no operation ended with an unknown outcome; the short clients prove nothing", tick)
+		}
+		t.Logf("tick %v: heartbeat %v, election timeout %v to %v, peer RPC timeout %v: failover mean %v, max %v over %d runs; %d ops with unknown outcome",
+			tick, tick*time.Duration(tm.HeartbeatEvery), tick*time.Duration(tm.ElectionMin), tick*time.Duration(tm.ElectionMax),
+			server.DefaultRPCTimeout, (total / time.Duration(iters)).Round(time.Millisecond), worst.Round(time.Millisecond), iters, unknown)
 	}
 }
 
-func runFailover(t *testing.T, bin string, seed uint64) {
+type failoverResult struct {
+	failover time.Duration
+	done     int64
+	unknown  int64
+}
+
+func runFailover(t *testing.T, bin string, seed uint64, tick time.Duration) failoverResult {
 	dir := t.TempDir()
 	addrs := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
 	var peerList []string
@@ -137,7 +178,7 @@ func runFailover(t *testing.T, bin string, seed uint64) {
 	for i := range procs {
 		procs[i] = &proc{
 			args: []string{"-id", fmt.Sprint(i + 1), "-peers", strings.Join(peerList, ","),
-				"-data-dir", filepath.Join(dir, fmt.Sprintf("n%d", i+1)), "-tick", "10ms"},
+				"-data-dir", filepath.Join(dir, fmt.Sprintf("n%d", i+1)), "-tick", tick.String()},
 			log: filepath.Join(dir, fmt.Sprintf("n%d.log", i+1)),
 		}
 		procs[i].start(t, bin)
@@ -173,11 +214,17 @@ func runFailover(t *testing.T, bin string, seed uint64) {
 		stop     = make(chan struct{})
 		wg       sync.WaitGroup
 	)
-	for ci := 0; ci < numClients; ci++ {
+	for ci := 0; ci < numClients+numShortClients; ci++ {
 		wg.Add(1)
 		go func(ci int) {
 			defer wg.Done()
-			c, err := client.New(addrs, client.Options{AttemptTimeout: 500 * time.Millisecond})
+			// Short clients give up after 300ms, so operations caught by the
+			// failover end with an unknown outcome.
+			attempt, deadline := 500*time.Millisecond, 5*time.Second
+			if ci >= numClients {
+				attempt, deadline = 100*time.Millisecond, 300*time.Millisecond
+			}
+			c, err := client.New(addrs, client.Options{AttemptTimeout: attempt})
 			if err != nil {
 				t.Error(err)
 				return
@@ -194,7 +241,7 @@ func runFailover(t *testing.T, bin string, seed uint64) {
 				if rng.IntN(2) == 0 {
 					in.put, in.value = true, fmt.Sprintf("c%d-%d", ci, n)
 				}
-				opCtx, opCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				opCtx, opCancel := context.WithTimeout(context.Background(), deadline)
 				call := since()
 				var out kvOut
 				if in.put {
@@ -273,4 +320,5 @@ func runFailover(t *testing.T, bin string, seed uint64) {
 			t.Fatalf("node %d did not exit cleanly on SIGTERM (exited=%v): %v", i+1, ok, err)
 		}
 	}
+	return failoverResult{failover: failover, done: done.Load(), unknown: failed.Load()}
 }

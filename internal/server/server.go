@@ -91,6 +91,7 @@ type Node struct {
 
 	inbox   chan paxos.Message
 	submit  chan submission
+	abandon chan submission // a handler gave up waiting; drop its waiter
 	inspect chan func()
 	quit    chan struct{}
 	done    chan struct{}
@@ -119,6 +120,7 @@ func Start(cfg Config) (*Node, error) {
 		cfg:     cfg,
 		inbox:   make(chan paxos.Message, inboxSize),
 		submit:  make(chan submission),
+		abandon: make(chan submission),
 		inspect: make(chan func()),
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -230,6 +232,12 @@ func (n *Node) loop() {
 		case s := <-n.submit:
 			n.waiters[s.req.ClientID] = waiter{seq: s.req.Seq, ch: s.ch}
 			n.rep.Handle(paxos.Message{From: clientEndpoint, To: n.cfg.ID, Body: s.req})
+		case s := <-n.abandon:
+			// Only remove the waiter if it is still this handler's; a retry
+			// may already have replaced it.
+			if w, ok := n.waiters[s.req.ClientID]; ok && w.ch == s.ch {
+				delete(n.waiters, s.req.ClientID)
+			}
 		case f := <-n.inspect:
 			f()
 		}
@@ -280,6 +288,12 @@ func (n *Node) do(ctx context.Context, req paxos.ClientRequest) (paxos.ClientRep
 	case r := <-ch:
 		return r, nil
 	case <-ctx.Done():
+		// Timed out or cancelled: tell the loop to forget this waiter now,
+		// so the table only holds requests someone is still waiting for.
+		select {
+		case n.abandon <- submission{req: req, ch: ch}:
+		case <-n.done:
+		}
 		return paxos.ClientReply{}, status.FromContextError(ctx.Err()).Err()
 	case <-n.done:
 		return paxos.ClientReply{}, status.Error(codes.Unavailable, "node stopping")
