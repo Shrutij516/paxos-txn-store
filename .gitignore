@@ -1,2 +1,6 @@
 coverage.out
 coverage-paxos.out
+coverage-child.out
+coverage-all.out
+coverage-pkg.out
+covdata/
