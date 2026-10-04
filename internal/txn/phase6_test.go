@@ -105,3 +105,86 @@ func TestTouch(t *testing.T) {
 		}
 	}
 }
+
+// runRetryAtNewLeader is one seeded run of the case the logged one-phase
+// abort exists for. A client's one-phase commit reaches the shard leader,
+// which sends the record's accepts and crashes before anyone learns it is
+// chosen. The next leader recovers the record from the promises, but is
+// cut off from the remaining replica as soon as it takes over, so it
+// cannot commit the record yet. The client's commit times out and, as the
+// SDK does, retries at the next replicas until it reaches the new leader,
+// whose read locks are gone. Then the partition heals and the recovered
+// record commits. It returns the first check that fails.
+func runRetryAtNewLeader(seed uint64, broken bool) error {
+	a, b, sh := sameShardAccounts()
+	w := newWorld(seed, worldOpts{Clients: 1, OpsPerClient: 0, Faults: transport.Faults{MaxDelay: 3},
+		Server: Config{ReplyAbortUnlogged: broken}})
+	tc := w.cli[0]
+	tc.plan = func(*client) ([]string, string) { return []string{a, b}, b }
+	if _, ok := w.runUntil(2000, func() bool { return w.leader(sh) != nil }); !ok {
+		return fmt.Errorf("no leader for shard %d", sh)
+	}
+	tc.hold, tc.ops, tc.think = true, 1, 1
+	if _, ok := w.runUntil(2000, func() bool { return tc.phase == phHeld }); !ok {
+		return fmt.Errorf("T never finished its reads")
+	}
+	tid := tc.meta.ID
+	var old paxos.NodeID
+	w.net.OnSend = func(m paxos.Message) {
+		w.observe(m)
+		if acc, ok := m.Body.(paxos.LogAccept); ok && old == 0 {
+			if r, err := decode(acc.Entry.Cmd); err == nil && r.Kind == KindOnePhase && r.Txn.ID == tid {
+				old = m.From
+			}
+		}
+	}
+	tc.release()
+	if _, ok := w.runUntil(500, func() bool { return old != 0 }); !ok {
+		return fmt.Errorf("the one-phase record was never proposed")
+	}
+	w.crash(old) // its accepts are already on the wire
+	var nl *node
+	if _, ok := w.runUntil(2000, func() bool { nl = w.leader(sh); return nl != nil }); !ok {
+		return fmt.Errorf("no new leader")
+	}
+	var rest []paxos.NodeID
+	for _, id := range w.ids {
+		if id != nl.id {
+			rest = append(rest, id)
+		}
+	}
+	w.net.Partition([]paxos.NodeID{nl.id, tc.id}, rest)
+	// The client gives up on the old leader and tries the others until
+	// some replica answers, or the partition has lasted long enough.
+	w.runUntil(1500, func() bool { return tc.phase != phCommitting })
+	w.net.Heal()
+	w.restart(old)
+	if _, ok := w.runUntil(calmLimit, w.quiescent); !ok {
+		return fmt.Errorf("not quiescent")
+	}
+	return checkNoBank(w)
+}
+
+// TestOnePhaseRetryAtNewLeader runs that case over seeded schedules. With
+// the abort logged before the reply, every seed passes. With the old
+// reply (ReplyAbortUnlogged) the client is told "aborted" for a txn that
+// then commits, and the outcome check catches it.
+func TestOnePhaseRetryAtNewLeader(t *testing.T) {
+	seeds := numSeeds(txnSchedules)
+	caught := 0
+	for seed := uint64(1); seed <= seeds; seed++ {
+		if err := runRetryAtNewLeader(seed, false); err != nil {
+			t.Fatalf("seed=%d: %v", seed, err)
+		}
+		if err := runRetryAtNewLeader(seed, true); err != nil {
+			if caught == 0 {
+				t.Logf("without the logged abort, seed=%d: %v", seed, err)
+			}
+			caught++
+		}
+	}
+	if caught == 0 {
+		t.Fatalf("no seed caught the unlogged abort reply in %d schedules", seeds)
+	}
+	t.Logf("unlogged abort reply caught in %d of %d seeds; logged abort passes all", caught, seeds)
+}

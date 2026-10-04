@@ -40,6 +40,10 @@ const (
 	shortDeadline = 150 * time.Millisecond
 	longDeadline  = 10 * time.Second
 	phase         = 1500 * time.Millisecond // between kills and restarts
+	// inDoubtWait is passed to every process (-in-doubt-wait). A txn left
+	// prepared by a kill keeps its locks until its participants ask the
+	// coordinator, this long after the new leader takes over.
+	inDoubtWait = server.DefaultInDoubtWait
 )
 
 // coverDirEnv, when set to a directory, makes the test build paxosd with
@@ -392,7 +396,7 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 	}
 	cfg := writeConfig(t, dir, procs)
 	for _, p := range procs {
-		p.args = []string{"-config", cfg, "-id", fmt.Sprint(p.id), "-data-dir", p.dir, "-tick", tick.String()}
+		p.args = []string{"-config", cfg, "-id", fmt.Sprint(p.id), "-data-dir", p.dir, "-tick", tick.String(), "-in-doubt-wait", inDoubtWait.String()}
 		p.start(t, bin)
 	}
 	defer func() {
@@ -524,7 +528,7 @@ func quiesce(t *testing.T, procs []*proc, bin string) map[txn.ShardID]*txn.SM {
 		for _, p := range procs {
 			p.start(t, bin)
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(2*time.Second + 2*inDoubtWait) // an election, then the outcome queries
 	}
 }
 

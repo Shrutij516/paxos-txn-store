@@ -88,8 +88,8 @@ type Client struct {
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
 	leaders map[int]string // cached leader address per shard
-	next    int                    // round-robin position when a leader is unknown
-	shards  int                    // learned from Begin
+	next    int            // round-robin position when a leader is unknown
+	shards  int            // learned from Begin
 	rng     *rand.Rand
 }
 
@@ -331,7 +331,7 @@ func (t *Txn) ReadValues() map[string]string { return maps(t.vals) }
 func (t *Txn) Shards() []int {
 	out := make([]int, 0, len(t.touch))
 	for sh := range t.touch {
-		out = append(out, int(sh))
+		out = append(out, sh)
 	}
 	slices.Sort(out)
 	return out

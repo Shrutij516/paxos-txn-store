@@ -322,3 +322,21 @@ func TestStoppedNode(t *testing.T) {
 		t.Fatalf("run on a stopped node: %v", err)
 	}
 }
+
+func TestInDoubtWaitInTicks(t *testing.T) {
+	cl := Cluster{Shards: 1, Nodes: []NodeConfig{{ID: 1, Addr: "127.0.0.1:0"}}}
+	for _, tc := range []struct {
+		wait, tick time.Duration
+		ticks      int
+	}{{0, 10 * time.Millisecond, 60}, {250 * time.Millisecond, 10 * time.Millisecond, 25}, {25 * time.Millisecond, 10 * time.Millisecond, 3}} {
+		n, err := Start(Config{ID: 1, Cluster: cl, DataDir: t.TempDir(), Tick: tc.tick, InDoubtWait: tc.wait})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := n.cfg.Txn.QueryAfter
+		n.Stop()
+		if got != tc.ticks {
+			t.Errorf("in-doubt wait %v at tick %v: QueryAfter %d ticks, want %d", tc.wait, tc.tick, got, tc.ticks)
+		}
+	}
+}

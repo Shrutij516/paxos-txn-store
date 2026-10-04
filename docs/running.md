@@ -45,8 +45,9 @@ Each shard elects its own leader within a few hundred milliseconds, so the leade
 | `-listen` | the node's `addr` in the config | address to bind, if different (for example `0.0.0.0:7001`) |
 | `-tick` | `10ms` | wall-clock length of one logical tick |
 | `-rpc-timeout` | `200ms` | deadline for each peer RPC |
+| `-in-doubt-wait` | `600ms` | how long a prepared transaction waits for its coordinator's decision before its shard leader asks for it (rounded up to whole ticks); see below |
 
-With the default tick, a shard leader sends a heartbeat every 40 ms and a follower starts an election after 200 to 400 ms without one (DECISIONS.md entry 15). The transaction layer's timeouts are also in ticks: a prepared participant asks its coordinator for the outcome after 0.6 s, a coordinator gives up on missing votes after 3 s, and an idle read lock expires after 2 s.
+With the default tick, a shard leader sends a heartbeat every 40 ms and a follower starts an election after 200 to 400 ms without one (DECISIONS.md entry 15). The transaction layer's timeouts are also in ticks: a prepared participant asks its coordinator for the outcome after `-in-doubt-wait` (0.6 s), a coordinator gives up on missing votes after 3 s, and an idle read lock expires after 2 s.
 
 Stop a node with Ctrl-C or `kill <pid>` (SIGTERM). It stops accepting requests, waits up to 2 seconds for in-flight ones, stops its event loops and closes its databases. Start it again with the same flags and every shard replica recovers from its file (docs/storage.md) and catches up from its shard's leader.
 
@@ -147,7 +148,16 @@ Numbers from one full run of 3 iterations in the development sandbox:
 | Failover, first kill (shard 2 leader) | 273, 243, 240 ms |
 | Failover, second kill (shard 0 leader, commits in flight) | 263, 402, 219 ms |
 
-They vary a lot between runs on a shared machine: another full run gave 26 to 59 committed transactions per second and one second-kill failover of 1.36 s. Failover is the time from the SIGKILL to the commit of the first transaction that began after it and touched a shard the killed node led. It is at least an election timeout (200 to 400 ms), and more when that transaction needs a key locked by a transaction left prepared by the kill: such a transaction stays prepared until its participants ask the new coordinator leader (after 0.6 s) and learn the outcome. That is the blocking window two-phase commit keeps even with replicated coordinators, now bounded by the query timeout instead of by a coordinator restart.
+They vary a lot between runs on a shared machine: another full run gave 26 to 59 committed transactions per second and one second-kill failover of 1.36 s. Failover is the time from the SIGKILL to the commit of the first transaction that began after it and touched a shard the killed node led. It is at least an election timeout (200 to 400 ms), and more when that transaction needs a key locked by a transaction left prepared by the kill: such a transaction stays prepared until its participants ask the new coordinator leader (after `-in-doubt-wait`) and learn the outcome. That is the blocking window two-phase commit keeps even with replicated coordinators, now bounded by the in-doubt wait instead of by a coordinator restart.
+
+### The in-doubt wait and failover
+
+`-in-doubt-wait` sets how long a shard leader holding a prepared transaction waits for the coordinator's decision before asking the coordinator shard for it. Normally the decision arrives within milliseconds and the wait never expires. It matters when the coordinator shard's leader dies between collecting votes and telling the participants: the participants keep the transaction's locks for an election plus up to the in-doubt wait plus one round trip. Any transaction that needs one of those keys waits that long, or is wounded and retried. A participant whose leader changes starts the wait again under the new leader.
+
+- Shorter (down to a few ticks): in-doubt locks are released sooner after a coordinator failure. The cost is more outcome queries. A coordinator that is still collecting votes just lets a query wait, but a query that reaches a new coordinator leader before the client's commit retry does finds no decision and no coordination in progress, so it logs a presumed abort, aborting a transaction that could still have committed.
+- Longer: fewer needless queries, but locks left by a coordinator failure are held longer, so throughput drops for longer after such a failure.
+
+Measured with the multi-process test (3 iterations each, same machine): the failover metric above stayed at 193 to 456 ms for 150 ms, 600 ms and 2 s, because the first transaction to commit after a kill rarely needs a key that an in-doubt transaction holds. Throughput was 66, 63 and 59 committed transactions per second, within the run-to-run noise noted above. The wait shows in the transactions that do touch in-doubt keys: they wait at least the election timeout plus the in-doubt wait.
 
 The workload is deliberately contended: 10 clients on 12 accounts, where two transfers that read the same account both need to upgrade to a write lock and the younger one is wounded, and audits hold read locks on every account. Uncontended, a single-shard transfer takes about 3 ms and a cross-shard one about 7 ms on the same machine.
 

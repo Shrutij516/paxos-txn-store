@@ -24,6 +24,7 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		{"-config", filepath.Join(dir, "missing.json"), "-id", "1", "-data-dir", t.TempDir()},
 		{"-config", bad, "-id", "1", "-data-dir", t.TempDir()},
 		{"-config", good, "-id", "2", "-data-dir", t.TempDir()}, // not in the config
+		{"-config", good, "-id", "1", "-data-dir", t.TempDir(), "-in-doubt-wait", "0s"},
 		{"-bogus"},
 	} {
 		if err := run(args); err == nil {

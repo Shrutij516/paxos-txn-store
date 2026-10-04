@@ -132,7 +132,7 @@ func newWorld(seed uint64, o worldOpts) *world {
 	}
 	for i := 0; i < o.Clients; i++ {
 		c := &client{w: w, idx: i, id: paxos.NodeID(clientBase + i), ops: o.OpsPerClient,
-			rng: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(i))), attempts: map[ID]*attempt{}}
+			rng: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(i))), attempts: map[ID]*attempt{}, leaders: map[ShardID]paxos.NodeID{}}
 		c.think = 1 + c.rng.IntN(10)
 		w.cli = append(w.cli, c)
 		w.net.Register(c.id, c.handle)
@@ -349,6 +349,9 @@ type attempt struct {
 	audit  bool
 	begin  int64 // step the attempt began
 	ack    int64 // step the client learned it committed, -1 if never
+	// toldAbort: a CommitResp said the attempt did not commit. The logs
+	// must agree (checkAtomicity).
+	toldAbort bool
 }
 
 const (
@@ -384,7 +387,9 @@ type client struct {
 	attempts map[ID]*attempt
 	commits  int
 	aborts   int
-	hold     bool // stop before committing; release() continues
+	hold     bool                     // stop before committing; release() continues
+	leaders  map[ShardID]paxos.NodeID // learned from replies, as the SDK caches them
+	rr       int                      // round-robin position when a leader is unknown
 }
 
 // release lets a held client send its commit request.
@@ -399,6 +404,22 @@ func (c *client) release() {
 func (c *client) done() bool { return c.ops == 0 && c.phase == phIdle }
 
 func (c *client) shardOf(k string) ShardID { return ShardOf(k, c.w.opts.Shards) }
+
+// commitTarget picks the node for a commit request the way the SDK does:
+// the shard's cached leader, or the next replica round-robin when it is
+// unknown. A retry after a timeout forgets the cached leader first, so
+// the request moves on to another replica, which may be the new leader.
+func (c *client) commitTarget(sh ShardID, retry bool) paxos.NodeID {
+	if retry {
+		delete(c.leaders, sh)
+	}
+	if n, ok := c.leaders[sh]; ok {
+		return n
+	}
+	nodes := shardNodes(sh)
+	c.rr++
+	return nodes[c.rr%len(nodes)]
+}
 
 func (c *client) toShard(sh ShardID, body any) {
 	for _, n := range shardNodes(sh) {
@@ -475,7 +496,8 @@ func (c *client) resend() {
 	case phCommitting:
 		c.timer = commitTimeout
 		parts := c.parts()
-		c.toShard(parts[0].Shard, CommitReq{Txn: c.meta, Coord: parts[0].Shard, Parts: parts, Client: c.id})
+		to := c.commitTarget(parts[0].Shard, c.tries > 0)
+		c.w.net.Send(paxos.Message{From: c.id, To: to, Body: paxos.Ext{Body: CommitReq{Txn: c.meta, Coord: parts[0].Shard, Parts: parts, Client: c.id}}})
 	}
 }
 
@@ -513,6 +535,7 @@ func (c *client) handle(m paxos.Message) {
 		if c.phase != phReading || r.Txn != c.meta.ID || r.Key != c.keys[c.next] {
 			return
 		}
+		c.leaders[c.w.shard[m.From]] = m.From
 		if r.Aborted {
 			c.abort()
 			return
@@ -534,7 +557,9 @@ func (c *client) handle(m paxos.Message) {
 		if c.phase != phCommitting || r.Txn != c.meta.ID {
 			return
 		}
+		c.leaders[c.w.shard[m.From]] = m.From
 		if !r.Committed {
+			c.cur.toldAbort = true
 			c.abort()
 			return
 		}

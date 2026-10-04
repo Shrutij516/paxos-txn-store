@@ -43,7 +43,10 @@ const (
 	DefaultTick       = 10 * time.Millisecond
 	DefaultRPCTimeout = 200 * time.Millisecond
 	DefaultReqTimeout = 2 * time.Second
-	inboxSize         = 4096
+	// DefaultInDoubtWait is how long a prepared participant waits for its
+	// coordinator's decision before asking for it.
+	DefaultInDoubtWait = 600 * time.Millisecond
+	inboxSize          = 4096
 )
 
 // Config describes one node.
@@ -65,6 +68,13 @@ type Config struct {
 	ReqTimeout time.Duration
 	// Timing overrides the replicas' timing in ticks; zero means the default.
 	Timing paxos.LogTiming
+	// InDoubtWait is how long a shard leader holding a prepared
+	// transaction waits for the coordinator's decision before it asks the
+	// coordinator shard for the outcome (txn.Config.QueryAfter, rounded up
+	// to whole ticks). Until then the transaction keeps its locks, so after
+	// a coordinator failure it bounds how long conflicting transactions
+	// wait. Zero means DefaultInDoubtWait. Ignored if Txn.QueryAfter is set.
+	InDoubtWait time.Duration
 	// Txn overrides the transaction layer's timeouts in ticks; zero fields
 	// take the defaults. Shard and ShardNodes are filled in per shard.
 	Txn txn.Config
@@ -107,6 +117,12 @@ func Start(cfg Config) (*Node, error) {
 	}
 	if cfg.ReqTimeout <= 0 {
 		cfg.ReqTimeout = DefaultReqTimeout
+	}
+	if cfg.InDoubtWait <= 0 {
+		cfg.InDoubtWait = DefaultInDoubtWait
+	}
+	if cfg.Txn.QueryAfter <= 0 {
+		cfg.Txn.QueryAfter = int((cfg.InDoubtWait + cfg.Tick - 1) / cfg.Tick)
 	}
 	n := &Node{cfg: cfg, addrs: addrs}
 	var err error

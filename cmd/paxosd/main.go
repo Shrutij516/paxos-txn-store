@@ -36,11 +36,16 @@ func run(args []string) error {
 	dataDir := fs.String("data-dir", "", "directory for this node's SQLite files, one per shard")
 	tick := fs.Duration("tick", server.DefaultTick, "wall-clock length of one logical Paxos tick")
 	rpcTimeout := fs.Duration("rpc-timeout", server.DefaultRPCTimeout, "deadline for each peer RPC")
+	inDoubt := fs.Duration("in-doubt-wait", server.DefaultInDoubtWait,
+		"how long a prepared transaction waits for its coordinator's decision before asking for it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *config == "" || *id <= 0 || *dataDir == "" {
 		return fmt.Errorf("-config, -id and -data-dir are required")
+	}
+	if *inDoubt <= 0 || *tick <= 0 {
+		return fmt.Errorf("-in-doubt-wait and -tick must be positive")
 	}
 	cl, err := server.LoadCluster(*config)
 	if err != nil {
@@ -51,7 +56,7 @@ func run(args []string) error {
 	}
 	n, err := server.Start(server.Config{
 		ID: paxos.NodeID(*id), Cluster: cl, Listen: *listen, DataDir: *dataDir,
-		Tick: *tick, RPCTimeout: *rpcTimeout,
+		Tick: *tick, RPCTimeout: *rpcTimeout, InDoubtWait: *inDoubt,
 	})
 	if err != nil {
 		return err

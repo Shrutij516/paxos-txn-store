@@ -21,6 +21,7 @@ type Config struct {
 	ReleaseLocksAtPrepare bool // participant drops its locks once prepared (pair with SM.noLockCheck)
 	VolatilePrepare       bool // prepare kept only in leader memory
 	NoWoundWait           bool // conflicting requests always wait
+	ReplyAbortUnlogged    bool // a failed one-phase commit is answered "aborted" without logging it
 }
 
 // Defaults for zero Config fields.
@@ -531,6 +532,10 @@ func (s *Server) fail(q *lockReq) {
 		// without anyone learning it yet (the client then retries here);
 		// whichever record comes first in the log decides, and the client
 		// is told that outcome.
+		if s.cfg.ReplyAbortUnlogged {
+			s.toNode(q.from, CommitResp{Txn: id, Committed: false}) // broken on purpose
+			return
+		}
 		s.clients[id] = q.from
 		s.propose(Record{Kind: KindAbort, Txn: q.meta})
 	}

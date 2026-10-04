@@ -11,7 +11,23 @@ func (w *world) checkAtomicity() error {
 	if w.unloggedDecision != nil {
 		return fmt.Errorf("atomicity: %w", w.unloggedDecision)
 	}
-	return CheckAtomicity(w.canonical())
+	if err := CheckAtomicity(w.canonical()); err != nil {
+		return err
+	}
+	// What clients were told must match the logs.
+	committed := Committed(w.canonical())
+	for _, c := range w.cli {
+		for _, id := range sortedTxns(c.attempts) {
+			a := c.attempts[id]
+			if a.toldAbort && committed[id] {
+				return fmt.Errorf("atomicity: client %d was told txn %d aborted, but it committed", c.id, id)
+			}
+			if a.ack >= 0 && !committed[id] {
+				return fmt.Errorf("atomicity: client %d was told txn %d committed, but it did not", c.id, id)
+			}
+		}
+	}
+	return nil
 }
 
 func (w *world) checkBank() error {

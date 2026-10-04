@@ -50,7 +50,7 @@ func ExampleClient_Run() {
 	case errors.Is(err, api.ErrUnknown):
 		fmt.Printf("txn %d may or may not have committed; read the balances to find out\n", id)
 	case err != nil:
-		log.Fatal(err)
+		fmt.Println("transfer failed:", err)
 	default:
 		fmt.Printf("txn %d committed\n", id)
 	}
