@@ -1,6 +1,6 @@
 # Transactions across shards
 
-Phase 5 adds serializable, interactive transactions across shards. It runs in the deterministic simulator only; Phase 6 will wire it into `paxosd` and the SDK. The code is in `internal/txn`.
+Phase 5 adds strictly serializable, interactive transactions across shards. It runs in the deterministic simulator only; Phase 6 will wire it into `paxosd` and the SDK. The code is in `internal/txn`.
 
 ## The pieces
 
@@ -29,15 +29,27 @@ A single replica crashing therefore loses nothing. If the coordinator shard's le
 
 As long as a majority of each shard is up, every prepared transaction eventually learns its outcome.
 
-## Two-phase locking
+## Concurrency control: two-phase locking plus validation at apply time
 
-Each shard leader keeps a lock table and runs strict two-phase locking:
+Two mechanisms work together. Strict two-phase locking at each shard leader keeps conflicting transactions apart while they run. Validation in the replicated state machine guarantees safety even when a leader's locks are lost.
 
-- A **read** takes a shared lock on the key and returns the latest committed value with its version (the log slot that wrote it).
-- **Prepare** takes exclusive locks on the keys the transaction will write, then writes the prepare record. From then on the record itself is the lock: every replica knows a prepared transaction holds its read and write keys until its commit or abort record is applied.
-- Locks are released only when the transaction commits or aborts.
+**Locks at the leader.** Each shard leader keeps a lock table:
 
-Shared read locks taken before prepare live only in the leader's memory. If that leader fails or is replaced, they are gone, and the transaction aborts when it tries to prepare (DECISIONS.md explains why that is acceptable). To make this safe even when a deposed leader does not yet know it was replaced, the state machine checks every prepare and one-phase record when it applies it: every key read must still be at the version the client saw, and the record must not overlap another prepared transaction's locks (its writes against their reads and writes, its reads against their writes). Losing a lock can only cause an abort, never a non-serializable commit.
+- A **read** takes a shared lock on the key and returns the latest committed value with its version (the log slot that wrote it). A read waits while another transaction holds an exclusive lock on the key, so it never sees a prepared but uncommitted write.
+- **Prepare** first checks that the transaction still holds a shared lock on every key it read at this shard, then takes exclusive locks on the keys it will write, then proposes the prepare record. Between proposing and applying, the leader holds those exclusive locks in memory.
+- Once the prepare record is applied, the record itself is the lock: every replica knows that a prepared transaction holds its read and write keys. The leader's lock table includes all prepared records, so a new leader has them too.
+- Locks are released only when the transaction's commit or abort record is applied (strict 2PL). A one-phase transaction takes its exclusive locks, writes one record and releases everything when that record is applied.
+
+Shared locks taken before prepare live only in the leader's memory. They are lost if the leader changes, and an idle transaction's shared locks expire after a lease (`LockLease`). The lease never touches a prepared transaction: its locks come from the replicated record, not from the lease-managed table (`TestLeaseNeverExpiresPreparedLock` keeps a transaction prepared for ten lease periods and checks a conflicting transaction still cannot commit). When a shared lock is lost, the transaction fails the "still holds its shared locks" check at prepare and aborts.
+
+**Validation when records are applied.** A prepare or one-phase record carries the versions the transaction read at that shard, including shards it only read from. When a replica applies the record, it checks:
+
+1. every key read is still at the version the transaction saw, and
+2. the record does not overlap another prepared transaction: its writes against their reads and writes, its reads against their writes.
+
+If either check fails, the record is rejected on every replica, deterministically, and the participant votes no. This matters because a leader that has been replaced may not know it yet and can still grant locks and serve reads. Its records may even be committed later by the new leader's recovery. Validation at apply time makes those cases harmless: a stale read or a lost lock can cause an abort, but never a non-serializable commit. `TestReadOnlyParticipantValidatesAfterLeaderChange` covers this: a transaction reads from shard A and only writes to shard B, A's leader changes, another transaction overwrites the key read on A, and the first transaction aborts.
+
+So the protocol is 2PL for liveness and low abort rates, with an optimistic version check at the replicated state machine as the safety guarantee across leader changes.
 
 ## Deadlocks and wound-wait
 
@@ -60,14 +72,35 @@ When a replica becomes leader, its volatile state is empty: no shared locks, no 
 - **Votes.** If the old leader crashed before voting, the coordinator's retried prepare finds the record already there and gets a yes.
 - **Outcomes.** Prepared transactions query the coordinator shard until they learn the decision, then write a commit or abort record. Commit, abort and decide records are idempotent by transaction ID: duplicates do nothing.
 
+## Isolation level
+
+The tests show **strict serializability** for committed transactions. The checker builds Adya's direct serialization graph over every committed transaction in each schedule:
+
+- **G1a, aborted reads:** every version a committed transaction read was installed by a committed transaction.
+- **G1b, intermediate reads:** every version read is its writer's final version of that key.
+- **G-cycle:** the graph of write-write, write-read and read-write (anti-dependency) edges has no cycle. Passing this means the history is serializable.
+- **Real-time order:** an edge from T1 to T2 whenever the client learned that T1 committed before T2 began. With these edges added the graph is still acyclic in all 1000 schedules, so the serial order also respects real time.
+
+Each of these checks has a control that tampers with a real history and must be rejected (`TestTxnCheckerControls`, `TestTxnSerializabilityCheckerCatchesTamperedHistory`). The claim covers committed transactions only. Reads of a transaction that later aborts may be stale (for example, served by a deposed leader); the abort is what keeps them out of the history.
+
+## Presumed abort is logged before it is answered
+
+When a participant asks the coordinator shard about a transaction and no decision is in the log, the coordinator shard does one of two things. If it is still collecting votes for that transaction, it does not answer, and the participant asks again later (`TestQueryWhileCoordinatingWaitsForDecision`). Otherwise it proposes an abort decision and answers only after that decision has been applied from its log. Since the first decision applied wins, a transaction whose abort has been logged can never commit, even if the client's commit request arrives afterwards (`TestQueryBeforeDecisionLogsAbortFirst`). Every schedule also checks that no node ever sends a Decision message that is not already in its own log.
+
 ## What the tests check
 
 | Property | Test | Seeds |
 |---|---|---|
 | Every txn commits on all its shards or none, with crashes, partitions and leader failovers | `TestTxnAtomicity` | 1000 (100 under -short) |
 | Total balance never changes, in the final state and in every committed audit | `TestTxnBankInvariant` | same schedules |
-| Committed history has no cycle in its dependency graph (ww, wr, rw) | `TestTxnSerializable` | same schedules |
-| A history with an injected write-skew cycle is rejected | `TestTxnSerializabilityCheckerCatchesTamperedHistory` | 1 |
+| No G1a or G1b, and no cycle in the dependency graph (ww, wr, rw): serializable | `TestTxnSerializable` | same schedules |
+| Still acyclic with real-time edges: strictly serializable | `TestTxnStrictSerializable` | same schedules |
+| Tampered histories are rejected: write-skew cycle, G1a, G1b, real-time violation | `TestTxnSerializabilityCheckerCatchesTamperedHistory`, `TestTxnCheckerControls` | 1 each |
+| A Decision is only sent once it is in the sender's log | every schedule | 1000 |
+| A lease never expires a prepared transaction's locks | `TestLeaseNeverExpiresPreparedLock` | 1 |
+| A read-only participant validates its reads after a leader change | `TestReadOnlyParticipantValidatesAfterLeaderChange` | 1 |
+| Presumed abort is logged before it is answered, and wins | `TestQueryBeforeDecisionLogsAbortFirst` | 1 |
+| A query during coordination does not abort the txn | `TestQueryWhileCoordinatingWaitsForDecision` | 1 |
 | Coordinator leader crashes after deciding, before notifying | `TestCoordinatorCrashAfterDecide` | 30 |
 | Participant leader crashes while prepared | `TestParticipantCrashWhilePrepared` | 30 |
 | Crossing transactions make progress under wound-wait | `TestDeadlockCrossingTxnsProgress` | 200 |

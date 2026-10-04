@@ -80,3 +80,18 @@ func TestShardOfIsStableAndSpread(t *testing.T) {
 		t.Fatalf("accounts land on %d shards, want %d", len(seen), DefaultShards)
 	}
 }
+
+// A read-only participant's prepare carries its read versions and is
+// rejected if any of them changed.
+func TestSMReadOnlyPrepareValidatesVersions(t *testing.T) {
+	s := NewSM(map[string]string{"a": "1"})
+	apply(s, 1, Record{Kind: KindOnePhase, Txn: Meta{ID: 1}, Reads: map[string]uint64{"a": 0}, Writes: map[string]string{"a": "2"}})
+	if e := apply(s, 2, Record{Kind: KindPrepare, Txn: Meta{ID: 2}, Coord: 0, Participants: []ShardID{0, 1},
+		Reads: map[string]uint64{"a": 0}, Writes: map[string]string{}}); e.OK {
+		t.Fatal("read-only prepare with a stale version was accepted")
+	}
+	if e := apply(s, 3, Record{Kind: KindPrepare, Txn: Meta{ID: 3}, Coord: 0, Participants: []ShardID{0, 1},
+		Reads: map[string]uint64{"a": 1}, Writes: map[string]string{}}); !e.OK {
+		t.Fatal("read-only prepare with the current version was rejected")
+	}
+}

@@ -2,6 +2,7 @@ package txn
 
 import (
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"testing"
 
@@ -94,12 +95,12 @@ func checkAll(w *world) error {
 
 // scheduleResult is what one seeded schedule produced.
 type scheduleResult struct {
-	quiet                      bool
-	atomic, bank, serializable error
-	commits, aborts            int
-	leaderChanges              int
-	multiShardCommits          int
-	stats                      Stats
+	quiet                              bool
+	atomic, bank, serializable, strict error
+	commits, aborts                    int
+	leaderChanges                      int
+	multiShardCommits                  int
+	stats                              Stats
 }
 
 var (
@@ -115,9 +116,9 @@ func schedules() []scheduleResult {
 			w, ok := runSchedule(seed, nil)
 			r := scheduleResult{quiet: ok, atomic: w.checkAtomicity(), bank: w.checkBank()}
 			if h, err := w.history(); err != nil {
-				r.serializable = err
+				r.serializable, r.strict = err, err
 			} else {
-				r.serializable = checkSerializable(h)
+				r.serializable, r.strict = checkSerializable(h), checkStrict(h)
 			}
 			for _, c := range w.cli {
 				r.commits += c.commits
@@ -186,6 +187,49 @@ func TestTxnSerializable(t *testing.T) {
 		if r.serializable != nil {
 			t.Fatalf("seed=%d: %v", i+1, r.serializable)
 		}
+	}
+}
+
+// Test 3, strict: adding real-time edges (a txn whose commit the client saw
+// precedes every txn that began afterwards) keeps every history acyclic, so
+// the system is strictly serializable in these runs.
+func TestTxnStrictSerializable(t *testing.T) {
+	for i, r := range schedules() {
+		if r.strict != nil {
+			t.Fatalf("seed=%d: %v", i+1, r.strict)
+		}
+	}
+}
+
+// Controls for the G1a, G1b and real-time checks: each tampered history
+// must be rejected with the matching error.
+func TestTxnCheckerControls(t *testing.T) {
+	w, _ := runSchedule(1, nil)
+	base, err := w.history()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		tamper func(*history) bool
+		check  func(*history) error
+		want   string
+	}{
+		{"G1a", tamperG1a, checkSerializable, "G1a"},
+		{"G1b", tamperG1b, checkSerializable, "G1b"},
+		{"real-time", tamperRealTime, checkStrict, "not strictly serializable"},
+	} {
+		h := cloneHistory(base)
+		if !tc.tamper(h) {
+			t.Fatalf("%s: no suitable txns to tamper with", tc.name)
+		}
+		err := tc.check(h)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: tampered history gave %v, want an error mentioning %q", tc.name, err, tc.want)
+		}
+	}
+	if err := checkStrict(base); err != nil {
+		t.Fatalf("untampered history rejected: %v", err)
 	}
 }
 

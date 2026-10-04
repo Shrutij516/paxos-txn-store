@@ -73,6 +73,30 @@ type world struct {
 
 	onDecide   func(n *node, id ID)
 	onPrepared func(n *node, id ID)
+
+	// unloggedDecision records the first Decision message a node sent
+	// without that decision being in its own shard's log.
+	unloggedDecision error
+}
+
+// observe checks every Decision on the wire: the sender must already have
+// the decision applied from its shard's Paxos log, with the same outcome.
+func (w *world) observe(m paxos.Message) {
+	ext, ok := m.Body.(paxos.Ext)
+	if !ok {
+		return
+	}
+	d, ok := ext.Body.(Decision)
+	if !ok || w.unloggedDecision != nil {
+		return
+	}
+	n := w.nodes[m.From]
+	if n == nil {
+		return // a crashed node's sends are dropped anyway
+	}
+	if c, known := n.sm.Decided(d.Txn); !known || c != d.Commit {
+		w.unloggedDecision = fmt.Errorf("node %d sent Decision{txn %d, commit %v} without that decision in its log", m.From, d.Txn, d.Commit)
+	}
 }
 
 func shardNodes(sh ShardID) []paxos.NodeID {
@@ -95,6 +119,7 @@ func newWorld(seed uint64, o worldOpts) *world {
 	}
 	w.net.SetFaults(o.Faults)
 	w.net.Trace = w.trace
+	w.net.OnSend = w.observe
 	for sh := ShardID(0); int(sh) < o.Shards; sh++ {
 		for _, id := range shardNodes(sh) {
 			w.ids = append(w.ids, id)
@@ -322,6 +347,8 @@ type attempt struct {
 	vals   map[string]string
 	writes map[string]string
 	audit  bool
+	begin  int64 // step the attempt began
+	ack    int64 // step the client learned it committed, -1 if never
 }
 
 const (
@@ -329,6 +356,7 @@ const (
 	phReading
 	phCommitting
 	phBackoff
+	phHeld // reads done, commit held back by the test
 )
 
 // client runs interactive transactions one at a time: transfers between
@@ -356,6 +384,16 @@ type client struct {
 	attempts map[ID]*attempt
 	commits  int
 	aborts   int
+	hold     bool // stop before committing; release() continues
+}
+
+// release lets a held client send its commit request.
+func (c *client) release() {
+	c.hold = false
+	if c.phase == phHeld {
+		c.phase = phCommitting
+		c.resend()
+	}
 }
 
 func (c *client) done() bool { return c.ops == 0 && c.phase == phIdle }
@@ -420,7 +458,8 @@ func (c *client) newOp() {
 func (c *client) begin() {
 	c.counter++
 	c.meta = Meta{ID: ID(uint64(c.idx+1)<<32 | c.counter), TS: c.ts}
-	c.cur = &attempt{reads: map[string]uint64{}, vals: map[string]string{}, audit: c.audit}
+	c.cur = &attempt{reads: map[string]uint64{}, vals: map[string]string{}, audit: c.audit,
+		begin: int64(c.w.net.Now()), ack: -1}
 	c.attempts[c.meta.ID] = c.cur
 	c.next, c.tries = 0, 0
 	c.phase = phReading
@@ -485,6 +524,10 @@ func (c *client) handle(m paxos.Message) {
 			return
 		}
 		c.cur.writes = c.compute()
+		if c.hold {
+			c.phase = phHeld
+			return
+		}
 		c.phase = phCommitting
 		c.resend()
 	case CommitResp:
@@ -495,6 +538,7 @@ func (c *client) handle(m paxos.Message) {
 			c.abort()
 			return
 		}
+		c.cur.ack = int64(c.w.net.Now())
 		c.commits++
 		c.ops--
 		c.phase, c.think = phIdle, 1+c.rng.IntN(10)

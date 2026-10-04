@@ -11,6 +11,9 @@ import (
 // decision, no shard committed a transaction it never prepared, and nothing
 // is left prepared once the system is quiet.
 func (w *world) checkAtomicity() error {
+	if w.unloggedDecision != nil {
+		return fmt.Errorf("atomicity: %w", w.unloggedDecision)
+	}
 	sms := w.canonical()
 	shards := make([]ShardID, 0, len(sms))
 	for sh := range sms {
@@ -104,6 +107,8 @@ func (w *world) committed() map[ID]bool {
 type htxn struct {
 	reads  map[string]uint64 // key -> version read
 	writes []string
+	begin  int64 // step the client began it
+	end    int64 // step the client learned it committed, -1 if it never did
 }
 
 // history is what the serializability checker sees: committed
@@ -118,8 +123,8 @@ func (w *world) history() (*history, error) {
 	committed := w.committed()
 	for _, c := range w.cli {
 		for _, id := range sortedTxns(c.attempts) {
-			if committed[id] {
-				h.txns[id] = &htxn{reads: c.attempts[id].reads}
+			if a := c.attempts[id]; committed[id] {
+				h.txns[id] = &htxn{reads: a.reads, begin: a.begin, end: a.ack}
 			}
 		}
 	}
@@ -136,12 +141,26 @@ func (w *world) history() (*history, error) {
 	return h, nil
 }
 
-// checkSerializable builds Adya's direct serialization graph over the
-// committed transactions and reports a cycle if there is one. Edges:
-// ww (Ti wrote the version before Tj's), wr (Tj read Ti's version) and rw
-// (Ti read the version that Tj overwrote next). Transaction 0 is the
-// initial state.
-func checkSerializable(h *history) error {
+// checkSerializable checks Adya's G1a, G1b and G-cycle conditions over
+// the committed transactions: the history is serializable.
+func checkSerializable(h *history) error { return checkHistory(h, false) }
+
+// checkStrict additionally adds real-time edges (T1 precedes T2 when the
+// client learned T1 committed before T2 began), which makes it a check of
+// strict serializability.
+func checkStrict(h *history) error { return checkHistory(h, true) }
+
+// checkHistory builds Adya's direct serialization graph. Version edges:
+// ww (Ti wrote the version before Tj's), wr (Tj read Ti's version), rw (Ti
+// read the version that Tj overwrote next). Transaction 0 is the initial
+// state. Before looking for cycles it checks:
+//
+//	G1a (aborted read): every version read was installed by a committed
+//	    transaction. Only committed writes ever become versions, so a read
+//	    of anything else is a read of an aborted or never-committed write.
+//	G1b (intermediate read): every version read is its writer's final
+//	    version of that key.
+func checkHistory(h *history, realTime bool) error {
 	edges := map[ID]map[ID]bool{}
 	add := func(a, b ID) {
 		if a == b {
@@ -154,12 +173,15 @@ func checkSerializable(h *history) error {
 	}
 	versions := map[string][]WriteRec{}
 	index := map[string]map[uint64]int{}
+	final := map[string]map[ID]uint64{} // key -> writer -> last version it wrote
 	for _, k := range sortedKeys(h.order) {
 		vs := append([]WriteRec{{Key: k, Ver: 0, Writer: 0}}, h.order[k]...)
 		versions[k] = vs
 		index[k] = map[uint64]int{}
+		final[k] = map[ID]uint64{}
 		for i, v := range vs {
 			index[k][v.Ver] = i
+			final[k][v.Writer] = v.Ver
 			if i > 0 {
 				add(vs[i-1].Writer, v.Writer) // ww
 			}
@@ -172,14 +194,33 @@ func checkSerializable(h *history) error {
 			if vs == nil {
 				vs = []WriteRec{{Key: k}}
 				versions[k], index[k] = vs, map[uint64]int{0: 0}
+				final[k] = map[ID]uint64{0: 0}
 			}
 			i, ok := index[k][ver]
 			if !ok {
-				return fmt.Errorf("serializability: txn %d read %s at version %d, which was never committed", id, k, ver)
+				return fmt.Errorf("G1a (aborted read): txn %d read %s at version %d, which no committed txn installed", id, k, ver)
 			}
-			add(vs[i].Writer, id) // wr
+			w := vs[i].Writer
+			if final[k][w] != ver {
+				return fmt.Errorf("G1b (intermediate read): txn %d read %s at version %d, but its writer %d later wrote version %d", id, k, ver, w, final[k][w])
+			}
+			add(w, id) // wr
 			if i+1 < len(vs) {
 				add(id, vs[i+1].Writer) // rw
+			}
+		}
+	}
+	if realTime {
+		ids := sortedTxns(h.txns)
+		for _, a := range ids {
+			ta := h.txns[a]
+			if ta.end < 0 {
+				continue
+			}
+			for _, b := range ids {
+				if a != b && h.txns[b].begin > ta.end {
+					add(a, b) // a finished before b started
+				}
 			}
 		}
 	}
@@ -218,9 +259,99 @@ func checkSerializable(h *history) error {
 				stuck = append(stuck, id)
 			}
 		}
-		return fmt.Errorf("serializability: dependency cycle among %d txns, e.g. %v", len(stuck), stuck[:min(len(stuck), 4)])
+		kind := "G-cycle (not serializable)"
+		if realTime {
+			kind = "cycle with real-time edges (not strictly serializable)"
+		}
+		return fmt.Errorf("%s: dependency cycle among %d txns, e.g. %v", kind, len(stuck), stuck[:min(len(stuck), 4)])
 	}
 	return nil
+}
+
+func cloneHistory(h *history) *history {
+	out := &history{txns: map[ID]*htxn{}, order: map[string][]WriteRec{}}
+	for id, t := range h.txns {
+		cp := *t
+		cp.reads = map[string]uint64{}
+		for k, v := range t.reads {
+			cp.reads[k] = v
+		}
+		cp.writes = append([]string(nil), t.writes...)
+		out.txns[id] = &cp
+	}
+	for k, vs := range h.order {
+		out.order[k] = append([]WriteRec(nil), vs...)
+	}
+	return out
+}
+
+// tamperG1a makes a committed txn read a version that only an aborted txn
+// would have written (one no committed txn installed).
+func tamperG1a(h *history) bool {
+	for _, id := range sortedTxns(h.txns) {
+		for _, k := range sortedKeys(h.txns[id].reads) {
+			h.txns[id].reads[k] = 1 << 40 // never a real log slot
+			return true
+		}
+	}
+	return false
+}
+
+// tamperG1b gives a committed writer an extra, earlier version of a key it
+// wrote (as if it had written the key twice) and makes another committed
+// txn read that intermediate version.
+func tamperG1b(h *history) bool {
+	for _, k := range sortedKeys(h.order) {
+		vs := h.order[k]
+		if len(vs) == 0 {
+			continue
+		}
+		last := vs[len(vs)-1]
+		mid := WriteRec{Key: k, Ver: last.Ver - 1, Writer: last.Writer}
+		if mid.Ver == 0 || (len(vs) > 1 && vs[len(vs)-2].Ver >= mid.Ver) {
+			continue
+		}
+		for _, id := range sortedTxns(h.txns) {
+			if id == last.Writer {
+				continue
+			}
+			h.order[k] = append(append(vs[:len(vs)-1:len(vs)-1], mid), last)
+			h.txns[id].reads = map[string]uint64{k: mid.Ver}
+			return true
+		}
+	}
+	return false
+}
+
+// tamperRealTime finds committed A and B where A finished before B began
+// and makes A read a version B wrote. That wr edge B -> A contradicts the
+// real-time order A -> B, while the version graph alone stays acyclic.
+func tamperRealTime(h *history) bool {
+	writes := map[ID]WriteRec{}
+	for _, k := range sortedKeys(h.order) {
+		for _, wr := range h.order[k] {
+			if _, ok := writes[wr.Writer]; !ok {
+				writes[wr.Writer] = wr
+			}
+		}
+	}
+	ids := sortedTxns(h.txns)
+	for _, a := range ids {
+		for _, b := range ids {
+			wb, ok := writes[b]
+			ta, tb := h.txns[a], h.txns[b]
+			if !ok || a == b || ta.end < 0 || tb.begin <= ta.end {
+				continue
+			}
+			trial := cloneHistory(h)
+			trial.txns[a].reads = map[string]uint64{wb.Key: wb.Ver}
+			if checkSerializable(trial) == nil && checkStrict(trial) != nil {
+				h.txns[a].reads = trial.txns[a].reads
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tamper injects a write-skew cycle into a real history: two committed
