@@ -76,6 +76,12 @@ func (Accept) isPayload()   {}
 func (Accepted) isPayload() {}
 func (Nack) isPayload()     {}
 
+// Ext carries a message for a layer built on top of Paxos (such as the
+// transaction layer) through the same Transport. Paxos roles ignore it.
+type Ext struct{ Body any }
+
+func (Ext) isPayload() {}
+
 // Message is the envelope that crosses the Transport.
 type Message struct {
 	From NodeID

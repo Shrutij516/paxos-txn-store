@@ -111,7 +111,43 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **Rejected:** TLS from the start (certificate generation and rotation in every test and in local runs, for no benefit yet).
 - **Tradeoff:** Anyone who can reach a node's port can send it Paxos messages or client requests, and traffic is readable on the network. Not deployable outside a trusted network until mTLS lands (see Future work).
 
+## 17. Spanner-style two-phase commit over Paxos groups
+
+- **What:** Cross-shard transactions use two-phase commit in which one participant shard acts as coordinator, every prepare record is written through its participant shard's Paxos log before the participant votes, and the coordinator's decision is written through the coordinator shard's log before anyone is told. Participants that stay prepared too long query the coordinator shard; a coordinator shard with no decision and no coordination in progress presumes abort.
+- **Why:** Plain 2PC blocks when the coordinator fails after collecting votes. With every piece of 2PC state replicated, a single machine failure loses nothing: a new leader of the same shard picks up from the log. Using a participant as coordinator avoids a separate coordinator service and saves a round trip for the coordinator's own part.
+- **Rejected:** Plain 2PC with a single-node coordinator (blocking); three-phase commit (non-blocking only under synchronous network assumptions, and more rounds); Paxos Commit with a separate acceptor set per transaction (elegant, but more messages and more code than reusing the shard groups we already have); Calvin-style deterministic ordering (no 2PC at all, but needs read and write sets up front, which rules out interactive transactions).
+- **Tradeoff:** Each cross-shard commit costs a Paxos round on every participant plus one on the coordinator, on top of the 2PC messages. A transaction can still wait while a shard has no leader, but no longer than an election.
+
+## 18. Wound-wait for deadlocks
+
+- **What:** Lock conflicts are resolved by start timestamp: an older requester wounds (aborts) a younger holder, a younger requester waits. A wounded transaction retries with its original timestamp. A prepared holder is wounded by asking its coordinator to abort it if undecided.
+- **Why:** Prevents deadlock without detecting it: waits only point from younger to older, so no cycle can form, and a retried transaction keeps its age, so it cannot starve. It works across shards with no global view.
+- **Rejected:** Wait-die (younger requesters die instead of waiting; also deadlock-free, but aborts more often, because a young transaction dies every time it meets an older lock even when it would have been released soon); deadlock detection with a waits-for graph (fewest aborts, but needs a global graph across shards or periodic probing, which is a distributed protocol of its own); timeouts only (simple, but either slow to resolve deadlocks or aborts transactions that were merely slow).
+- **Tradeoff:** A younger transaction may be wounded even when no deadlock exists. Long-running transactions that start early are favored. Wounding a prepared transaction needs an extra message to its coordinator.
+
+## 19. Interactive transactions instead of one-shot
+
+- **What:** Clients run Begin, any number of Reads, buffered Writes, then Commit or Abort. Reads take shared locks as they go.
+- **Why:** This is the programming model people expect: read a balance, decide, then write. Write sets need not be known in advance.
+- **Rejected:** One-shot transactions with read and write sets declared up front (one round trip, and they allow deterministic scheduling such as Calvin, but they push complexity to the application and cannot express read-then-decide logic).
+- **Tradeoff:** Locks are held across client round trips, so slow clients hold locks longer, and a client that disappears holds them until the lock lease expires. More round trips per transaction.
+
+## 20. Leader-only read locks
+
+- **What:** Shared locks taken by reads before prepare are kept only in the shard leader's memory, not written to the log. At prepare time they become durable as part of the prepare record. If the leader that granted them is replaced, they are lost and the transaction aborts when it tries to prepare. Separately, the state machine re-validates every read version at apply time, so a lost lock can never let a stale read commit.
+- **Why:** Writing every read lock through Paxos would cost a consensus round per read. Reads are frequent and leader changes are rare.
+- **Rejected:** Replicating read locks through the log (survives failover, but makes every read as expensive as a write); optimistic reads without locks (no lock overhead, but conflicts are found only at commit time, so long transactions under contention abort much more).
+- **Tradeoff:** Every transaction in flight during a leader change aborts and must retry. A deposed leader that does not know it was replaced can still grant read locks, which is why the version check in the state machine is required for safety.
+
+## 21. Static sharding; resharding deferred
+
+- **What:** A key's shard is its hash modulo the number of shards, fixed at startup.
+- **Why:** Simple and deterministic, and enough to build and test cross-shard transactions.
+- **Rejected:** Range sharding with a shard map service (supports splits, moves and range scans, but needs a replicated directory and a protocol to move data while transactions run); consistent hashing with virtual nodes (cheaper rebalancing, same need for data movement).
+- **Tradeoff:** The number of shards cannot change without rewriting every key's location, hot keys cannot be split off, and range scans touch every shard. See Future work.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
+- **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).
