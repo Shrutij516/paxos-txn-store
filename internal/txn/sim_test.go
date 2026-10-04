@@ -170,7 +170,7 @@ func (w *world) start(id paxos.NodeID) {
 	cfg := w.opts.Server
 	cfg.Shard, cfg.ShardNodes = sh, shardNodes
 	n := &node{id: id, shard: sh, rep: rep, sm: sm}
-	n.srv = NewServer(cfg, id, rep, sm, w.net.Send)
+	n.srv = NewServer(cfg, id, rep, sm, func(_ ShardID, m paxos.Message) { w.net.Send(m) })
 	n.srv.OnDecide = func(t ID) {
 		if w.onDecide != nil {
 			w.onDecide(n, t)

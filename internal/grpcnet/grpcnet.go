@@ -1,4 +1,6 @@
-package transport
+// Package grpcnet carries Paxos and transaction messages between nodes over
+// gRPC (the Peer service in proto/paxos/v1).
+package grpcnet
 
 import (
 	"context"
@@ -18,14 +20,16 @@ import (
 // Paxos tolerates; the caller never blocks.
 const peerQueue = 1024
 
-// GRPC implements paxos.Transport over gRPC. Send never blocks: messages for
-// a peer go into that peer's queue and a per-peer goroutine delivers them
-// with one unary RPC each, bounded by a deadline. Messages addressed to this
-// node itself, or to any ID that is not a configured peer (such as a local
+// Transport carries messages between nodes over gRPC. A node hosts one
+// replica of every shard, and Send tags each message with the shard it is
+// for. Send never blocks: messages for a peer go into that peer's queue
+// (shared by all shards) and a per-peer goroutine delivers them with one
+// unary RPC each, bounded by a deadline. Messages addressed to this node
+// itself, or to any ID that is not a configured peer (such as a local
 // client endpoint), are handed to the local callback instead.
-type GRPC struct {
+type Transport struct {
 	self    paxos.NodeID
-	local   func(paxos.Message)
+	local   func(shard uint32, m paxos.Message)
 	timeout time.Duration
 	peers   map[paxos.NodeID]*peer
 	wg      sync.WaitGroup
@@ -39,13 +43,11 @@ type peer struct {
 	q      chan *paxosv1.Envelope
 }
 
-var _ paxos.Transport = (*GRPC)(nil)
-
-// NewGRPC connects (lazily) to every peer in addrs other than self. local
+// New connects (lazily) to every peer in addrs other than self. local
 // receives messages for self and for non-peer IDs; it is called from Send,
 // on the caller's goroutine. timeout bounds each RPC.
-func NewGRPC(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(paxos.Message), timeout time.Duration) (*GRPC, error) {
-	t := &GRPC{self: self, local: local, timeout: timeout, peers: make(map[paxos.NodeID]*peer)}
+func New(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(shard uint32, m paxos.Message), timeout time.Duration) (*Transport, error) {
+	t := &Transport{self: self, local: local, timeout: timeout, peers: make(map[paxos.NodeID]*peer)}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	for id, addr := range addrs {
 		if id == self {
@@ -64,24 +66,25 @@ func NewGRPC(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(paxos.
 	return t, nil
 }
 
-// Send implements paxos.Transport.
-func (t *GRPC) Send(m paxos.Message) {
+// Send delivers m to node m.To's replica of shard sh.
+func (t *Transport) Send(sh uint32, m paxos.Message) {
 	p, ok := t.peers[m.To]
 	if !ok {
-		t.local(m)
+		t.local(sh, m)
 		return
 	}
 	env, err := wire.ToProto(m)
 	if err != nil {
 		return
 	}
+	env.Shard = sh
 	select {
 	case p.q <- env:
 	default: // queue full: drop, Paxos will retry
 	}
 }
 
-func (t *GRPC) deliver(p *peer) {
+func (t *Transport) deliver(p *peer) {
 	defer t.wg.Done()
 	for env := range p.q {
 		ctx, cancel := context.WithTimeout(t.ctx, t.timeout)
@@ -92,7 +95,7 @@ func (t *GRPC) deliver(p *peer) {
 
 // Close stops the delivery goroutines, dropping anything still queued, and
 // closes the connections. Send must not be called after Close.
-func (t *GRPC) Close() {
+func (t *Transport) Close() {
 	t.cancel()
 	for _, p := range t.peers {
 		close(p.q)

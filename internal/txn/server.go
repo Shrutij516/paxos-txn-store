@@ -76,7 +76,7 @@ type Server struct {
 	id   paxos.NodeID
 	rep  *paxos.Replica
 	sm   *SM
-	send func(paxos.Message)
+	send func(ShardID, paxos.Message)
 	now  int
 
 	leading   bool
@@ -121,8 +121,9 @@ type Stats struct {
 }
 
 // NewServer wires a server to its replica and state machine. send delivers
-// messages through the transport.
-func NewServer(cfg Config, id paxos.NodeID, rep *paxos.Replica, sm *SM, send func(paxos.Message)) *Server {
+// a message to node m.To's replica of shard sh; for a reply to a client sh
+// is this server's own shard.
+func NewServer(cfg Config, id paxos.NodeID, rep *paxos.Replica, sm *SM, send func(sh ShardID, m paxos.Message)) *Server {
 	if cfg.QueryAfter <= 0 {
 		cfg.QueryAfter = DefaultQueryAfter
 	}
@@ -161,6 +162,22 @@ func (s *Server) reset() {
 // Leading reports whether this server is acting as its shard's leader.
 func (s *Server) Leading() bool { return s.leading }
 
+// Touch is a client's write to a key of this shard, before commit. The
+// value itself travels in the commit request; Touch only renews the lease
+// on the transaction's shared locks and reports whether it can still
+// commit here (this server leads the shard, the transaction was not
+// wounded and has no outcome yet). Write locks are taken at prepare.
+func (s *Server) Touch(id ID) bool {
+	if !s.leading || s.wounded[id] {
+		return false
+	}
+	if _, done := s.sm.Outcome(id); done {
+		return false
+	}
+	s.active[id] = s.now
+	return true
+}
+
 // ExclusiveHolder returns the transaction holding the exclusive lock on key
 // at this leader (a prepared txn from the SM, or one being prepared).
 func (s *Server) ExclusiveHolder(key string) (ID, bool) {
@@ -173,13 +190,14 @@ func (s *Server) ExclusiveHolder(key string) (ID, bool) {
 	return id, ok
 }
 
+// toNode replies to a client.
 func (s *Server) toNode(to paxos.NodeID, body any) {
-	s.send(paxos.Message{From: s.id, To: to, Body: paxos.Ext{Body: body}})
+	s.send(s.cfg.Shard, paxos.Message{From: s.id, To: to, Body: paxos.Ext{Body: body}})
 }
 
 func (s *Server) toShard(sh ShardID, body any) {
 	for _, n := range s.cfg.ShardNodes(sh) {
-		s.toNode(n, body)
+		s.send(sh, paxos.Message{From: s.id, To: n, Body: paxos.Ext{Body: body}})
 	}
 }
 
@@ -508,7 +526,13 @@ func (s *Server) fail(q *lockReq) {
 	case reqPrepare:
 		s.vote(q.prep.Coord, id, false)
 	case reqOnePhase:
-		s.toNode(q.from, CommitResp{Txn: id, Committed: false})
+		// The abort goes through the log before the client hears it. An
+		// earlier leader may have logged this txn's one-phase record
+		// without anyone learning it yet (the client then retries here);
+		// whichever record comes first in the log decides, and the client
+		// is told that outcome.
+		s.clients[id] = q.from
+		s.propose(Record{Kind: KindAbort, Txn: q.meta})
 	}
 }
 
@@ -752,5 +776,8 @@ func (s *Server) onEvent(e Event) {
 		delete(s.outcomeAt, id)
 		delete(s.volatile, id)
 		s.dropShared(id)
+		if c, ok := s.clients[id]; ok {
+			s.toNode(c, CommitResp{Txn: id, Committed: e.OK}) // a logged one-phase abort
+		}
 	}
 }

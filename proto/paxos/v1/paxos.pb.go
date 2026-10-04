@@ -11,6 +11,7 @@
 package paxosv1
 
 import (
+	v1 "github.com/Shrutij516/paxos-txn-store/proto/txn/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -1019,11 +1020,15 @@ func (x *ClientReply) GetLeader() int32 {
 	return 0
 }
 
-// Envelope carries exactly one message between two nodes.
+// Envelope carries exactly one message between two nodes. A node hosts
+// one replica of every shard; shard names the replica group the message
+// belongs to (sender and receiver are replicas of the same shard, except
+// for two-phase commit messages, which go to the receiving shard).
 type Envelope struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	From  int32                  `protobuf:"varint,1,opt,name=from,proto3" json:"from,omitempty"`
 	To    int32                  `protobuf:"varint,2,opt,name=to,proto3" json:"to,omitempty"`
+	Shard uint32                 `protobuf:"varint,3,opt,name=shard,proto3" json:"shard,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Envelope_Prepare
@@ -1041,6 +1046,11 @@ type Envelope struct {
 	//	*Envelope_CatchupReply
 	//	*Envelope_ClientRequest
 	//	*Envelope_ClientReply
+	//	*Envelope_PrepareReq
+	//	*Envelope_Vote
+	//	*Envelope_Decision
+	//	*Envelope_QueryOutcome
+	//	*Envelope_WoundReq
 	Body          isEnvelope_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1086,6 +1096,13 @@ func (x *Envelope) GetFrom() int32 {
 func (x *Envelope) GetTo() int32 {
 	if x != nil {
 		return x.To
+	}
+	return 0
+}
+
+func (x *Envelope) GetShard() uint32 {
+	if x != nil {
+		return x.Shard
 	}
 	return 0
 }
@@ -1232,6 +1249,51 @@ func (x *Envelope) GetClientReply() *ClientReply {
 	return nil
 }
 
+func (x *Envelope) GetPrepareReq() *v1.PrepareReq {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_PrepareReq); ok {
+			return x.PrepareReq
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetVote() *v1.Vote {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_Vote); ok {
+			return x.Vote
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetDecision() *v1.Decision {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_Decision); ok {
+			return x.Decision
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetQueryOutcome() *v1.QueryOutcome {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_QueryOutcome); ok {
+			return x.QueryOutcome
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetWoundReq() *v1.WoundReq {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_WoundReq); ok {
+			return x.WoundReq
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Body interface {
 	isEnvelope_Body()
 }
@@ -1296,6 +1358,26 @@ type Envelope_ClientReply struct {
 	ClientReply *ClientReply `protobuf:"bytes,29,opt,name=client_reply,json=clientReply,proto3,oneof"`
 }
 
+type Envelope_PrepareReq struct {
+	PrepareReq *v1.PrepareReq `protobuf:"bytes,30,opt,name=prepare_req,json=prepareReq,proto3,oneof"`
+}
+
+type Envelope_Vote struct {
+	Vote *v1.Vote `protobuf:"bytes,31,opt,name=vote,proto3,oneof"`
+}
+
+type Envelope_Decision struct {
+	Decision *v1.Decision `protobuf:"bytes,32,opt,name=decision,proto3,oneof"`
+}
+
+type Envelope_QueryOutcome struct {
+	QueryOutcome *v1.QueryOutcome `protobuf:"bytes,33,opt,name=query_outcome,json=queryOutcome,proto3,oneof"`
+}
+
+type Envelope_WoundReq struct {
+	WoundReq *v1.WoundReq `protobuf:"bytes,34,opt,name=wound_req,json=woundReq,proto3,oneof"`
+}
+
 func (*Envelope_Prepare) isEnvelope_Body() {}
 
 func (*Envelope_Promise) isEnvelope_Body() {}
@@ -1325,6 +1407,16 @@ func (*Envelope_CatchupReply) isEnvelope_Body() {}
 func (*Envelope_ClientRequest) isEnvelope_Body() {}
 
 func (*Envelope_ClientReply) isEnvelope_Body() {}
+
+func (*Envelope_PrepareReq) isEnvelope_Body() {}
+
+func (*Envelope_Vote) isEnvelope_Body() {}
+
+func (*Envelope_Decision) isEnvelope_Body() {}
+
+func (*Envelope_QueryOutcome) isEnvelope_Body() {}
+
+func (*Envelope_WoundReq) isEnvelope_Body() {}
 
 type SendAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1366,7 +1458,7 @@ var File_proto_paxos_v1_paxos_proto protoreflect.FileDescriptor
 
 const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\n" +
-	"\x1aproto/paxos/v1/paxos.proto\x12\bpaxos.v1\"2\n" +
+	"\x1aproto/paxos/v1/paxos.proto\x12\bpaxos.v1\x1a\x16proto/txn/v1/txn.proto\"2\n" +
 	"\x06Ballot\x12\x14\n" +
 	"\x05round\x18\x01 \x01(\x04R\x05round\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\x05R\x04node\"\\\n" +
@@ -1429,10 +1521,11 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x0e\n" +
 	"\x02ok\x18\x03 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06result\x18\x04 \x01(\fR\x06result\x12\x16\n" +
-	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\xe3\x06\n" +
+	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\xf2\b\n" +
 	"\bEnvelope\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
-	"\x02to\x18\x02 \x01(\x05R\x02to\x12-\n" +
+	"\x02to\x18\x02 \x01(\x05R\x02to\x12\x14\n" +
+	"\x05shard\x18\x03 \x01(\rR\x05shard\x12-\n" +
 	"\aprepare\x18\n" +
 	" \x01(\v2\x11.paxos.v1.PrepareH\x00R\aprepare\x12-\n" +
 	"\apromise\x18\v \x01(\v2\x11.paxos.v1.PromiseH\x00R\apromise\x12*\n" +
@@ -1451,7 +1544,13 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x0fcatchup_request\x18\x1a \x01(\v2\x18.paxos.v1.CatchupRequestH\x00R\x0ecatchupRequest\x12=\n" +
 	"\rcatchup_reply\x18\x1b \x01(\v2\x16.paxos.v1.CatchupReplyH\x00R\fcatchupReply\x12@\n" +
 	"\x0eclient_request\x18\x1c \x01(\v2\x17.paxos.v1.ClientRequestH\x00R\rclientRequest\x12:\n" +
-	"\fclient_reply\x18\x1d \x01(\v2\x15.paxos.v1.ClientReplyH\x00R\vclientReplyB\x06\n" +
+	"\fclient_reply\x18\x1d \x01(\v2\x15.paxos.v1.ClientReplyH\x00R\vclientReply\x125\n" +
+	"\vprepare_req\x18\x1e \x01(\v2\x12.txn.v1.PrepareReqH\x00R\n" +
+	"prepareReq\x12\"\n" +
+	"\x04vote\x18\x1f \x01(\v2\f.txn.v1.VoteH\x00R\x04vote\x12.\n" +
+	"\bdecision\x18  \x01(\v2\x10.txn.v1.DecisionH\x00R\bdecision\x12;\n" +
+	"\rquery_outcome\x18! \x01(\v2\x14.txn.v1.QueryOutcomeH\x00R\fqueryOutcome\x12/\n" +
+	"\twound_req\x18\" \x01(\v2\x10.txn.v1.WoundReqH\x00R\bwoundReqB\x06\n" +
 	"\x04body\"\t\n" +
 	"\aSendAck25\n" +
 	"\x04Peer\x12-\n" +
@@ -1471,26 +1570,31 @@ func file_proto_paxos_v1_paxos_proto_rawDescGZIP() []byte {
 
 var file_proto_paxos_v1_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_proto_paxos_v1_paxos_proto_goTypes = []any{
-	(*Ballot)(nil),         // 0: paxos.v1.Ballot
-	(*Entry)(nil),          // 1: paxos.v1.Entry
-	(*SlotEntry)(nil),      // 2: paxos.v1.SlotEntry
-	(*Prepare)(nil),        // 3: paxos.v1.Prepare
-	(*Promise)(nil),        // 4: paxos.v1.Promise
-	(*Accept)(nil),         // 5: paxos.v1.Accept
-	(*Accepted)(nil),       // 6: paxos.v1.Accepted
-	(*Nack)(nil),           // 7: paxos.v1.Nack
-	(*LogPrepare)(nil),     // 8: paxos.v1.LogPrepare
-	(*LogPromise)(nil),     // 9: paxos.v1.LogPromise
-	(*LogAccept)(nil),      // 10: paxos.v1.LogAccept
-	(*LogAccepted)(nil),    // 11: paxos.v1.LogAccepted
-	(*LogNack)(nil),        // 12: paxos.v1.LogNack
-	(*Heartbeat)(nil),      // 13: paxos.v1.Heartbeat
-	(*CatchupRequest)(nil), // 14: paxos.v1.CatchupRequest
-	(*CatchupReply)(nil),   // 15: paxos.v1.CatchupReply
-	(*ClientRequest)(nil),  // 16: paxos.v1.ClientRequest
-	(*ClientReply)(nil),    // 17: paxos.v1.ClientReply
-	(*Envelope)(nil),       // 18: paxos.v1.Envelope
-	(*SendAck)(nil),        // 19: paxos.v1.SendAck
+	(*Ballot)(nil),          // 0: paxos.v1.Ballot
+	(*Entry)(nil),           // 1: paxos.v1.Entry
+	(*SlotEntry)(nil),       // 2: paxos.v1.SlotEntry
+	(*Prepare)(nil),         // 3: paxos.v1.Prepare
+	(*Promise)(nil),         // 4: paxos.v1.Promise
+	(*Accept)(nil),          // 5: paxos.v1.Accept
+	(*Accepted)(nil),        // 6: paxos.v1.Accepted
+	(*Nack)(nil),            // 7: paxos.v1.Nack
+	(*LogPrepare)(nil),      // 8: paxos.v1.LogPrepare
+	(*LogPromise)(nil),      // 9: paxos.v1.LogPromise
+	(*LogAccept)(nil),       // 10: paxos.v1.LogAccept
+	(*LogAccepted)(nil),     // 11: paxos.v1.LogAccepted
+	(*LogNack)(nil),         // 12: paxos.v1.LogNack
+	(*Heartbeat)(nil),       // 13: paxos.v1.Heartbeat
+	(*CatchupRequest)(nil),  // 14: paxos.v1.CatchupRequest
+	(*CatchupReply)(nil),    // 15: paxos.v1.CatchupReply
+	(*ClientRequest)(nil),   // 16: paxos.v1.ClientRequest
+	(*ClientReply)(nil),     // 17: paxos.v1.ClientReply
+	(*Envelope)(nil),        // 18: paxos.v1.Envelope
+	(*SendAck)(nil),         // 19: paxos.v1.SendAck
+	(*v1.PrepareReq)(nil),   // 20: txn.v1.PrepareReq
+	(*v1.Vote)(nil),         // 21: txn.v1.Vote
+	(*v1.Decision)(nil),     // 22: txn.v1.Decision
+	(*v1.QueryOutcome)(nil), // 23: txn.v1.QueryOutcome
+	(*v1.WoundReq)(nil),     // 24: txn.v1.WoundReq
 }
 var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	0,  // 0: paxos.v1.SlotEntry.ballot:type_name -> paxos.v1.Ballot
@@ -1528,13 +1632,18 @@ var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	15, // 32: paxos.v1.Envelope.catchup_reply:type_name -> paxos.v1.CatchupReply
 	16, // 33: paxos.v1.Envelope.client_request:type_name -> paxos.v1.ClientRequest
 	17, // 34: paxos.v1.Envelope.client_reply:type_name -> paxos.v1.ClientReply
-	18, // 35: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
-	19, // 36: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
-	36, // [36:37] is the sub-list for method output_type
-	35, // [35:36] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	20, // 35: paxos.v1.Envelope.prepare_req:type_name -> txn.v1.PrepareReq
+	21, // 36: paxos.v1.Envelope.vote:type_name -> txn.v1.Vote
+	22, // 37: paxos.v1.Envelope.decision:type_name -> txn.v1.Decision
+	23, // 38: paxos.v1.Envelope.query_outcome:type_name -> txn.v1.QueryOutcome
+	24, // 39: paxos.v1.Envelope.wound_req:type_name -> txn.v1.WoundReq
+	18, // 40: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
+	19, // 41: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
+	41, // [41:42] is the sub-list for method output_type
+	40, // [40:41] is the sub-list for method input_type
+	40, // [40:40] is the sub-list for extension type_name
+	40, // [40:40] is the sub-list for extension extendee
+	0,  // [0:40] is the sub-list for field type_name
 }
 
 func init() { file_proto_paxos_v1_paxos_proto_init() }
@@ -1558,6 +1667,11 @@ func file_proto_paxos_v1_paxos_proto_init() {
 		(*Envelope_CatchupReply)(nil),
 		(*Envelope_ClientRequest)(nil),
 		(*Envelope_ClientReply)(nil),
+		(*Envelope_PrepareReq)(nil),
+		(*Envelope_Vote)(nil),
+		(*Envelope_Decision)(nil),
+		(*Envelope_QueryOutcome)(nil),
+		(*Envelope_WoundReq)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

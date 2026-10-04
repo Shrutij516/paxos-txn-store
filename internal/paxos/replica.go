@@ -131,6 +131,10 @@ func (r *Replica) ID() NodeID { return r.id }
 // IsLeader reports whether this replica currently acts as leader.
 func (r *Replica) IsLeader() bool { return r.role == leader }
 
+// Leader returns the leader this replica believes in (itself while it
+// leads), or 0 if it knows of none.
+func (r *Replica) Leader() NodeID { return r.leader }
+
 // Ballot returns the replica's own ballot as candidate or leader.
 func (r *Replica) Ballot() Ballot { return r.ballot }
 

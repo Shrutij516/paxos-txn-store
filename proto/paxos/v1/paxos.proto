@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package paxos.v1;
 
+import "proto/txn/v1/txn.proto";
+
 option go_package = "github.com/Shrutij516/paxos-txn-store/proto/paxos/v1;paxosv1";
 
 message Ballot {
@@ -106,10 +108,14 @@ message ClientReply {
   int32 leader = 5;
 }
 
-// Envelope carries exactly one message between two nodes.
+// Envelope carries exactly one message between two nodes. A node hosts
+// one replica of every shard; shard names the replica group the message
+// belongs to (sender and receiver are replicas of the same shard, except
+// for two-phase commit messages, which go to the receiving shard).
 message Envelope {
   int32 from = 1;
   int32 to = 2;
+  uint32 shard = 3;
   oneof body {
     Prepare prepare = 10;
     Promise promise = 11;
@@ -126,6 +132,11 @@ message Envelope {
     CatchupReply catchup_reply = 27;
     ClientRequest client_request = 28;
     ClientReply client_reply = 29;
+    txn.v1.PrepareReq prepare_req = 30;
+    txn.v1.Vote vote = 31;
+    txn.v1.Decision decision = 32;
+    txn.v1.QueryOutcome query_outcome = 33;
+    txn.v1.WoundReq wound_req = 34;
   }
 }
 

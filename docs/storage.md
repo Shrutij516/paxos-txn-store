@@ -33,7 +33,7 @@ Every row below is written in its own transaction, and the node sends the matchi
 | Proposer starts an election or a new ballot | `proposer.round` | send Prepare with that ballot |
 | Acceptor promises a higher ballot on Prepare or Heartbeat | `log_promise` | send Promise, or follow the new leader |
 | Acceptor accepts an entry | `log_accepted` row for the slot, and `log_promise` if the Accept raises the promise, in one transaction | send Accepted |
-| Slots become committed (contiguous prefix extends) | new `log_committed` rows and `log_commit`, in one transaction | apply them to the KV store and reply to clients |
+| Slots become committed (contiguous prefix extends) | new `log_committed` rows and `log_commit`, in one transaction | apply them to the state machine and reply to clients |
 | Single-decree acceptor changes state | `acceptor` | send Promise or Accepted |
 
 The commit index never runs ahead of the disk: if the committed write fails, nothing is applied and the next attempt retries the whole batch.
@@ -43,7 +43,7 @@ The commit index never runs ahead of the disk: if the committed write fails, not
 1. Open the file, check the schema version, migrate if needed.
 2. Load the proposer round, so the next ballot is higher than any this node used before the crash.
 3. Load the promise and every accepted entry, so the acceptor keeps every promise and vote it ever made.
-4. Load the committed prefix (slots 1 to the commit index) and replay it, in order, into a fresh KV store. This rebuilds both the data and the dedup table, so a client retry that arrives after the restart still gets its cached result and is not executed twice.
+4. Load the committed prefix (slots 1 to the commit index) and replay it, in order, into a fresh state machine (the key-value store in Phases 3 and 4, a shard's transaction state machine from Phase 6 on). For the key-value store this rebuilds both the data and the dedup table, so a client retry that arrives after the restart still gets its cached result and is not executed twice.
 5. Join as a follower. Anything committed after the last durable write arrives through heartbeats and catch-up, as in Phase 2.
 
 There are no snapshots yet, so step 4 replays the whole log. `TestSQLiteRestartReplaysCommittedLog` checks that a node restarted from its file, before receiving any message, has the same commit index, the same applied entries and the same key values as before the crash.

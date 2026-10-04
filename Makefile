@@ -46,7 +46,7 @@ bench:
 
 # Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.6
 # and protoc-gen-go-grpc v1.5.1 on PATH (pinned in CI; see docs/running.md).
-PROTOS := proto/paxos/v1/paxos.proto proto/kv/v1/kv.proto
+PROTOS := proto/paxos/v1/paxos.proto proto/txn/v1/txn.proto
 proto:
 	protoc --go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative $(PROTOS)

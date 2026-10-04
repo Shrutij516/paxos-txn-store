@@ -1,13 +1,13 @@
 # Transactions across shards
 
-Phase 5 adds strictly serializable, interactive transactions across shards. It runs in the deterministic simulator only; Phase 6 will wire it into `paxosd` and the SDK. The code is in `internal/txn`.
+Phase 5 added strictly serializable, interactive transactions across shards, tested in the deterministic simulator. Phase 6 runs the same code in `paxosd` over gRPC, with one replica of every shard in each process, and exposes it through the SDK (see docs/running.md). The code is in `internal/txn`.
 
 ## The pieces
 
 - **Shards.** Keys are split across N shards (default 3) by hashing the key. Each shard is its own Multi-Paxos group of 3 replicas, exactly like Phase 2. Resharding is not supported yet (DECISIONS.md, Future work).
 - **The shard state machine** (`sm.go`). Each shard's Paxos log holds transaction records instead of plain Gets and Puts: prepare, one-phase commit, coordinator decision, commit, abort. Every replica applies them in the same order, so every replica knows the same committed data, the same prepared transactions and the same outcomes.
 - **The shard server** (`server.go`). It runs next to each replica and only acts while that replica leads its shard. It holds locks, runs two-phase commit, and turns decisions into log records.
-- **Clients.** A transaction is interactive: `Begin`, then `Read`s that go to the shard leaders one at a time, `Write`s that are only buffered on the client, then `Commit` or `Abort`. Each attempt has a unique transaction ID and a start timestamp. A retried transaction gets a new ID but keeps its original timestamp.
+- **Clients.** A transaction is interactive: `Begin`, then `Read`s that go to the shard leaders one at a time, `Write`s whose values are buffered on the client, then `Commit` or `Abort`. Each attempt has a unique transaction ID and a start timestamp. A retried transaction gets a new ID but keeps its original timestamp. (Over gRPC, `Write` also tells the shard leader, which renews the transaction's locks and fails fast if it was already wounded; see DECISIONS.md entry 24.)
 
 ## Two-phase commit, and why plain 2PC blocks
 
@@ -63,6 +63,8 @@ Waits only ever go from younger to older, so there can be no cycle, and a wounde
 ## One-phase commit
 
 A transaction that only touched one shard skips 2PC: the shard leader takes the locks and writes a single one-phase record that validates the reads and applies the writes in one step.
+
+If the leader cannot grant the locks (the transaction was wounded, or a read lock was lost to a leader change), it does not simply reply "aborted". It writes an abort record for the transaction and replies once that record is applied, with whatever outcome the log then holds. A client whose commit timed out retries the same request at the new leader; meanwhile the old leader's one-phase record may still be on its way into the log. The first of the two records in the log decides, so the client is never told "aborted" for a transaction that then commits (`TestOnePhaseAbortIsLogged`).
 
 ## Recovery of prepared transactions
 

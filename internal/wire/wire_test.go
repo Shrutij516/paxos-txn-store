@@ -3,10 +3,12 @@ package wire
 import (
 	"reflect"
 	"testing"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
+	"github.com/Shrutij516/paxos-txn-store/internal/txn"
 	paxosv1 "github.com/Shrutij516/paxos-txn-store/proto/paxos/v1"
 )
 
@@ -100,6 +102,11 @@ func FuzzDecode(f *testing.F) {
 		raw, _ := proto.Marshal(env)
 		f.Add(raw)
 	}
+	for k := uint8(0); k < numTxnKinds; k++ {
+		env, _ := ToProto(buildTxn(k, 3, 4, 5, []byte("x"), true, 5))
+		raw, _ := proto.Marshal(env)
+		f.Add(raw)
+	}
 	f.Add([]byte{})
 	f.Add([]byte{0xff, 0xff, 0xff})
 	f.Fuzz(func(_ *testing.T, raw []byte) {
@@ -125,10 +132,17 @@ func TestEveryKindCovered(t *testing.T) {
 	if len(seen) != numKinds {
 		t.Fatalf("build covers %d message types, want %d", len(seen), numKinds)
 	}
+	txnSeen := map[reflect.Type]bool{}
+	for k := uint8(0); k < numTxnKinds; k++ {
+		txnSeen[reflect.TypeOf(buildTxn(k, 1, 2, 3, []byte("k"), false, 1).Body.(paxos.Ext).Body)] = true
+	}
+	if len(txnSeen) != numTxnKinds {
+		t.Fatalf("buildTxn covers %d message types, want %d", len(txnSeen), numTxnKinds)
+	}
 	// Every oneof case in the envelope must be reachable.
 	cases := (&paxosv1.Envelope{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
-	if cases != numKinds {
-		t.Fatalf("Envelope has %d body cases, build covers %d", cases, numKinds)
+	if cases != numKinds+numTxnKinds {
+		t.Fatalf("Envelope has %d body cases, build and buildTxn cover %d", cases, numKinds+numTxnKinds)
 	}
 }
 
@@ -140,4 +154,84 @@ func TestErrors(t *testing.T) {
 	if _, err := ToProto(paxos.Message{Body: bogus{}}); err == nil {
 		t.Fatal("unknown type must fail")
 	}
+	// Client requests and replies are local only.
+	if _, err := ToProto(paxos.Message{Body: paxos.Ext{Body: txn.ReadReq{Key: "k"}}}); err == nil {
+		t.Fatal("ReadReq must not be sent over the wire")
+	}
+}
+
+// numTxnKinds is the number of transaction message types that cross the
+// network; buildTxn covers each one.
+const numTxnKinds = 5
+
+// buildTxn makes a transaction message of the given kind from fuzz inputs.
+// Shards are uint32 on the wire, so a and n are folded into that range.
+// Empty maps and slices are nil, which is how they decode.
+func buildTxn(kind uint8, a, b uint64, n int32, data []byte, flag bool, count uint8) paxos.Message {
+	meta := txn.Meta{ID: txn.ID(a), TS: b}
+	sh := txn.ShardID(uint32(n))
+	var parts []txn.ShardID
+	for i := uint8(0); i < count%4; i++ {
+		parts = append(parts, txn.ShardID(uint32(a)+uint32(i)))
+	}
+	part := txn.Part{Shard: sh}
+	key := string(data)
+	if count%3 != 0 {
+		part.Reads = map[string]uint64{key: b, key + "x": a}
+	}
+	if count%2 != 0 {
+		part.Writes = map[string]string{key: string(data) + "v"}
+	}
+	var body any
+	switch kind % numTxnKinds {
+	case 0:
+		body = txn.PrepareReq{Txn: meta, Coord: txn.ShardID(uint32(b)), Participants: parts, Part: part}
+	case 1:
+		body = txn.Vote{Txn: meta.ID, Shard: sh, Yes: flag}
+	case 2:
+		body = txn.Decision{Txn: meta.ID, Commit: flag}
+	case 3:
+		body = txn.QueryOutcome{Txn: meta.ID, From: sh, Participants: parts}
+	default:
+		body = txn.WoundReq{Txn: meta.ID}
+	}
+	return paxos.Message{From: paxos.NodeID(n), To: paxos.NodeID(-n), Body: paxos.Ext{Body: body}}
+}
+
+// FuzzTxnRoundTrip is FuzzRoundTrip for the two-phase commit messages,
+// including the envelope's shard field.
+func FuzzTxnRoundTrip(f *testing.F) {
+	for k := uint8(0); k < numTxnKinds; k++ {
+		f.Add(k, uint64(k)+1, uint64(k)*7, int32(k)+1, []byte("acct\x001"), k%2 == 0, k%6, uint32(k))
+	}
+	f.Add(uint8(0), ^uint64(0), uint64(0), int32(-2147483648), []byte{}, true, uint8(5), ^uint32(0))
+	f.Fuzz(func(t *testing.T, kind uint8, a, b uint64, n int32, data []byte, flag bool, count uint8, shard uint32) {
+		if !utf8.Valid(data) {
+			return // proto3 strings (map keys and values) must be UTF-8
+		}
+		m := buildTxn(kind, a, b, n, data, flag, count)
+		env, err := ToProto(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Shard = shard
+		raw, err := proto.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back paxosv1.Envelope
+		if err := proto.Unmarshal(raw, &back); err != nil {
+			t.Fatal(err)
+		}
+		if back.GetShard() != shard {
+			t.Fatalf("shard %d came back as %d", shard, back.GetShard())
+		}
+		got, err := FromProto(&back)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, m) {
+			t.Fatalf("round trip changed the message:\nin  %#v\nout %#v", m, got)
+		}
+	})
 }
