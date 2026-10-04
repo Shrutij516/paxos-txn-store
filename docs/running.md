@@ -23,7 +23,7 @@ All nodes read the same JSON config file: the number of shards, and every node's
 }
 ```
 
-Node IDs must be positive and unique. Unknown keys are rejected, so a typo fails at startup instead of being ignored. Keys are assigned to shards by hashing (`txn.ShardOf`: FNV-1a modulo the shard count), so the shard count cannot change once data is written.
+Node IDs must be positive and unique. Unknown keys are rejected, so a typo fails at startup instead of being ignored. Keys are assigned to shards by hashing (`api.ShardOf`: FNV-1a modulo the shard count), so the shard count cannot change once data is written.
 
 ## Start three nodes locally
 
@@ -118,7 +118,7 @@ func main() {
 }
 ```
 
-Run it from inside the module, for example as `go run ./cmd/example` after saving it as `cmd/example/main.go` (the SDK lives in this module and imports its internal packages).
+The SDK (`client`) and the types it exposes (`api`: transaction IDs, the shard function, the outcome errors) import none of this module's internal packages, so the program builds in any module that requires this one. CI checks that (`make sdk-check`). `client/example_test.go` holds the same transfer as a compiled example.
 
 What the SDK does:
 

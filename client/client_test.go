@@ -4,10 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/Shrutij516/paxos-txn-store/api"
 	"github.com/Shrutij516/paxos-txn-store/client"
+	"github.com/Shrutij516/paxos-txn-store/internal/server"
 	"github.com/Shrutij516/paxos-txn-store/internal/testcluster"
 	"github.com/Shrutij516/paxos-txn-store/internal/txn"
 )
@@ -86,7 +92,7 @@ func TestLeaderCache(t *testing.T) {
 // is retried with the same start timestamp, up to MaxAttempts.
 func TestRunRetriesThenGivesUp(t *testing.T) {
 	c := testcluster.Start(t, 3, shards, nil)
-	var ids []uint64
+	var ids []api.TxnID
 	cl := newClient(t, c, client.Options{MaxAttempts: 3, BackoffBase: time.Millisecond, OnAttempt: func(tx *client.Txn, _ error) {
 		ids = append(ids, tx.ID())
 	}})
@@ -151,5 +157,47 @@ func TestCommitUnknownOutcome(t *testing.T) {
 	defer ccancel()
 	if err := tx.Commit(cctx); !errors.Is(err, client.ErrUnknown) {
 		t.Fatalf("commit with every node down: %v, want ErrUnknown", err)
+	}
+}
+
+// TestAbortTimeout: Abort runs on a fresh context even after the caller's
+// has ended, and is bounded by AbortTimeout (default 500ms) when the
+// server does not answer.
+func TestAbortTimeout(t *testing.T) {
+	var slow atomic.Bool
+	stall := grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		if slow.Load() && strings.HasSuffix(info.FullMethod, "/Abort") {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-ctx.Done():
+			}
+		}
+		return h(ctx, req)
+	})
+	c := testcluster.Start(t, 3, shards, func(cfg *server.Config) { cfg.ServerOptions = []grpc.ServerOption{stall} })
+	for _, tc := range []struct {
+		opt  time.Duration
+		want time.Duration
+	}{{100 * time.Millisecond, 100 * time.Millisecond}, {0, 500 * time.Millisecond}} {
+		cl := newClient(t, c, client.Options{AbortTimeout: tc.opt})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tx, err := cl.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for sh := txn.ShardID(0); sh < shards; sh++ {
+			if _, err := tx.Read(ctx, keyOn(sh, 0)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cancel() // the caller's context is over; Abort must still try
+		slow.Store(true)
+		start := time.Now()
+		tx.Abort(ctx)
+		took := time.Since(start)
+		slow.Store(false)
+		if took < tc.want-20*time.Millisecond || took > tc.want+400*time.Millisecond {
+			t.Fatalf("AbortTimeout %v: Abort took %v, want about %v", tc.opt, took, tc.want)
+		}
 	}
 }

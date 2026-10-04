@@ -39,7 +39,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	"github.com/Shrutij516/paxos-txn-store/internal/txn"
+	"github.com/Shrutij516/paxos-txn-store/api"
 	txnv1 "github.com/Shrutij516/paxos-txn-store/proto/txn/v1"
 )
 
@@ -55,23 +55,29 @@ type Options struct {
 	// MaxAttempts is how many times Run tries a transaction that aborts.
 	// Default 10.
 	MaxAttempts int
+	// AbortTimeout bounds Txn.Abort as a whole. Abort runs on a context
+	// detached from the caller's (which has often already ended), so this
+	// is its only bound. Default 500ms.
+	AbortTimeout time.Duration
 	// OnAttempt, if set, is called by Run after each attempt with the
 	// transaction and its result (nil if it committed).
 	OnAttempt func(t *Txn, err error)
 }
 
+// The outcome errors are defined in package api; these are the same
+// values, so errors.Is works with either name.
 var (
 	// ErrAborted means the transaction did not commit and never will;
 	// it can be run again.
-	ErrAborted = errors.New("client: transaction aborted")
+	ErrAborted = api.ErrAborted
 	// ErrUnknown means the commit request may have reached a coordinator
 	// but its outcome was not learned in time: the transaction may or may
 	// not have committed.
-	ErrUnknown = errors.New("client: commit outcome unknown")
+	ErrUnknown = api.ErrUnknown
 	// ErrNoAddrs is returned by New when no server address is given.
-	ErrNoAddrs = errors.New("client: no server addresses")
+	ErrNoAddrs = api.ErrNoAddrs
 	// ErrDone is returned when a transaction is used after it finished.
-	ErrDone = errors.New("client: transaction already finished")
+	ErrDone = api.ErrDone
 )
 
 // Client talks to one cluster.
@@ -81,7 +87,7 @@ type Client struct {
 
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
-	leaders map[txn.ShardID]string // cached leader address per shard
+	leaders map[int]string // cached leader address per shard
 	next    int                    // round-robin position when a leader is unknown
 	shards  int                    // learned from Begin
 	rng     *rand.Rand
@@ -105,9 +111,12 @@ func New(addrs []string, opts Options) (*Client, error) {
 	if opts.MaxAttempts <= 0 {
 		opts.MaxAttempts = 10
 	}
+	if opts.AbortTimeout <= 0 {
+		opts.AbortTimeout = 500 * time.Millisecond
+	}
 	return &Client{
 		opts: opts, addrs: slices.Clone(addrs),
-		conns: map[string]*grpc.ClientConn{}, leaders: map[txn.ShardID]string{},
+		conns: map[string]*grpc.ClientConn{}, leaders: map[int]string{},
 		rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}, nil
 }
@@ -130,7 +139,7 @@ func (c *Client) Close() error {
 func (c *Client) Leader(sh int) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.leaders[txn.ShardID(sh)]
+	return c.leaders[sh]
 }
 
 // Shards returns the number of shards, 0 before the first Begin.
@@ -157,7 +166,7 @@ func (c *Client) stub(addr string) (txnv1.TxnClient, error) {
 
 // target picks the node to try for a shard: the cached leader, or the next
 // node round-robin.
-func (c *Client) target(sh txn.ShardID) string {
+func (c *Client) target(sh int) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if a, ok := c.leaders[sh]; ok {
@@ -170,7 +179,7 @@ func (c *Client) target(sh txn.ShardID) string {
 
 // redirect records what a failed attempt at addr taught about the shard's
 // leader. It reports whether the hint names a new node to try right away.
-func (c *Client) redirect(sh txn.ShardID, addr string, hint *txnv1.LeaderHint) bool {
+func (c *Client) redirect(sh int, addr string, hint *txnv1.LeaderHint) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if h := hint.GetAddr(); h != "" && h != addr {
@@ -183,7 +192,7 @@ func (c *Client) redirect(sh txn.ShardID, addr string, hint *txnv1.LeaderHint) b
 	return false
 }
 
-func (c *Client) learned(sh txn.ShardID, addr string) {
+func (c *Client) learned(sh int, addr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.leaders[sh] = addr
@@ -215,7 +224,7 @@ const (
 // onShard calls f at the leader of shard sh until it gives a final answer
 // or ctx ends. f returns the attempt's outcome, a leader hint for
 // notLeader, and an error for failed.
-func (c *Client) onShard(ctx context.Context, sh txn.ShardID,
+func (c *Client) onShard(ctx context.Context, sh int,
 	f func(ctx context.Context, stub txnv1.TxnClient) (outcome, *txnv1.LeaderHint, error)) error {
 	backoff := c.opts.BackoffBase
 	var last error
@@ -262,12 +271,13 @@ func (c *Client) onShard(ctx context.Context, sh txn.ShardID,
 // writes are buffered and sent with Commit.
 type Txn struct {
 	c      *Client
-	meta   txn.Meta
+	id     api.TxnID
+	ts     uint64 // start timestamp, kept by retries in Run
 	shards int
 	reads  map[string]uint64 // key -> version read
 	vals   map[string]string // key -> value read
 	writes map[string]string
-	touch  map[txn.ShardID]bool
+	touch  map[int]bool
 	done   bool
 }
 
@@ -295,8 +305,8 @@ func (c *Client) begin(ctx context.Context, ts uint64) (*Txn, error) {
 			c.shards = int(r.GetShards())
 			c.mu.Unlock()
 			return &Txn{
-				c: c, meta: txn.Meta{ID: txn.ID(r.GetTxn().GetId()), TS: r.GetTxn().GetTs()}, shards: int(r.GetShards()),
-				reads: map[string]uint64{}, vals: map[string]string{}, writes: map[string]string{}, touch: map[txn.ShardID]bool{},
+				c: c, id: api.TxnID(r.GetTxn().GetId()), ts: r.GetTxn().GetTs(), shards: int(r.GetShards()),
+				reads: map[string]uint64{}, vals: map[string]string{}, writes: map[string]string{}, touch: map[int]bool{},
 			}, nil
 		}
 		last = err
@@ -308,7 +318,7 @@ func (c *Client) begin(ctx context.Context, ts uint64) (*Txn, error) {
 }
 
 // ID returns the attempt's transaction ID.
-func (t *Txn) ID() uint64 { return uint64(t.meta.ID) }
+func (t *Txn) ID() api.TxnID { return t.id }
 
 // ReadVersions returns the version of every key this attempt read from a
 // shard (a key it wrote before reading is not included).
@@ -335,7 +345,7 @@ func maps[V any](m map[string]V) map[string]V {
 	return out
 }
 
-func (t *Txn) shardOf(key string) txn.ShardID { return txn.ShardOf(key, t.shards) }
+func (t *Txn) shardOf(key string) int { return api.ShardOf(key, t.shards) }
 
 // fail ends the attempt after the server said it aborted.
 func (t *Txn) fail(ctx context.Context) error {
@@ -410,11 +420,11 @@ func classify(st txnv1.Status, hint *txnv1.LeaderHint, err error, keep func()) (
 	return failed, nil, fmt.Errorf("client: unexpected status %v", st)
 }
 
-func (t *Txn) protoMeta() *txnv1.TxnMeta { return &txnv1.TxnMeta{Id: uint64(t.meta.ID), Ts: t.meta.TS} }
+func (t *Txn) protoMeta() *txnv1.TxnMeta { return &txnv1.TxnMeta{Id: uint64(t.id), Ts: t.ts} }
 
 // parts groups the read set and the writes by shard, lowest shard first.
 func (t *Txn) parts() []*txnv1.Part {
-	by := map[txn.ShardID]*txnv1.Part{}
+	by := map[int]*txnv1.Part{}
 	get := func(k string) *txnv1.Part {
 		sh := t.shardOf(k)
 		if by[sh] == nil {
@@ -459,7 +469,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 	if len(parts) == 0 {
 		return nil // touched nothing
 	}
-	coord := txn.ShardID(parts[0].GetShard())
+	coord := int(parts[0].GetShard())
 	req := &txnv1.CommitRequest{Txn: t.protoMeta(), Parts: parts}
 	var st txnv1.Status
 	maybeSent := false // some attempt may have reached a coordinator
@@ -492,21 +502,28 @@ func neverSent(err error) bool { return err != nil && status.Code(err) == codes.
 // touched to drop its locks. It is best effort (locks also expire) and
 // never fails. It runs even if ctx has ended, since a transaction often
 // aborts because its deadline passed, and its locks would otherwise block
-// others until they expire; each request is bounded by AttemptTimeout.
+// others until they expire. Instead it has its own deadline,
+// Options.AbortTimeout, and contacts the shards in parallel.
 func (t *Txn) Abort(ctx context.Context) {
 	if t.done {
 		return
 	}
 	t.done = true
-	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), t.c.opts.AbortTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
 	for _, sh := range t.Shards() {
-		sh := txn.ShardID(sh)
-		actx, cancel := context.WithTimeout(ctx, t.c.opts.AttemptTimeout)
-		if stub, err := t.c.stub(t.c.target(sh)); err == nil {
-			_, _ = stub.Abort(actx, &txnv1.AbortRequest{Txn: uint64(t.meta.ID), Shard: uint32(sh)})
+		stub, err := t.c.stub(t.c.target(sh))
+		if err != nil {
+			continue
 		}
-		cancel()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = stub.Abort(ctx, &txnv1.AbortRequest{Txn: uint64(t.id), Shard: uint32(sh)})
+		}()
 	}
+	wg.Wait()
 }
 
 // Run runs fn in a transaction and commits it. If the transaction aborts
@@ -526,7 +543,7 @@ func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, t *Txn) e
 		if err != nil {
 			return err
 		}
-		ts = t.meta.TS
+		ts = t.ts
 		if err = fn(ctx, t); err == nil {
 			err = t.Commit(ctx)
 		} else {

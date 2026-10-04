@@ -8,8 +8,8 @@ on:
 permissions:
   contents: read
 
-# Four jobs run in parallel: lint, proto (generated code is up to date),
-# race-short and full. The race detector slows the seeded simulation
+# Five jobs run in parallel: lint, sdk-deps (the SDK imports no internal
+# package), proto (generated code is up to date), race-short and full. The race detector slows the seeded simulation
 # suites about 9x, so it runs on the short seed counts, while the full 1000
 # seed suites run once without -race and also feed the coverage gate.
 jobs:
@@ -29,6 +29,20 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.5.0
+
+  # The public SDK must not depend on this module's internal packages,
+  # which programs outside the module cannot import.
+  sdk-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: client imports no internal package
+        run: make sdk-check
 
   # Regenerates the protobuf code with pinned tools and fails if the
   # committed files differ from what the .proto files produce.
