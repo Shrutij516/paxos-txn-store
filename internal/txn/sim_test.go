@@ -35,6 +35,13 @@ func numSeeds(n uint64) uint64 {
 
 type chaos struct {
 	CrashProb, RestartProb, PartitionProb, HealProb float64
+	// Gap-heavy mode, as in the Multi-Paxos tests (internal/paxos): during
+	// chaos each LogAccept is dropped with probability AcceptDrop, and a
+	// leader that sends the accepts for a one-phase, prepare or decide
+	// record crashes 1 to 3 steps later with probability RecordCrash. New
+	// leaders then often recover such records from promises and need
+	// several retransmissions to commit them, while clients retry.
+	AcceptDrop, RecordCrash float64
 }
 
 type worldOpts struct {
@@ -70,6 +77,12 @@ type world struct {
 	h      hash.Hash
 
 	allServers []*Server // every incarnation, for stats
+
+	chaosOn bool                 // gap-heavy faults apply only during chaos
+	crashIn map[paxos.NodeID]int // steps until a scheduled gap-heavy crash
+	gapRng  *rand.Rand
+	// recordCrashes counts gap-heavy crashes scheduled after a record.
+	recordCrashes int
 
 	onDecide   func(n *node, id ID)
 	onPrepared func(n *node, id ID)
@@ -110,12 +123,14 @@ func newWorld(seed uint64, o worldOpts) *world {
 	}
 	w := &world{
 		seed: seed, opts: o,
-		rng:    rand.New(rand.NewPCG(seed, 0x7a)),
-		net:    transport.NewSimNet(seed),
-		shard:  map[paxos.NodeID]ShardID{},
-		nodes:  map[paxos.NodeID]*node{},
-		stores: map[paxos.NodeID]*storage.Memory{},
-		h:      sha256.New(),
+		rng:     rand.New(rand.NewPCG(seed, 0x7a)),
+		net:     transport.NewSimNet(seed),
+		shard:   map[paxos.NodeID]ShardID{},
+		nodes:   map[paxos.NodeID]*node{},
+		stores:  map[paxos.NodeID]*storage.Memory{},
+		crashIn: map[paxos.NodeID]int{},
+		gapRng:  rand.New(rand.NewPCG(seed, 0x9a9)),
+		h:       sha256.New(),
 	}
 	w.net.SetFaults(o.Faults)
 	w.net.Trace = w.trace
@@ -163,7 +178,7 @@ func (w *world) start(id paxos.NodeID) {
 	rep, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: shardNodes(sh), StateMachine: sm,
 		Rand: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
-	}, w.stores[id], w.net)
+	}, w.stores[id], gapNet{w})
 	if err != nil {
 		panic(err)
 	}
@@ -245,8 +260,19 @@ func (w *world) injectChaos() {
 }
 
 func (w *world) step(withChaos bool) {
+	w.chaosOn = withChaos
 	if withChaos {
 		w.injectChaos()
+	}
+	for _, id := range w.ids {
+		if n, ok := w.crashIn[id]; ok {
+			if n <= 1 {
+				delete(w.crashIn, id)
+				w.crash(id)
+			} else {
+				w.crashIn[id] = n - 1
+			}
+		}
 	}
 	w.net.Step()
 	for _, id := range w.ids {
@@ -268,6 +294,7 @@ func (w *world) run(steps int, withChaos bool) {
 }
 
 func (w *world) calm() {
+	clear(w.crashIn)
 	w.net.SetFaults(transport.Faults{MaxDelay: 2})
 	w.net.Heal()
 	for _, id := range w.ids {
@@ -604,4 +631,27 @@ func (c *client) abort() {
 	c.phase = phBackoff
 	c.timer = 1 + c.rng.IntN(c.backoff)
 	c.backoff = min(c.backoff*2, 64)
+}
+
+// gapNet is the transport replicas use. Outside gap-heavy mode (or outside
+// chaos) it passes every message straight to the SimNet.
+type gapNet struct{ w *world }
+
+func (g gapNet) Send(m paxos.Message) {
+	w := g.w
+	ch := w.opts.Chaos
+	if acc, ok := m.Body.(paxos.LogAccept); ok && w.chaosOn && (ch.AcceptDrop > 0 || ch.RecordCrash > 0) {
+		if r, err := decode(acc.Entry.Cmd); err == nil && !acc.Entry.Noop &&
+			(r.Kind == KindOnePhase || r.Kind == KindPrepare || r.Kind == KindDecide) {
+			if _, pending := w.crashIn[m.From]; !pending && w.gapRng.Float64() < ch.RecordCrash {
+				w.crashIn[m.From] = 1 + w.gapRng.IntN(3)
+				w.recordCrashes++
+			}
+		}
+		if w.gapRng.Float64() < ch.AcceptDrop {
+			w.trace(fmt.Sprintf("t=%d gapdrop %v", w.net.Now(), m))
+			return
+		}
+	}
+	w.net.Send(m)
 }

@@ -51,6 +51,11 @@ const (
 // data there (GOCOVERDIR). make cover merges it into the report.
 const coverDirEnv = "PAXOSD_GOCOVERDIR"
 
+// keepLogsEnv, when set to a directory, makes a failed run copy its node
+// logs, config and data directories there (t.TempDir is removed after the
+// test), so the SQLite files can be inspected afterwards.
+const keepLogsEnv = "PAXOSD_KEEP_LOGS"
+
 func account(i int) string { return fmt.Sprintf("acct%d", i) }
 
 func freeAddr(t *testing.T) string {
@@ -387,6 +392,18 @@ func keyOn(sh txn.ShardID) string {
 
 func runBank(t *testing.T, bin string, seed uint64) runResult {
 	dir := t.TempDir()
+	t.Cleanup(func() {
+		keep := os.Getenv(keepLogsEnv)
+		if !t.Failed() || keep == "" {
+			return
+		}
+		dst := filepath.Join(keep, fmt.Sprintf("%s-%d", filepath.Base(dir), time.Now().UnixNano()))
+		if err := os.CopyFS(dst, os.DirFS(dir)); err != nil {
+			t.Logf("keeping logs: %v", err)
+			return
+		}
+		t.Logf("logs and data kept in %s", dst)
+	})
 	procs := make([]*proc, numNodes)
 	var addrs []string
 	for i := range procs {

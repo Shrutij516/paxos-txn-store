@@ -188,3 +188,59 @@ func TestOnePhaseRetryAtNewLeader(t *testing.T) {
 	}
 	t.Logf("unlogged abort reply caught in %d of %d seeds; logged abort passes all", caught, seeds)
 }
+
+// gapHeavy turns on the gap-heavy faults during chaos (see chaos).
+func gapHeavy(o *worldOpts) {
+	o.Chaos.AcceptDrop = 0.7
+	o.Chaos.RecordCrash = 0.05
+	o.Chaos.RestartProb = 0.1
+}
+
+// TestTxnGapHeavy: every check holds across the random schedules in
+// gap-heavy mode, where leaders crash right after proposing transaction
+// records and new leaders must recover them.
+func TestTxnGapHeavy(t *testing.T) {
+	seeds := numSeeds(txnSchedules)
+	crashes, withCrash := 0, 0
+	for seed := uint64(1); seed <= seeds; seed++ {
+		w, ok := runSchedule(seed, gapHeavy)
+		if !ok {
+			t.Fatalf("seed=%d: not quiescent within %d calm steps", seed, calmLimit)
+		}
+		if err := checkAll(w); err != nil {
+			t.Fatalf("seed=%d: %v", seed, err)
+		}
+		crashes += w.recordCrashes
+		if w.recordCrashes > 0 {
+			withCrash++
+		}
+	}
+	if withCrash == 0 {
+		t.Fatal("no leader crashed after proposing a record; gap-heavy mode proves nothing")
+	}
+	t.Logf("%d gap-heavy schedules: %d crashes right after a record, in %d schedules", seeds, crashes, withCrash)
+}
+
+// TestTxnGapHeavyCatchesUnloggedAbort: the random gap-heavy schedules,
+// with no directed setup, catch the old one-phase abort reply
+// (ReplyAbortUnlogged) in at least 1% of seeds.
+func TestTxnGapHeavyCatchesUnloggedAbort(t *testing.T) {
+	seeds := numSeeds(txnSchedules)
+	caught := 0
+	for seed := uint64(1); seed <= seeds; seed++ {
+		w, _ := runSchedule(seed, func(o *worldOpts) {
+			gapHeavy(o)
+			o.Server.ReplyAbortUnlogged = true
+		})
+		if err := checkAll(w); err != nil {
+			if caught == 0 {
+				t.Logf("caught as expected: seed=%d: %v", seed, err)
+			}
+			caught++
+		}
+	}
+	if caught*100 < int(seeds) {
+		t.Fatalf("unlogged abort reply caught in %d of %d gap-heavy schedules, want at least 1%%", caught, seeds)
+	}
+	t.Logf("unlogged abort reply caught in %d of %d gap-heavy schedules", caught, seeds)
+}
