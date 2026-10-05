@@ -1,13 +1,13 @@
 # Transactions across shards
 
-Phase 5 adds strictly serializable, interactive transactions across shards. It runs in the deterministic simulator only; Phase 6 will wire it into `paxosd` and the SDK. The code is in `internal/txn`.
+Phase 5 added strictly serializable, interactive transactions across shards, tested in the deterministic simulator. Phase 6 runs the same code in `paxosd` over gRPC, with one replica of every shard in each process, and exposes it through the SDK (see docs/running.md). The code is in `internal/txn`.
 
 ## The pieces
 
 - **Shards.** Keys are split across N shards (default 3) by hashing the key. Each shard is its own Multi-Paxos group of 3 replicas, exactly like Phase 2. Resharding is not supported yet (DECISIONS.md, Future work).
 - **The shard state machine** (`sm.go`). Each shard's Paxos log holds transaction records instead of plain Gets and Puts: prepare, one-phase commit, coordinator decision, commit, abort. Every replica applies them in the same order, so every replica knows the same committed data, the same prepared transactions and the same outcomes.
 - **The shard server** (`server.go`). It runs next to each replica and only acts while that replica leads its shard. It holds locks, runs two-phase commit, and turns decisions into log records.
-- **Clients.** A transaction is interactive: `Begin`, then `Read`s that go to the shard leaders one at a time, `Write`s that are only buffered on the client, then `Commit` or `Abort`. Each attempt has a unique transaction ID and a start timestamp. A retried transaction gets a new ID but keeps its original timestamp.
+- **Clients.** A transaction is interactive: `Begin`, then `Read`s that go to the shard leaders one at a time, `Write`s whose values are buffered on the client, then `Commit` or `Abort`. Each attempt has a unique transaction ID and a start timestamp. A retried transaction gets a new ID but keeps its original timestamp. (Over gRPC, `Write` also tells the shard leader, which renews the transaction's locks and fails fast if it was already wounded; see DECISIONS.md entry 24.)
 
 ## Two-phase commit, and why plain 2PC blocks
 
@@ -63,6 +63,10 @@ Waits only ever go from younger to older, so there can be no cycle, and a wounde
 ## One-phase commit
 
 A transaction that only touched one shard skips 2PC: the shard leader takes the locks and writes a single one-phase record that validates the reads and applies the writes in one step.
+
+If the leader cannot grant the locks (the transaction was wounded, or a read lock was lost to a leader change), it does not simply reply "aborted". It writes an abort record for the transaction and replies once that record is applied, with whatever outcome the log then holds. A client whose commit timed out retries the same request at the new leader; meanwhile the old leader's one-phase record may still be on its way into the log. The first of the two records in the log decides, so the client is never told "aborted" for a transaction that then commits (`TestOnePhaseAbortIsLogged`).
+
+The simulated clients retry a commit the way the SDK does: they send it to the shard leader they last heard from, and after a timeout forget that leader and try the next replica. Every schedule also checks that what each client was told matches the logs: no transaction reported aborted committed, and every one reported committed did. `TestOnePhaseRetryAtNewLeader` runs the case above in 1000 seeded schedules: the leader crashes right after sending the accepts for a one-phase record, the next leader recovers the record but is cut off from the third replica before it can commit it, and the client's retried commit reaches that leader. With the abort logged first, all 1000 seeds pass. With the old direct reply (the `ReplyAbortUnlogged` broken mode), all 1000 tell the client "aborted" for a transaction that then commits. The 1000 ordinary random chaos schedules never hit this window (0 of 1000 catch the broken mode). A gap-heavy mode, as in the Multi-Paxos tests, widens it: during chaos 70% of Accepts are dropped and a leader that sends the accepts for a one-phase, prepare or decide record crashes 1 to 3 steps later with probability 5%, so new leaders often recover such records and need several retransmissions to commit them while clients retry. Every check holds in 1000 gap-heavy schedules (`TestTxnGapHeavy`), and they catch the broken mode in 40 of 1000 (4%, `TestTxnGapHeavyCatchesUnloggedAbort`, which requires at least 1%). The directed test stays, since it catches the bug in every seed.
 
 ## Recovery of prepared transactions
 

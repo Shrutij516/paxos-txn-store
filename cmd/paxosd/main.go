@@ -1,10 +1,11 @@
-// Command paxosd runs one node of the replicated key-value store.
+// Command paxosd runs one node of the sharded transaction store. The node
+// hosts one replica of every shard listed in the cluster config file:
 //
-//	paxosd -id 1 -peers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003 -data-dir ./data/1
+//	paxosd -config cluster.json -id 1 -data-dir ./data/1
 //
-// It serves both the peer (Paxos) and the client (KV) gRPC services on its
-// address from -peers, or on -listen if given. SIGTERM or SIGINT shuts it
-// down gracefully.
+// It serves both the peer (Paxos and two-phase commit) and the client
+// (Txn) gRPC services on its address from the config, or on -listen if
+// given. SIGTERM or SIGINT shuts it down gracefully.
 package main
 
 import (
@@ -29,19 +30,24 @@ func main() {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("paxosd", flag.ContinueOnError)
-	id := fs.Int("id", 0, "this node's ID (must appear in -peers)")
-	peers := fs.String("peers", "", "all nodes as id=host:port, comma separated")
-	listen := fs.String("listen", "", "listen address (default: this node's address in -peers)")
-	dataDir := fs.String("data-dir", "", "directory for this node's SQLite database")
+	config := fs.String("config", "", "cluster config file (JSON: shards and every node's id and addr)")
+	id := fs.Int("id", 0, "this node's ID (must appear in the config)")
+	listen := fs.String("listen", "", "listen address (default: this node's addr in the config)")
+	dataDir := fs.String("data-dir", "", "directory for this node's SQLite files, one per shard")
 	tick := fs.Duration("tick", server.DefaultTick, "wall-clock length of one logical Paxos tick")
 	rpcTimeout := fs.Duration("rpc-timeout", server.DefaultRPCTimeout, "deadline for each peer RPC")
+	inDoubt := fs.Duration("in-doubt-wait", server.DefaultInDoubtWait,
+		"how long a prepared transaction waits for its coordinator's decision before asking for it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *id <= 0 || *dataDir == "" {
-		return fmt.Errorf("-id and -data-dir are required")
+	if *config == "" || *id <= 0 || *dataDir == "" {
+		return fmt.Errorf("-config, -id and -data-dir are required")
 	}
-	pm, err := server.ParsePeers(*peers)
+	if *inDoubt <= 0 || *tick <= 0 {
+		return fmt.Errorf("-in-doubt-wait and -tick must be positive")
+	}
+	cl, err := server.LoadCluster(*config)
 	if err != nil {
 		return err
 	}
@@ -49,13 +55,13 @@ func run(args []string) error {
 		return err
 	}
 	n, err := server.Start(server.Config{
-		ID: paxos.NodeID(*id), Peers: pm, Listen: *listen, DataDir: *dataDir,
-		Tick: *tick, RPCTimeout: *rpcTimeout,
+		ID: paxos.NodeID(*id), Cluster: cl, Listen: *listen, DataDir: *dataDir,
+		Tick: *tick, RPCTimeout: *rpcTimeout, InDoubtWait: *inDoubt,
 	})
 	if err != nil {
 		return err
 	}
-	log.Printf("paxosd: node %d serving on %s (tick %v)", *id, n.Addr(), *tick)
+	log.Printf("paxosd: node %d serving %d shards on %s (tick %v)", *id, n.Shards(), n.Addr(), *tick)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	<-ctx.Done()

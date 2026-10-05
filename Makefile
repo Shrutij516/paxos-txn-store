@@ -1,7 +1,7 @@
 GO ?= go
 COVER_MIN := 85
 
-.PHONY: test test-full lint race cover bench proto proto-check
+.PHONY: test test-full lint race cover bench proto proto-check sdk-check
 
 # Quick local run: seeded suites use 100 seeds instead of 1000.
 test:
@@ -46,7 +46,7 @@ bench:
 
 # Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.6
 # and protoc-gen-go-grpc v1.5.1 on PATH (pinned in CI; see docs/running.md).
-PROTOS := proto/paxos/v1/paxos.proto proto/kv/v1/kv.proto
+PROTOS := proto/paxos/v1/paxos.proto proto/txn/v1/txn.proto
 proto:
 	protoc --go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative $(PROTOS)
@@ -55,3 +55,11 @@ proto:
 proto-check: proto
 	git diff --exit-code -- proto/
 	@test -z "$$(git status --porcelain -- proto/)" || { git status --porcelain -- proto/; exit 1; }
+
+# The SDK must build for programs outside this module, which cannot import
+# its internal packages. Fails if package client depends on any of them.
+MODULE := $(shell $(GO) list -m)
+sdk-check:
+	@bad=$$($(GO) list -deps ./client | grep '^$(MODULE)/internal/' || true); \
+	if [ -n "$$bad" ]; then echo "client imports internal packages:"; echo "$$bad"; exit 1; fi; \
+	echo "client depends on no internal package"

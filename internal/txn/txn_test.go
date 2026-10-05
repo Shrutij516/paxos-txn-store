@@ -211,8 +211,8 @@ func TestTxnCheckerControls(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name   string
-		tamper func(*history) bool
-		check  func(*history) error
+		tamper func(*History) bool
+		check  func(*History) error
 		want   string
 	}{
 		{"G1a", tamperG1a, checkSerializable, "G1a"},

@@ -11,9 +11,9 @@ package txn
 
 import (
 	"encoding/json"
-	"hash/fnv"
 	"slices"
 
+	"github.com/Shrutij516/paxos-txn-store/api"
 	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
 )
 
@@ -23,12 +23,9 @@ type ShardID int
 // DefaultShards is the default number of shards.
 const DefaultShards = 3
 
-// ShardOf maps a key to its shard by hashing.
-func ShardOf(key string, shards int) ShardID {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return ShardID(h.Sum32() % uint32(shards))
-}
+// ShardOf maps a key to its shard by hashing (api.ShardOf, shared with the
+// SDK).
+func ShardOf(key string, shards int) ShardID { return ShardID(api.ShardOf(key, shards)) }
 
 // ID identifies one attempt of a transaction. A retried transaction gets
 // a new ID but keeps its start timestamp.

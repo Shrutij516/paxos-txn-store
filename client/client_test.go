@@ -1,147 +1,203 @@
-package client
+package client_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 
-	"github.com/Shrutij516/paxos-txn-store/internal/kv"
-	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
+	"github.com/Shrutij516/paxos-txn-store/api"
+	"github.com/Shrutij516/paxos-txn-store/client"
 	"github.com/Shrutij516/paxos-txn-store/internal/server"
 	"github.com/Shrutij516/paxos-txn-store/internal/testcluster"
-	kvv1 "github.com/Shrutij516/paxos-txn-store/proto/kv/v1"
+	"github.com/Shrutij516/paxos-txn-store/internal/txn"
 )
 
-func bg(t *testing.T) context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	t.Cleanup(cancel)
-	return ctx
-}
+const shards = 3
 
-// A client that only knows a follower first is redirected to the leader.
-func TestRedirectToLeader(t *testing.T) {
-	cl := testcluster.Start(t, 3, nil)
-	leader, err := cl.Leader(bg(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var addrs []string
-	for _, id := range cl.IDs {
-		if id != leader {
-			addrs = append(addrs, cl.Addr(id)) // followers first
-		}
-	}
-	addrs = append(addrs, cl.Addr(leader))
-	// A committed write guarantees every follower has heard from the leader.
-	warm, _ := New([]string{cl.Addr(leader)}, Options{})
-	defer func() { _ = warm.Close() }()
-	if err := warm.Put(bg(t), "warm", "up"); err != nil {
-		t.Fatal(err)
-	}
-	c, err := New(addrs, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close() }()
-	if err := c.Put(bg(t), "k", "v"); err != nil {
-		t.Fatal(err)
-	}
-	if c.redirects < 1 {
-		t.Fatalf("redirects = %d, want at least 1", c.redirects)
-	}
-	if c.Leader() != cl.Addr(leader) {
-		t.Fatalf("client leader %q, want %q", c.Leader(), cl.Addr(leader))
-	}
-	if c.attempts != 2 {
-		t.Fatalf("attempts = %d, want 2 (follower, then leader)", c.attempts)
-	}
-}
-
-// The first reply for key "slow" is held back past the client's attempt
-// timeout, after the server has already committed and applied the Put. The
-// client retries with the same sequence number, and the cluster applies the
-// request exactly once.
-func TestRetryAfterTimeoutAppliedOnce(t *testing.T) {
-	var held atomic.Bool
-	delay := grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
-		resp, err := h(ctx, req)
-		if p, ok := req.(*kvv1.PutRequest); ok && p.GetKey() == "slow" && err == nil &&
-			resp.(*kvv1.PutResponse).GetOk() && held.CompareAndSwap(false, true) {
-			time.Sleep(600 * time.Millisecond) // reply lost, as far as the client knows
-		}
-		return resp, err
-	})
-	cl := testcluster.Start(t, 3, func(cfg *server.Config) { cfg.ServerOptions = []grpc.ServerOption{delay} })
-	c, err := New(cl.Addrs, Options{AttemptTimeout: 300 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close() }()
-	if err := c.Put(bg(t), "slow", "1"); err != nil {
-		t.Fatal(err)
-	}
-	if !held.Load() {
-		t.Fatal("interceptor never held a reply; the test proves nothing")
-	}
-	if c.retries < 1 {
-		t.Fatalf("retries = %d, want at least 1", c.retries)
-	}
-	// Another client overwrites the key; a late duplicate of the first Put
-	// must not resurrect "1".
-	c2, _ := New(cl.Addrs, Options{})
-	defer func() { _ = c2.Close() }()
-	if err := c2.Put(bg(t), "slow", "2"); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := c.Get(bg(t), "slow"); err != nil || v != "2" {
-		t.Fatalf("Get = %q, %v; want 2", v, err)
-	}
-	leader, _ := cl.Leader(bg(t))
-	want := cl.Commit(leader)
-	for _, id := range cl.IDs {
-		deadline := time.Now().Add(10 * time.Second)
-		for cl.Commit(id) < want && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		var execs int
-		var v string
-		cl.Nodes[id].Inspect(func(_ *paxos.Replica, s *kv.Store) { execs, v = s.MaxExecutions(), s.Value("slow") })
-		if execs != 1 || v != "2" {
-			t.Fatalf("node %d: max executions %d, slow=%q", id, execs, v)
+func keyOn(sh txn.ShardID, i int) string {
+	for n := 0; ; n++ {
+		k := fmt.Sprintf("k%d", n)
+		if txn.ShardOf(k, shards) == sh {
+			if i == 0 {
+				return k
+			}
+			i--
 		}
 	}
 }
 
-// With no reachable server the client keeps retrying until its context ends.
-func TestGivesUpWhenContextEnds(t *testing.T) {
-	c, err := New([]string{"127.0.0.1:1"}, Options{AttemptTimeout: 50 * time.Millisecond})
+func newClient(t *testing.T, c *testcluster.Cluster, opts client.Options) *client.Client {
+	t.Helper()
+	cl, err := client.New(c.Addrs, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = c.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	t.Cleanup(func() { _ = cl.Close() })
+	return cl
+}
+
+func TestNew(t *testing.T) {
+	if _, err := client.New(nil, client.Options{}); err != client.ErrNoAddrs {
+		t.Fatalf("New without addresses: %v", err)
+	}
+	cl, err := client.New([]string{"127.0.0.1:1"}, client.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.Shards() != 0 || cl.Leader(0) != "" {
+		t.Fatal("a new client knows nothing about the cluster")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := c.Get(ctx, "k"); err == nil {
-		t.Fatal("expected an error")
+	if _, err := cl.Begin(ctx); err == nil {
+		t.Fatal("Begin against a dead address must fail when ctx ends")
 	}
-	if c.retries < 2 {
-		t.Fatalf("retries = %d, want several", c.retries)
+	if err := cl.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestNewValidates(t *testing.T) {
-	if _, err := New(nil, Options{}); err != ErrNoAddrs {
-		t.Fatalf("New(nil) = %v", err)
+// TestLeaderCache: the client learns each shard's leader, and after a
+// redirect from a stale cache it follows the hint.
+func TestLeaderCache(t *testing.T) {
+	c := testcluster.Start(t, 3, shards, nil)
+	cl := newClient(t, c, client.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for sh := txn.ShardID(0); sh < shards; sh++ {
+		k := keyOn(sh, 0)
+		if err := cl.Run(ctx, func(ctx context.Context, t *client.Txn) error { return t.Write(ctx, k, "v") }); err != nil {
+			t.Fatal(err)
+		}
+		id, err := c.Leader(ctx, sh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cl.Leader(int(sh)) != c.Addr(id) {
+			t.Fatalf("shard %d: client caches %q, leader is %s", sh, cl.Leader(int(sh)), c.Addr(id))
+		}
 	}
-	c, _ := New([]string{"a:1"}, Options{ClientID: 42})
-	if c.ID() != 42 {
-		t.Fatalf("ID = %d", c.ID())
+	if cl.Shards() != shards {
+		t.Fatalf("client learned %d shards", cl.Shards())
 	}
-	d, _ := New([]string{"a:1"}, Options{})
-	if d.ID() == 0 || d.ID() == c.ID() || d.ID()>>63 != 0 {
-		t.Fatalf("random ID %d", d.ID())
+}
+
+// TestRunRetriesThenGivesUp checks Run's retry policy: an aborted attempt
+// is retried with the same start timestamp, up to MaxAttempts.
+func TestRunRetriesThenGivesUp(t *testing.T) {
+	c := testcluster.Start(t, 3, shards, nil)
+	var ids []api.TxnID
+	cl := newClient(t, c, client.Options{MaxAttempts: 3, BackoffBase: time.Millisecond, OnAttempt: func(tx *client.Txn, _ error) {
+		ids = append(ids, tx.ID())
+	}})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	calls := 0
+	err := cl.Run(ctx, func(context.Context, *client.Txn) error {
+		calls++
+		return client.ErrAborted
+	})
+	if !errors.Is(err, client.ErrAborted) || calls != 3 || len(ids) != 3 || ids[0] == ids[1] {
+		t.Fatalf("Run: err %v after %d calls, attempt ids %v", err, calls, ids)
+	}
+	// Any other error is returned at once.
+	boom := errors.New("boom")
+	calls = 0
+	if err := cl.Run(ctx, func(context.Context, *client.Txn) error { calls++; return boom }); err != boom || calls != 1 {
+		t.Fatalf("Run: err %v after %d calls, want boom after 1", err, calls)
+	}
+	// A transaction is finished after Commit.
+	tx, err := cl.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("empty commit: %v", err)
+	}
+	if _, err := tx.Read(ctx, "x"); err != client.ErrDone {
+		t.Fatalf("read after commit: %v", err)
+	}
+	if err := tx.Write(ctx, "x", "1"); err != client.ErrDone {
+		t.Fatalf("write after commit: %v", err)
+	}
+	if err := tx.Commit(ctx); err != client.ErrDone {
+		t.Fatalf("second commit: %v", err)
+	}
+}
+
+// TestCommitUnknownOutcome: when every node goes away after the reads, the
+// commit cannot learn its outcome and says so.
+func TestCommitUnknownOutcome(t *testing.T) {
+	c := testcluster.Start(t, 3, shards, nil)
+	cl := newClient(t, c, client.Options{AttemptTimeout: 100 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	k0, k2 := keyOn(0, 0), keyOn(2, 0)
+	tx, err := cl.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Read(ctx, k0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Write(ctx, k2, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if got := tx.ReadVersions(); len(got) != 1 || got[k0] != 0 {
+		t.Fatalf("read versions %v", got)
+	}
+	c.StopAll()
+	cctx, ccancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	defer ccancel()
+	if err := tx.Commit(cctx); !errors.Is(err, client.ErrUnknown) {
+		t.Fatalf("commit with every node down: %v, want ErrUnknown", err)
+	}
+}
+
+// TestAbortTimeout: Abort runs on a fresh context even after the caller's
+// has ended, and is bounded by AbortTimeout (default 500ms) when the
+// server does not answer.
+func TestAbortTimeout(t *testing.T) {
+	var slow atomic.Bool
+	stall := grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		if slow.Load() && strings.HasSuffix(info.FullMethod, "/Abort") {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-ctx.Done():
+			}
+		}
+		return h(ctx, req)
+	})
+	c := testcluster.Start(t, 3, shards, func(cfg *server.Config) { cfg.ServerOptions = []grpc.ServerOption{stall} })
+	for _, tc := range []struct {
+		opt  time.Duration
+		want time.Duration
+	}{{100 * time.Millisecond, 100 * time.Millisecond}, {0, 500 * time.Millisecond}} {
+		cl := newClient(t, c, client.Options{AbortTimeout: tc.opt})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tx, err := cl.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for sh := txn.ShardID(0); sh < shards; sh++ {
+			if _, err := tx.Read(ctx, keyOn(sh, 0)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cancel() // the caller's context is over; Abort must still try
+		slow.Store(true)
+		start := time.Now()
+		tx.Abort(ctx)
+		took := time.Since(start)
+		slow.Store(false)
+		if took < tc.want-20*time.Millisecond || took > tc.want+400*time.Millisecond {
+			t.Fatalf("AbortTimeout %v: Abort took %v, want about %v", tc.opt, took, tc.want)
+		}
 	}
 }

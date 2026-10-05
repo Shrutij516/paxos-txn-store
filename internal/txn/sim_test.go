@@ -35,6 +35,13 @@ func numSeeds(n uint64) uint64 {
 
 type chaos struct {
 	CrashProb, RestartProb, PartitionProb, HealProb float64
+	// Gap-heavy mode, as in the Multi-Paxos tests (internal/paxos): during
+	// chaos each LogAccept is dropped with probability AcceptDrop, and a
+	// leader that sends the accepts for a one-phase, prepare or decide
+	// record crashes 1 to 3 steps later with probability RecordCrash. New
+	// leaders then often recover such records from promises and need
+	// several retransmissions to commit them, while clients retry.
+	AcceptDrop, RecordCrash float64
 }
 
 type worldOpts struct {
@@ -70,6 +77,12 @@ type world struct {
 	h      hash.Hash
 
 	allServers []*Server // every incarnation, for stats
+
+	chaosOn bool                 // gap-heavy faults apply only during chaos
+	crashIn map[paxos.NodeID]int // steps until a scheduled gap-heavy crash
+	gapRng  *rand.Rand
+	// recordCrashes counts gap-heavy crashes scheduled after a record.
+	recordCrashes int
 
 	onDecide   func(n *node, id ID)
 	onPrepared func(n *node, id ID)
@@ -110,12 +123,14 @@ func newWorld(seed uint64, o worldOpts) *world {
 	}
 	w := &world{
 		seed: seed, opts: o,
-		rng:    rand.New(rand.NewPCG(seed, 0x7a)),
-		net:    transport.NewSimNet(seed),
-		shard:  map[paxos.NodeID]ShardID{},
-		nodes:  map[paxos.NodeID]*node{},
-		stores: map[paxos.NodeID]*storage.Memory{},
-		h:      sha256.New(),
+		rng:     rand.New(rand.NewPCG(seed, 0x7a)),
+		net:     transport.NewSimNet(seed),
+		shard:   map[paxos.NodeID]ShardID{},
+		nodes:   map[paxos.NodeID]*node{},
+		stores:  map[paxos.NodeID]*storage.Memory{},
+		crashIn: map[paxos.NodeID]int{},
+		gapRng:  rand.New(rand.NewPCG(seed, 0x9a9)),
+		h:       sha256.New(),
 	}
 	w.net.SetFaults(o.Faults)
 	w.net.Trace = w.trace
@@ -132,7 +147,7 @@ func newWorld(seed uint64, o worldOpts) *world {
 	}
 	for i := 0; i < o.Clients; i++ {
 		c := &client{w: w, idx: i, id: paxos.NodeID(clientBase + i), ops: o.OpsPerClient,
-			rng: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(i))), attempts: map[ID]*attempt{}}
+			rng: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(i))), attempts: map[ID]*attempt{}, leaders: map[ShardID]paxos.NodeID{}}
 		c.think = 1 + c.rng.IntN(10)
 		w.cli = append(w.cli, c)
 		w.net.Register(c.id, c.handle)
@@ -163,14 +178,14 @@ func (w *world) start(id paxos.NodeID) {
 	rep, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: shardNodes(sh), StateMachine: sm,
 		Rand: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
-	}, w.stores[id], w.net)
+	}, w.stores[id], gapNet{w})
 	if err != nil {
 		panic(err)
 	}
 	cfg := w.opts.Server
 	cfg.Shard, cfg.ShardNodes = sh, shardNodes
 	n := &node{id: id, shard: sh, rep: rep, sm: sm}
-	n.srv = NewServer(cfg, id, rep, sm, w.net.Send)
+	n.srv = NewServer(cfg, id, rep, sm, func(_ ShardID, m paxos.Message) { w.net.Send(m) })
 	n.srv.OnDecide = func(t ID) {
 		if w.onDecide != nil {
 			w.onDecide(n, t)
@@ -245,8 +260,19 @@ func (w *world) injectChaos() {
 }
 
 func (w *world) step(withChaos bool) {
+	w.chaosOn = withChaos
 	if withChaos {
 		w.injectChaos()
+	}
+	for _, id := range w.ids {
+		if n, ok := w.crashIn[id]; ok {
+			if n <= 1 {
+				delete(w.crashIn, id)
+				w.crash(id)
+			} else {
+				w.crashIn[id] = n - 1
+			}
+		}
 	}
 	w.net.Step()
 	for _, id := range w.ids {
@@ -268,6 +294,7 @@ func (w *world) run(steps int, withChaos bool) {
 }
 
 func (w *world) calm() {
+	clear(w.crashIn)
 	w.net.SetFaults(transport.Faults{MaxDelay: 2})
 	w.net.Heal()
 	for _, id := range w.ids {
@@ -349,6 +376,9 @@ type attempt struct {
 	audit  bool
 	begin  int64 // step the attempt began
 	ack    int64 // step the client learned it committed, -1 if never
+	// toldAbort: a CommitResp said the attempt did not commit. The logs
+	// must agree (checkAtomicity).
+	toldAbort bool
 }
 
 const (
@@ -384,7 +414,9 @@ type client struct {
 	attempts map[ID]*attempt
 	commits  int
 	aborts   int
-	hold     bool // stop before committing; release() continues
+	hold     bool                     // stop before committing; release() continues
+	leaders  map[ShardID]paxos.NodeID // learned from replies, as the SDK caches them
+	rr       int                      // round-robin position when a leader is unknown
 }
 
 // release lets a held client send its commit request.
@@ -399,6 +431,22 @@ func (c *client) release() {
 func (c *client) done() bool { return c.ops == 0 && c.phase == phIdle }
 
 func (c *client) shardOf(k string) ShardID { return ShardOf(k, c.w.opts.Shards) }
+
+// commitTarget picks the node for a commit request the way the SDK does:
+// the shard's cached leader, or the next replica round-robin when it is
+// unknown. A retry after a timeout forgets the cached leader first, so
+// the request moves on to another replica, which may be the new leader.
+func (c *client) commitTarget(sh ShardID, retry bool) paxos.NodeID {
+	if retry {
+		delete(c.leaders, sh)
+	}
+	if n, ok := c.leaders[sh]; ok {
+		return n
+	}
+	nodes := shardNodes(sh)
+	c.rr++
+	return nodes[c.rr%len(nodes)]
+}
 
 func (c *client) toShard(sh ShardID, body any) {
 	for _, n := range shardNodes(sh) {
@@ -475,7 +523,8 @@ func (c *client) resend() {
 	case phCommitting:
 		c.timer = commitTimeout
 		parts := c.parts()
-		c.toShard(parts[0].Shard, CommitReq{Txn: c.meta, Coord: parts[0].Shard, Parts: parts, Client: c.id})
+		to := c.commitTarget(parts[0].Shard, c.tries > 0)
+		c.w.net.Send(paxos.Message{From: c.id, To: to, Body: paxos.Ext{Body: CommitReq{Txn: c.meta, Coord: parts[0].Shard, Parts: parts, Client: c.id}}})
 	}
 }
 
@@ -513,6 +562,7 @@ func (c *client) handle(m paxos.Message) {
 		if c.phase != phReading || r.Txn != c.meta.ID || r.Key != c.keys[c.next] {
 			return
 		}
+		c.leaders[c.w.shard[m.From]] = m.From
 		if r.Aborted {
 			c.abort()
 			return
@@ -534,7 +584,9 @@ func (c *client) handle(m paxos.Message) {
 		if c.phase != phCommitting || r.Txn != c.meta.ID {
 			return
 		}
+		c.leaders[c.w.shard[m.From]] = m.From
 		if !r.Committed {
+			c.cur.toldAbort = true
 			c.abort()
 			return
 		}
@@ -579,4 +631,27 @@ func (c *client) abort() {
 	c.phase = phBackoff
 	c.timer = 1 + c.rng.IntN(c.backoff)
 	c.backoff = min(c.backoff*2, 64)
+}
+
+// gapNet is the transport replicas use. Outside gap-heavy mode (or outside
+// chaos) it passes every message straight to the SimNet.
+type gapNet struct{ w *world }
+
+func (g gapNet) Send(m paxos.Message) {
+	w := g.w
+	ch := w.opts.Chaos
+	if acc, ok := m.Body.(paxos.LogAccept); ok && w.chaosOn && (ch.AcceptDrop > 0 || ch.RecordCrash > 0) {
+		if r, err := decode(acc.Entry.Cmd); err == nil && !acc.Entry.Noop &&
+			(r.Kind == KindOnePhase || r.Kind == KindPrepare || r.Kind == KindDecide) {
+			if _, pending := w.crashIn[m.From]; !pending && w.gapRng.Float64() < ch.RecordCrash {
+				w.crashIn[m.From] = 1 + w.gapRng.IntN(3)
+				w.recordCrashes++
+			}
+		}
+		if w.gapRng.Float64() < ch.AcceptDrop {
+			w.trace(fmt.Sprintf("t=%d gapdrop %v", w.net.Now(), m))
+			return
+		}
+	}
+	w.net.Send(m)
 }

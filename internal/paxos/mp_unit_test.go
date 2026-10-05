@@ -108,13 +108,13 @@ func TestReplicaTakeoverFillsGapsWithNoops(t *testing.T) {
 		{Slot: 3, Ballot: b(3, 2), Entry: eC},
 	}}})
 	r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.LogPromise{Ballot: b(9, 9)}}) // stale ballot
-	if r.IsLeader() {
+	if r.IsLeader() || r.Leader() != 0 {
 		t.Fatal("leader after one promise")
 	}
 	r.Handle(paxos.Message{From: 3, To: 1, Body: paxos.LogPromise{Ballot: b(6, 1), Entries: []paxos.SlotEntry{
 		{Slot: 1, Ballot: b(4, 3), Entry: eB},
 	}}})
-	if !r.IsLeader() || r.Ballot() != b(6, 1) {
+	if !r.IsLeader() || r.Ballot() != b(6, 1) || r.Leader() != 1 {
 		t.Fatal("not leader after majority of promises")
 	}
 	want := map[uint64]paxos.Entry{1: eB, 2: {Noop: true}, 3: eC}
