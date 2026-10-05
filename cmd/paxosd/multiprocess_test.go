@@ -211,7 +211,8 @@ type attempt struct {
 	id      txn.ID
 	reads   map[string]uint64
 	vals    map[string]string
-	shards  []int
+	shards  []int // shards it read or wrote
+	planned []int // shards of the accounts it set out to use, if more than one
 	audit   bool
 	short   bool
 	setup   bool
@@ -279,11 +280,12 @@ func (b *bankClient) onAttempt(t *client.Txn, err error) {
 		b.r.shortCoord.Add(-1)
 		b.coord = false
 	}
+	planned := b.pending
 	for _, sh := range b.pending {
 		b.r.cross[sh].Add(-1)
 	}
 	b.pending = nil
-	a := &attempt{id: txn.ID(t.ID()), reads: t.ReadVersions(), vals: t.ReadValues(), shards: t.Shards(),
+	a := &attempt{id: txn.ID(t.ID()), reads: t.ReadVersions(), vals: t.ReadValues(), shards: t.Shards(), planned: planned,
 		audit: b.audit, short: b.short, setup: b.setup, begin: b.begin, end: -1, finish: b.r.since()}
 	switch {
 	case err == nil:
@@ -505,8 +507,8 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 				k.led = append(k.led, sh)
 			}
 		}
+		k.at = rec.since() // the moment of the signal, not of the exit
 		p.kill(t)
-		k.at = rec.since()
 		kills = append(kills, k)
 	}
 	// awaitInFlight waits (up to 10 s) until cond holds; the kill follows.
@@ -818,18 +820,23 @@ func check(t *testing.T, rec *recorder, sms map[txn.ShardID]*txn.SM, kills []kil
 	for i, k := range kills {
 		spans := 0
 		first := int64(-1)
-		for _, a := range rec.all {
-			touches := false
-			for _, sh := range a.shards {
+		touches := func(shards []int) bool {
+			for _, sh := range shards {
 				if slices.Contains(k.led, txn.ShardID(sh)) {
-					touches = true
+					return true
 				}
 			}
-			if !touches {
-				continue
-			}
-			if len(a.shards) > 1 && a.begin <= k.at && a.finish >= k.at {
+			return false
+		}
+		for _, a := range rec.all {
+			// A cross-shard transaction in flight across the kill on a
+			// shard the victim led. Judged by the shards it set out to
+			// use: one cut off mid-read by the kill counts too.
+			if touches(a.planned) && a.begin <= k.at && a.finish >= k.at {
 				spans++
+			}
+			if !touches(a.shards) {
+				continue
 			}
 			if a.begin >= k.at && committed[a.id] && a.end >= 0 && (first < 0 || a.end < first) {
 				first = a.end
