@@ -22,6 +22,9 @@ type Config struct {
 	VolatilePrepare       bool // prepare kept only in leader memory
 	NoWoundWait           bool // conflicting requests always wait
 	ReplyAbortUnlogged    bool // a failed one-phase commit is answered "aborted" without logging it
+
+	// Observer receives the leader's transaction events; nil means none.
+	Observer Observer
 }
 
 // Defaults for zero Config fields.
@@ -39,11 +42,12 @@ const (
 )
 
 type lockReq struct {
-	kind int
-	meta Meta
-	key  string       // reqRead
-	from paxos.NodeID // client, for reqRead and reqOnePhase
-	prep PrepareReq   // reqPrepare and reqOnePhase
+	waited bool // counted as a lock wait already
+	kind   int
+	meta   Meta
+	key    string       // reqRead
+	from   paxos.NodeID // client, for reqRead and reqOnePhase
+	prep   PrepareReq   // reqPrepare and reqOnePhase
 }
 
 type holder struct {
@@ -98,7 +102,9 @@ type Server struct {
 	lastQuery  map[ID]int
 	outcomeAt  map[ID]int
 	woundSent  map[ID]int
-	leaderTerm int // number of times this server became leader
+	reasons    map[ID]AbortReason // why this leader aborted a txn, for the Observer
+	reported   map[ID]bool        // outcomes already passed to Observer.Finished
+	leaderTerm int                // number of times this server became leader
 
 	// Counters read by tests to show which paths a schedule exercised.
 	stats Stats
@@ -137,6 +143,9 @@ func NewServer(cfg Config, id paxos.NodeID, rep *paxos.Replica, sm *SM, send fun
 	if cfg.LockLease <= 0 {
 		cfg.LockLease = DefaultLockLease
 	}
+	if cfg.Observer == nil {
+		cfg.Observer = NoObserver{}
+	}
 	s := &Server{cfg: cfg, id: id, rep: rep, sm: sm, send: send}
 	s.reset()
 	return s
@@ -158,6 +167,8 @@ func (s *Server) reset() {
 	s.lastQuery = make(map[ID]int)
 	s.outcomeAt = make(map[ID]int)
 	s.woundSent = make(map[ID]int)
+	s.reasons = make(map[ID]AbortReason)
+	s.reported = make(map[ID]bool)
 }
 
 // Leading reports whether this server is acting as its shard's leader.
@@ -246,7 +257,7 @@ func (s *Server) Tick() {
 			continue
 		}
 		if s.now-cs.started > s.cfg.CoordTimeout {
-			s.decide(id, false, partShards(cs.parts))
+			s.decide(id, false, partShards(cs.parts), AbortTimeout)
 			continue
 		}
 		if s.now-cs.lastSend >= s.cfg.Resend {
@@ -290,6 +301,7 @@ func (s *Server) maybeQuery(id ID, r *Record) {
 	if s.now-s.seen[id] >= s.cfg.QueryAfter && s.now-s.lastQuery[id] >= s.cfg.Resend {
 		s.lastQuery[id] = s.now
 		s.stats.Queries++
+		s.cfg.Observer.QuerySent(id)
 		s.toShard(r.Coord, QueryOutcome{Txn: id, From: s.cfg.Shard, Participants: r.Participants})
 	}
 }
@@ -418,7 +430,7 @@ func (s *Server) tryLocks() {
 	s.waiting = nil
 	for _, q := range reqs {
 		if s.wounded[q.meta.ID] {
-			s.fail(q)
+			s.fail(q, AbortWounded)
 			continue
 		}
 		hs := s.holders(q)
@@ -438,6 +450,10 @@ func (s *Server) tryLocks() {
 		if len(hs) == 0 {
 			s.grant(q)
 		} else {
+			if !q.waited {
+				q.waited = true
+				s.cfg.Observer.LockWait(q.meta.ID)
+			}
 			s.waiting = append(s.waiting, q)
 		}
 	}
@@ -446,6 +462,7 @@ func (s *Server) tryLocks() {
 func (s *Server) wound(id ID) {
 	if !s.wounded[id] {
 		s.stats.Wounds++
+		s.cfg.Observer.Wounded(id)
 	}
 	s.wounded[id] = true
 	s.dropShared(id)
@@ -487,7 +504,7 @@ func (s *Server) grant(q *lockReq) {
 	// the read may be stale, so the txn must abort.
 	for _, k := range sortedKeys(q.prep.Part.Reads) {
 		if !s.holdsShared(k, id) {
-			s.fail(q)
+			s.fail(q, AbortLockLost)
 			return
 		}
 	}
@@ -516,9 +533,13 @@ func (s *Server) grant(q *lockReq) {
 	}
 	s.pending[id] = &p
 	s.propose(rec)
+	if q.kind == reqPrepare {
+		s.cfg.Observer.PrepareProposed(id)
+	}
 }
 
-func (s *Server) fail(q *lockReq) {
+// fail aborts a lock request; reason is reported for one-phase commits.
+func (s *Server) fail(q *lockReq, reason AbortReason) {
 	id := q.meta.ID
 	s.wound(id)
 	switch q.kind {
@@ -537,6 +558,7 @@ func (s *Server) fail(q *lockReq) {
 			return
 		}
 		s.clients[id] = q.from
+		s.reasons[id] = reason
 		s.propose(Record{Kind: KindAbort, Txn: q.meta})
 	}
 }
@@ -605,6 +627,7 @@ func (s *Server) onCommit(c CommitReq) {
 	}
 	cs := &coordState{meta: c.Txn, parts: c.Parts, votes: make(map[ShardID]bool), started: s.now, lastSend: s.now}
 	s.coord[id] = cs
+	s.cfg.Observer.CoordinationStarted(id)
 	s.sendPrepares(cs)
 }
 
@@ -658,11 +681,11 @@ func (s *Server) onVote(v Vote) {
 		return
 	}
 	if s.cfg.CommitWithoutAllVotes {
-		s.decide(v.Txn, true, partShards(cs.parts)) // broken on purpose
+		s.decide(v.Txn, true, partShards(cs.parts), "") // broken on purpose
 		return
 	}
 	if !v.Yes {
-		s.decide(v.Txn, false, partShards(cs.parts))
+		s.decide(v.Txn, false, partShards(cs.parts), AbortVoteNo)
 		return
 	}
 	cs.votes[v.Shard] = true
@@ -671,16 +694,20 @@ func (s *Server) onVote(v Vote) {
 			return
 		}
 	}
-	s.decide(v.Txn, true, partShards(cs.parts))
+	s.decide(v.Txn, true, partShards(cs.parts), "")
 }
 
 // decide writes the coordinator's decision through this shard's log. The
 // first decision applied wins; the outcome reported to anyone is always the
 // one in the SM.
-func (s *Server) decide(id ID, commit bool, parts []ShardID) {
+func (s *Server) decide(id ID, commit bool, parts []ShardID, reason AbortReason) {
 	if s.deciding[id] != nil {
 		return
 	}
+	if !commit {
+		s.reasons[id] = reason
+	}
+	s.cfg.Observer.DecisionProposed(id, commit)
 	s.deciding[id] = &deciding{at: s.now, commit: commit, parts: parts}
 	r := Record{Kind: KindDecide, Txn: Meta{ID: id}, Participants: parts, Commit: commit}
 	if v := s.volatile[id]; v != nil && commit {
@@ -722,7 +749,7 @@ func (s *Server) onQuery(q QueryOutcome) {
 	if s.deciding[q.Txn] == nil {
 		s.stats.PresumedAborts++
 	}
-	s.decide(q.Txn, false, q.Participants)
+	s.decide(q.Txn, false, q.Participants, AbortPresumed)
 }
 
 func (s *Server) onWound(w WoundReq) {
@@ -730,11 +757,11 @@ func (s *Server) onWound(w WoundReq) {
 		return
 	}
 	if cs := s.coord[w.Txn]; cs != nil {
-		s.decide(w.Txn, false, partShards(cs.parts))
+		s.decide(w.Txn, false, partShards(cs.parts), AbortWounded)
 		return
 	}
 	if r := s.sm.prepared[w.Txn]; r != nil && r.Coord == s.cfg.Shard {
-		s.decide(w.Txn, false, r.Participants)
+		s.decide(w.Txn, false, r.Participants, AbortWounded)
 	}
 }
 
@@ -754,10 +781,12 @@ func (s *Server) onEvent(e Event) {
 		if !e.OK {
 			s.wound(id)
 		}
+		s.cfg.Observer.PrepareApplied(id, e.OK)
 		s.vote(e.Rec.Coord, id, e.OK)
 	case KindOnePhase:
 		s.releasePending(id)
 		s.dropShared(id)
+		s.finished(id, e.OK, false, AbortValidation)
 		if c, ok := s.clients[id]; ok {
 			s.toNode(c, CommitResp{Txn: id, Committed: e.OK})
 		}
@@ -765,6 +794,7 @@ func (s *Server) onEvent(e Event) {
 		if s.OnDecide != nil {
 			s.OnDecide(id) // a crash here drops the notifications below
 		}
+		s.finished(id, e.OK, true, AbortUnknown)
 		delete(s.coord, id)
 		delete(s.deciding, id)
 		for _, sh := range e.Rec.Participants {
@@ -782,7 +812,28 @@ func (s *Server) onEvent(e Event) {
 		delete(s.volatile, id)
 		s.dropShared(id)
 		if c, ok := s.clients[id]; ok {
-			s.toNode(c, CommitResp{Txn: id, Committed: e.OK}) // a logged one-phase abort
+			s.finished(id, e.OK, false, AbortUnknown) // a logged one-phase abort
+			s.toNode(c, CommitResp{Txn: id, Committed: e.OK})
+		} else {
+			s.cfg.Observer.Resolved(id, e.OK)
 		}
 	}
+}
+
+// finished reports a transaction's outcome to the Observer once. An abort
+// takes the reason this leader recorded, or fallback.
+func (s *Server) finished(id ID, commit, crossShard bool, fallback AbortReason) {
+	if s.reported[id] {
+		return
+	}
+	s.reported[id] = true
+	reason := AbortReason("")
+	if !commit {
+		reason = fallback
+		if r, ok := s.reasons[id]; ok {
+			reason = r
+		}
+	}
+	delete(s.reasons, id)
+	s.cfg.Observer.Finished(id, commit, crossShard, reason)
 }

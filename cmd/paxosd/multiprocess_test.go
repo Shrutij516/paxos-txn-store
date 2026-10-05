@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,13 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/grpc"
+
+	"github.com/Shrutij516/paxos-txn-store/api"
 	"github.com/Shrutij516/paxos-txn-store/client"
 	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
 	"github.com/Shrutij516/paxos-txn-store/internal/server"
@@ -44,6 +52,9 @@ const (
 	// prepared by a kill keeps its locks until its participants ask the
 	// coordinator, this long after the new leader takes over.
 	inDoubtWait = server.DefaultInDoubtWait
+	// traceSample is the nodes' -trace-sample. The clients do not trace, so
+	// each Txn RPC a node receives starts a trace with this probability.
+	traceSample = "0.2"
 )
 
 // coverDirEnv, when set to a directory, makes the test build paxosd with
@@ -72,6 +83,7 @@ func freeAddr(t *testing.T) string {
 type proc struct {
 	id     paxos.NodeID
 	addr   string
+	maddr  string // its /metrics endpoint
 	dir    string
 	args   []string
 	log    string
@@ -236,9 +248,9 @@ type recorder struct {
 	mu    sync.Mutex
 	all   []*attempt
 	// shortCoord counts short clients whose commit is in flight with
-	// shard 0 as coordinator; cross[s] counts commits in flight of
-	// cross-shard transactions that touch shard s. The kills wait for
-	// them, so each kill hits transactions in flight.
+	// shard 0 as coordinator; cross[s] counts cross-shard transactions in
+	// flight (from their first read) that touch shard s. The kills wait
+	// for them, so each kill hits transactions in flight.
 	shortCoord atomic.Int64
 	cross      [numShards]atomic.Int64
 }
@@ -293,8 +305,23 @@ func (b *bankClient) body(rng *rand.Rand) func(ctx context.Context, t *client.Tx
 	x := rng.IntN(numAccounts)
 	y := (x + 1 + rng.IntN(numAccounts-1)) % numAccounts
 	amt := 1 + rng.IntN(10)
+	// The shards this transaction will touch are known up front; count it
+	// in recorder.cross from its start, so a kill waiting for one in flight
+	// has the whole transaction as its window, not just the commit.
+	planned := map[int]bool{}
+	for i := 0; i < numAccounts; i++ {
+		if b.audit || i == x || i == y {
+			planned[api.ShardOf(account(i), numShards)] = true
+		}
+	}
 	return func(ctx context.Context, t *client.Txn) error {
 		b.begin = b.r.since()
+		if len(planned) > 1 {
+			for sh := range planned {
+				b.pending = append(b.pending, sh)
+				b.r.cross[sh].Add(1)
+			}
+		}
 		if b.audit {
 			for i := 0; i < numAccounts; i++ {
 				if _, err := t.Read(ctx, account(i)); err != nil {
@@ -321,17 +348,10 @@ func (b *bankClient) body(rng *rand.Rand) func(ctx context.Context, t *client.Tx
 				}
 			}
 		}
-		// Run calls Commit next; onAttempt undoes these counts.
-		sh := t.Shards()
-		if b.short && len(sh) > 0 && sh[0] == 0 {
+		// Run calls Commit next; onAttempt undoes the counts.
+		if sh := t.Shards(); b.short && len(sh) > 0 && sh[0] == 0 {
 			b.coord = true
 			b.r.shortCoord.Add(1)
-		}
-		if len(sh) > 1 {
-			b.pending = sh
-			for _, s := range sh {
-				b.r.cross[s].Add(1)
-			}
 		}
 		return nil
 	}
@@ -354,39 +374,37 @@ func writeConfig(t *testing.T, dir string, procs []*proc) string {
 	return path
 }
 
-// leaders asks the cluster, with a fresh client, which node leads each
-// shard: it reads one key per shard and reports where the read was served.
-func leaders(ctx context.Context, t *testing.T, addrs []string, procs []*proc) map[txn.ShardID]paxos.NodeID {
+// leadersNow scrapes every node and returns the scrape and, per shard, the
+// node whose paxos_is_leader gauge is 1. It retries briefly while shard sh
+// has no leader, or two (a deposed leader that has not noticed yet).
+func leadersNow(t *testing.T, procs []*proc, sh txn.ShardID) (map[paxos.NodeID]map[string]*dto.MetricFamily, map[txn.ShardID]paxos.NodeID) {
 	t.Helper()
-	c, err := client.New(addrs, client.Options{AttemptTimeout: 300 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close() }()
-	out := map[txn.ShardID]paxos.NodeID{}
-	for sh := txn.ShardID(0); sh < numShards; sh++ {
-		k := keyOn(sh)
-		err := c.Run(ctx, func(ctx context.Context, t *client.Txn) error {
-			_, err := t.Read(ctx, k)
-			return err
-		})
-		if err != nil {
-			t.Fatalf("probe read of shard %d: %v", sh, err)
-		}
-		for _, p := range procs {
-			if p.addr == c.Leader(int(sh)) {
-				out[sh] = p.id
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fams := scrapeAll(t, procs)
+		count := map[txn.ShardID]int{}
+		out := map[txn.ShardID]paxos.NodeID{}
+		for id, f := range fams {
+			for _, m := range f["paxos_is_leader"].GetMetric() {
+				if m.GetGauge().GetValue() != 1 {
+					continue
+				}
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "shard" {
+						n, _ := strconv.Atoi(lp.GetValue())
+						count[txn.ShardID(n)]++
+						out[txn.ShardID(n)] = id
+					}
+				}
 			}
 		}
-	}
-	return out
-}
-
-func keyOn(sh txn.ShardID) string {
-	for i := 0; ; i++ {
-		if k := fmt.Sprintf("probe%d", i); txn.ShardOf(k, numShards) == sh {
-			return k
+		if count[sh] == 1 {
+			return fams, out
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shard %d has %d nodes reporting paxos_is_leader 1", sh, count[sh])
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -408,12 +426,14 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 	var addrs []string
 	for i := range procs {
 		id := paxos.NodeID(i + 1)
-		procs[i] = &proc{id: id, addr: freeAddr(t), dir: filepath.Join(dir, fmt.Sprintf("n%d", id)), log: filepath.Join(dir, fmt.Sprintf("n%d.log", id))}
+		procs[i] = &proc{id: id, addr: freeAddr(t), maddr: freeAddr(t), dir: filepath.Join(dir, fmt.Sprintf("n%d", id)), log: filepath.Join(dir, fmt.Sprintf("n%d.log", id))}
 		addrs = append(addrs, procs[i].addr)
 	}
 	cfg := writeConfig(t, dir, procs)
+	col, otlp := startCollector(t)
 	for _, p := range procs {
-		p.args = []string{"-config", cfg, "-id", fmt.Sprint(p.id), "-data-dir", p.dir, "-tick", tick.String(), "-in-doubt-wait", inDoubtWait.String()}
+		p.args = []string{"-config", cfg, "-id", fmt.Sprint(p.id), "-data-dir", p.dir, "-tick", tick.String(), "-in-doubt-wait", inDoubtWait.String(),
+			"-metrics-listen", p.maddr, "-otlp-endpoint", otlp, "-trace-sample", traceSample}
 		p.start(t, bin)
 	}
 	defer func() {
@@ -495,58 +515,202 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 			time.Sleep(200 * time.Microsecond)
 		}
 	}
-	// Kill 1: the leader of shard 2, while a cross-shard commit touching
-	// shard 2 is in flight.
+	// killLeader SIGKILLs the leader of shard sh once cond holds, and
+	// returns it with a scrape of every node taken just before. The leader
+	// is read from the paxos_is_leader gauges; if cond took a while,
+	// leadership may have moved, so it reads them again.
+	killLeader := func(sh txn.ShardID, cond func() bool) (*proc, map[paxos.NodeID]map[string]*dto.MetricFamily) {
+		for try := 0; ; try++ {
+			before, l := leadersNow(t, procs, sh)
+			start := time.Now()
+			awaitInFlight(cond)
+			if time.Since(start) < 300*time.Millisecond || try == 5 {
+				v := byID(l[sh])
+				doKill(v, l)
+				return v, before
+			}
+		}
+	}
+	// Kill 1: the leader of shard 2, while a cross-shard transaction
+	// touching shard 2 is in flight.
 	time.Sleep(phase)
-	l := leaders(ctx, t, addrs, procs)
-	v1 := byID(l[2])
-	awaitInFlight(func() bool { return rec.cross[2].Load() > 0 })
-	doKill(v1, l)
+	v1, before := killLeader(2, func() bool { return rec.cross[2].Load() > 0 })
 	time.Sleep(phase)
+	electionsRose(t, procs, v1, before)
 	v1.start(t, bin)
 	time.Sleep(phase)
 	// Kill 2: the leader of shard 0, the coordinator shard, while a short
-	// client's commit and a cross-shard commit are in flight there.
-	l = leaders(ctx, t, addrs, procs)
-	v2 := byID(l[0])
-	awaitInFlight(func() bool { return rec.shortCoord.Load() > 0 && rec.cross[0].Load() > 0 })
-	doKill(v2, l)
+	// client's commit and a cross-shard transaction are in flight there.
+	v2, before := killLeader(0, func() bool { return rec.shortCoord.Load() > 0 && rec.cross[0].Load() > 0 })
 	time.Sleep(phase)
+	electionsRose(t, procs, v2, before)
 	v2.start(t, bin)
 	time.Sleep(phase)
 	close(stop)
 	wg.Wait()
 	workTime := time.Since(workStart)
 
-	sms := quiesce(t, procs, bin)
+	sms := quiesce(t, procs)
+	col.checkExported(t)
 	return check(t, rec, sms, kills, workTime, dir)
 }
 
-// quiesce lets the restarted cluster settle, stops every process cleanly,
-// and rebuilds each shard from the SQLite files. If a transaction is still
-// prepared somewhere (its coordinator's decision has not reached every
-// participant yet), it restarts the cluster and tries again.
-func quiesce(t *testing.T, procs []*proc, bin string) map[txn.ShardID]*txn.SM {
+// quiesce waits until every node reports no transaction in doubt
+// (txn_in_doubt is 0 for every shard), checks that the commit latency
+// histograms have samples, stops every process cleanly, and rebuilds each
+// shard from the SQLite files.
+func quiesce(t *testing.T, procs []*proc) map[txn.ShardID]*txn.SM {
 	t.Helper()
-	for round := 0; ; round++ {
-		time.Sleep(time.Second)
+	// Long enough for an election plus an outcome query plus a coordinator
+	// timeout, for a transaction left prepared by the last kill.
+	deadline := time.Now().Add(10*time.Second + 2*inDoubtWait)
+	for {
+		inDoubt := 0.0
 		for _, p := range procs {
-			p.stop(t)
+			inDoubt += sum(scrape(t, p), "txn_in_doubt")
 		}
-		sms := loadShards(t, procs)
-		prepared := 0
-		for _, sm := range sms {
-			prepared += len(sm.PreparedTxns())
+		if inDoubt == 0 {
+			break
 		}
-		if prepared == 0 || round == 5 {
-			return sms
+		if time.Now().After(deadline) {
+			t.Fatalf("txn_in_doubt still sums to %v across the cluster after the workload settled", inDoubt)
 		}
-		t.Logf("%d txns still prepared; restarting the cluster to let them resolve", prepared)
-		for _, p := range procs {
-			p.start(t, bin)
-		}
-		time.Sleep(2*time.Second + 2*inDoubtWait) // an election, then the outcome queries
+		time.Sleep(100 * time.Millisecond)
 	}
+	samples := 0.0
+	for _, p := range procs {
+		samples += histCount(scrape(t, p), "paxos_commit_latency_seconds")
+	}
+	if samples == 0 {
+		t.Fatal("paxos_commit_latency_seconds has no samples on any node")
+	}
+	for _, p := range procs {
+		p.stop(t)
+	}
+	return loadShards(t, procs)
+}
+
+// ---- Traces ----
+
+// collector is a minimal OTLP/gRPC trace receiver: it counts the spans the
+// nodes export, by name, and the nodes they came from.
+type collector struct {
+	coltracepb.UnimplementedTraceServiceServer
+	mu    sync.Mutex
+	names map[string]int
+	nodes map[int64]bool
+}
+
+func (c *collector) Export(_ context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, rs := range req.GetResourceSpans() {
+		for _, a := range rs.GetResource().GetAttributes() {
+			if a.GetKey() == "node" {
+				c.nodes[a.GetValue().GetIntValue()] = true
+			}
+		}
+		for _, ss := range rs.GetScopeSpans() {
+			for _, sp := range ss.GetSpans() {
+				c.names[sp.GetName()]++
+			}
+		}
+	}
+	return &coltracepb.ExportTraceServiceResponse{}, nil
+}
+
+func startCollector(t *testing.T) (*collector, string) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &collector{names: map[string]int{}, nodes: map[int64]bool{}}
+	srv := grpc.NewServer()
+	coltracepb.RegisterTraceServiceServer(srv, c)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return c, lis.Addr().String()
+}
+
+// checkExported: the nodes exported spans over OTLP (flushed on SIGTERM),
+// including two-phase commit phases and Paxos rounds, from several nodes.
+func (c *collector) checkExported(t *testing.T) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, name := range []string{"txn.v1.Txn/Commit", "2pc.prepare", "2pc.decide", "2pc.participant.prepare", "paxos.round"} {
+		if c.names[name] == 0 {
+			t.Fatalf("no %q span exported over OTLP; got %v", name, c.names)
+		}
+	}
+	if len(c.nodes) < 2 {
+		t.Fatalf("spans exported by nodes %v, want at least 2", c.nodes)
+	}
+	t.Logf("OTLP collector received spans from nodes %v: %d 2pc.prepare, %d paxos.round", c.nodes, c.names["2pc.prepare"], c.names["paxos.round"])
+}
+
+// ---- Metrics ----
+
+// scrape fetches and parses a node's /metrics.
+func scrape(t *testing.T, p *proc) map[string]*dto.MetricFamily {
+	t.Helper()
+	resp, err := http.Get("http://" + p.maddr + "/metrics")
+	if err != nil {
+		t.Fatalf("scraping node %d: %v", p.id, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	fams, err := parser.TextToMetricFamilies(resp.Body)
+	if err != nil {
+		t.Fatalf("parsing node %d's metrics: %v", p.id, err)
+	}
+	return fams
+}
+
+func scrapeAll(t *testing.T, procs []*proc) map[paxos.NodeID]map[string]*dto.MetricFamily {
+	t.Helper()
+	out := map[paxos.NodeID]map[string]*dto.MetricFamily{}
+	for _, p := range procs {
+		out[p.id] = scrape(t, p)
+	}
+	return out
+}
+
+// sum adds a counter's or gauge's value over every shard.
+func sum(fams map[string]*dto.MetricFamily, name string) float64 {
+	total := 0.0
+	for _, m := range fams[name].GetMetric() {
+		total += m.GetCounter().GetValue() + m.GetGauge().GetValue()
+	}
+	return total
+}
+
+// histCount adds a histogram's sample count over every shard.
+func histCount(fams map[string]*dto.MetricFamily, name string) float64 {
+	total := 0.0
+	for _, m := range fams[name].GetMetric() {
+		total += float64(m.GetHistogram().GetSampleCount())
+	}
+	return total
+}
+
+// electionsRose checks that the surviving nodes won elections after the
+// victim was killed: someone took over the shards it led.
+func electionsRose(t *testing.T, procs []*proc, victim *proc, before map[paxos.NodeID]map[string]*dto.MetricFamily) {
+	t.Helper()
+	was, now := 0.0, 0.0
+	for _, p := range procs {
+		if p == victim {
+			continue
+		}
+		was += sum(before[p.id], "paxos_leader_elections_total")
+		now += sum(scrape(t, p), "paxos_leader_elections_total")
+	}
+	if now <= was {
+		t.Fatalf("paxos_leader_elections_total on the survivors of node %d stayed at %v after the kill", victim.id, was)
+	}
+	t.Logf("paxos_leader_elections_total on the survivors of node %d: %v before the kill, %v after", victim.id, was, now)
 }
 
 // loadShards replays every node's committed log of every shard into a

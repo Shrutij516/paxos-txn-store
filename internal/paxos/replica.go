@@ -34,6 +34,7 @@ type Replica struct {
 	rng    Rand
 	t      LogTiming
 	sm     StateMachine
+	obs    Observer
 
 	// Acceptor state, persisted before any reply.
 	promised  Ballot
@@ -59,6 +60,9 @@ type Replica struct {
 	commit  uint64 // every slot <= commit is in chosen
 	applied uint64
 	pending map[uint64]pendingReq // by client ID
+	// leaderCommit is the highest commit index a leader reported in a
+	// heartbeat. Only observed (Lag), never acted on.
+	leaderCommit uint64
 
 	// Test-only switches, set from export_test.go.
 	skipPrepare    bool
@@ -94,11 +98,14 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Observer == nil {
+		cfg.Observer = NoObserver{}
+	}
 	peers := slices.Clone(cfg.Peers)
 	slices.Sort(peers)
 	r := &Replica{
 		id: cfg.ID, peers: peers, quorum: len(peers)/2 + 1,
-		store: store, tr: tr, rng: cfg.Rand, t: cfg.Timing, sm: cfg.StateMachine,
+		store: store, tr: tr, rng: cfg.Rand, t: cfg.Timing, sm: cfg.StateMachine, obs: cfg.Observer,
 		promised: promised, accepted: make(map[uint64]SlotEntry, len(acc)), lastRound: rnd,
 		chosen: make(map[uint64]Entry), pending: make(map[uint64]pendingReq),
 	}
@@ -130,6 +137,10 @@ func (r *Replica) ID() NodeID { return r.id }
 
 // IsLeader reports whether this replica currently acts as leader.
 func (r *Replica) IsLeader() bool { return r.role == leader }
+
+// Lag returns how many slots this replica knows are committed (by itself
+// or, from heartbeats, by the leader) but has not applied yet.
+func (r *Replica) Lag() uint64 { return max(r.commit, r.leaderCommit) - r.applied }
 
 // Leader returns the leader this replica believes in (itself while it
 // leads), or 0 if it knows of none.
@@ -221,6 +232,9 @@ func (r *Replica) savePromised(b Ballot) bool {
 // yield steps down if someone else holds a higher ballot than ours.
 func (r *Replica) yield(b Ballot) {
 	if r.role != follower && r.ballot.Less(b) {
+		if r.role == leader {
+			r.obs.SteppedDown(b)
+		}
 		r.role = follower
 		r.leader = 0
 		r.promises, r.proposals, r.votes = nil, nil, nil
@@ -313,6 +327,7 @@ func (r *Replica) becomeLeader() {
 	}
 	r.role = leader
 	r.leader = r.id
+	r.obs.BecameLeader(r.ballot)
 	r.promises = nil
 	r.proposals = make(map[uint64]Entry)
 	r.votes = make(map[uint64]map[NodeID]struct{})
@@ -341,6 +356,7 @@ func (r *Replica) becomeLeader() {
 func (r *Replica) propose(slot uint64, e Entry) {
 	r.proposals[slot] = e
 	r.votes[slot] = make(map[NodeID]struct{})
+	r.obs.Proposed(slot, e)
 	r.broadcast(LogAccept{Ballot: r.ballot, Slot: slot, Entry: e})
 }
 
@@ -440,6 +456,7 @@ func (r *Replica) onHeartbeat(from NodeID, m Heartbeat) {
 	}
 	r.yield(m.Ballot)
 	r.leader = from
+	r.leaderCommit = max(r.leaderCommit, m.Commit)
 	r.resetElectionTimer()
 	// An entry we accepted in the leader's own ballot at a slot the leader
 	// reports committed is the chosen one: a leader proposes only one entry
@@ -496,6 +513,7 @@ func (r *Replica) markChosen(slot uint64, e Entry) {
 		r.applied++
 		e := r.chosen[r.applied]
 		res := r.sm.Apply(r.applied, e)
+		r.obs.Applied(r.applied, e)
 		if p, ok := r.pending[e.ClientID]; ok && !e.Noop && p.seq == e.Seq {
 			delete(r.pending, e.ClientID)
 			r.send(p.from, ClientReply{ClientID: e.ClientID, Seq: e.Seq, OK: true, Result: res, Leader: r.leader})

@@ -3,10 +3,17 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 
 	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
@@ -15,6 +22,42 @@ import (
 	paxosv1 "github.com/Shrutij516/paxos-txn-store/proto/paxos/v1"
 	txnv1 "github.com/Shrutij516/paxos-txn-store/proto/txn/v1"
 )
+
+// ---- Instrumentation ----
+
+// serverOptions adds tracing and request logging to the gRPC server. Only
+// the Txn service is traced and logged: peer messages (heartbeats, Paxos
+// rounds, 2PC messages) are far too frequent for a span or a log line
+// each. 2PC and Paxos work shows up as spans of the transaction instead.
+func (n *Node) serverOptions() []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(n.tp),
+			otelgrpc.WithPropagators(propagator),
+			otelgrpc.WithMeterProvider(metricnoop.NewMeterProvider()),
+			otelgrpc.WithFilter(func(info *stats.RPCTagInfo) bool { return isTxnMethod(info.FullMethodName) }),
+		)),
+		grpc.ChainUnaryInterceptor(n.logRequests),
+	}
+}
+
+func isTxnMethod(full string) bool { return strings.HasPrefix(full, "/txn.v1.Txn/") }
+
+// logRequests logs every Txn request at debug level, with its trace ID so a
+// log line leads to its trace.
+func (n *Node) logRequests(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+	if !isTxnMethod(info.FullMethod) || !n.log.Enabled(ctx, slog.LevelDebug) {
+		return h(ctx, req)
+	}
+	start := time.Now()
+	resp, err := h(ctx, req)
+	attrs := []any{"method", info.FullMethod, "duration_ms", float64(time.Since(start).Microseconds()) / 1000, "code", status.Code(err).String()}
+	if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
+		attrs = append(attrs, "trace_id", sc.TraceID().String())
+	}
+	n.log.DebugContext(ctx, "request", attrs...)
+	return resp, err
+}
 
 // ---- Peer service ----
 
@@ -35,7 +78,7 @@ func (p peerService) Send(_ context.Context, env *paxosv1.Envelope) (*paxosv1.Se
 		return nil, status.Errorf(codes.InvalidArgument, "no shard %d", env.GetShard())
 	}
 	select {
-	case p.n.shards[env.GetShard()].inbox <- m:
+	case p.n.shards[env.GetShard()].inbox <- inMsg{m: m, trace: env.GetTrace()}:
 	default: // overloaded: drop, Paxos and two-phase commit retry
 	}
 	return &paxosv1.SendAck{}, nil
@@ -212,6 +255,7 @@ func (t txnService) Commit(ctx context.Context, r *txnv1.CommitRequest) (*txnv1.
 			return
 		}
 		s.commits[meta.ID] = ch
+		s.tel.remember(meta.ID, trace.SpanContextFromContext(ctx))
 		s.ts.Handle(paxos.Message{From: clientEndpoint, To: t.n.cfg.ID,
 			Body: paxos.Ext{Body: txn.CommitReq{Txn: meta, Coord: coord, Parts: parts, Client: clientEndpoint}}})
 	}); err != nil {

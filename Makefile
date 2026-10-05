@@ -1,7 +1,7 @@
 GO ?= go
 COVER_MIN := 85
 
-.PHONY: test test-full lint race cover bench proto proto-check sdk-check
+.PHONY: test test-full lint race cover bench bench-trace proto proto-check sdk-check
 
 # Quick local run: seeded suites use 100 seeds instead of 1000.
 test:
@@ -43,6 +43,11 @@ cover:
 # Persist latency with synchronous=FULL vs NORMAL.
 bench:
 	$(GO) test -run xxx -bench . ./internal/storage/
+
+# Committed transactions per second with tracing off and at sampling 0.1
+# and 1.0 (docs/observability.md).
+bench-trace:
+	$(GO) test -run xxx -bench TracingOverhead -benchtime 3s -count 3 ./internal/server/
 
 # Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.6
 # and protoc-gen-go-grpc v1.5.1 on PATH (pinned in CI; see docs/running.md).

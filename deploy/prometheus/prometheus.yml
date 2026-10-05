@@ -1,0 +1,11 @@
+# Scrapes the three paxosd nodes of the local cluster in docs/running.md,
+# started with -metrics-listen 127.0.0.1:9101, :9102 and :9103.
+# Not run by any test or CI job yet.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: paxosd
+    static_configs:
+      - targets: ["127.0.0.1:9101", "127.0.0.1:9102", "127.0.0.1:9103"]

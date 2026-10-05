@@ -67,7 +67,11 @@ func New(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(shard uint
 }
 
 // Send delivers m to node m.To's replica of shard sh.
-func (t *Transport) Send(sh uint32, m paxos.Message) {
+func (t *Transport) Send(sh uint32, m paxos.Message) { t.SendTraced(sh, m, nil) }
+
+// SendTraced is Send with a trace context (W3C traceparent and tracestate)
+// carried in the envelope. The local callback does not receive it.
+func (t *Transport) SendTraced(sh uint32, m paxos.Message, trace map[string]string) {
 	p, ok := t.peers[m.To]
 	if !ok {
 		t.local(sh, m)
@@ -78,6 +82,7 @@ func (t *Transport) Send(sh uint32, m paxos.Message) {
 		return
 	}
 	env.Shard = sh
+	env.Trace = trace
 	select {
 	case p.q <- env:
 	default: // queue full: drop, Paxos will retry

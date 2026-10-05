@@ -52,6 +52,7 @@ type worldOpts struct {
 	Faults       transport.Faults
 	Chaos        chaos
 	Server       Config // timing and broken modes; Shard/ShardNodes filled in
+	Observe      bool   // attach a recording Observer to every server
 }
 
 type node struct {
@@ -77,6 +78,7 @@ type world struct {
 	h      hash.Hash
 
 	allServers []*Server // every incarnation, for stats
+	observers  []*recObserver
 
 	chaosOn bool                 // gap-heavy faults apply only during chaos
 	crashIn map[paxos.NodeID]int // steps until a scheduled gap-heavy crash
@@ -184,6 +186,11 @@ func (w *world) start(id paxos.NodeID) {
 	}
 	cfg := w.opts.Server
 	cfg.Shard, cfg.ShardNodes = sh, shardNodes
+	if w.opts.Observe {
+		o := &recObserver{shard: sh, finished: map[ID]bool{}}
+		w.observers = append(w.observers, o)
+		cfg.Observer = o
+	}
 	n := &node{id: id, shard: sh, rep: rep, sm: sm}
 	n.srv = NewServer(cfg, id, rep, sm, func(_ ShardID, m paxos.Message) { w.net.Send(m) })
 	n.srv.OnDecide = func(t ID) {
@@ -655,3 +662,33 @@ func (g gapNet) Send(m paxos.Message) {
 	}
 	w.net.Send(m)
 }
+
+// recObserver records a server's Observer events.
+type recObserver struct {
+	shard    ShardID
+	finished map[ID]bool // outcome reported by Finished
+	reasons  map[AbortReason]int
+	dup      error
+	events   int
+}
+
+func (o *recObserver) Finished(id ID, commit, _ bool, reason AbortReason) {
+	if _, ok := o.finished[id]; ok && o.dup == nil {
+		o.dup = fmt.Errorf("shard %d reported txn %d twice", o.shard, id)
+	}
+	o.finished[id] = commit
+	if !commit {
+		if o.reasons == nil {
+			o.reasons = map[AbortReason]int{}
+		}
+		o.reasons[reason]++
+	}
+}
+func (o *recObserver) CoordinationStarted(ID)    { o.events++ }
+func (o *recObserver) DecisionProposed(ID, bool) { o.events++ }
+func (o *recObserver) PrepareProposed(ID)        { o.events++ }
+func (o *recObserver) PrepareApplied(ID, bool)   { o.events++ }
+func (o *recObserver) QuerySent(ID)              { o.events++ }
+func (o *recObserver) Resolved(ID, bool)         { o.events++ }
+func (o *recObserver) Wounded(ID)                { o.events++ }
+func (o *recObserver) LockWait(ID)               { o.events++ }

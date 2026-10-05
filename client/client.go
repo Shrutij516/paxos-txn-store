@@ -31,8 +31,17 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -62,6 +71,13 @@ type Options struct {
 	// OnAttempt, if set, is called by Run after each attempt with the
 	// transaction and its result (nil if it committed).
 	OnAttempt func(t *Txn, err error)
+	// TracerProvider produces the client's spans: one per Run, one per
+	// transaction attempt ("txn"), and one per RPC. Their trace context
+	// goes to the servers with every request, so a transaction is one
+	// trace across the client, shards and nodes. Nil means the global
+	// provider (otel.GetTracerProvider), which does nothing unless the
+	// program installs one.
+	TracerProvider trace.TracerProvider
 }
 
 // The outcome errors are defined in package api; these are the same
@@ -84,6 +100,9 @@ var (
 type Client struct {
 	opts  Options
 	addrs []string
+
+	tracer trace.Tracer
+	dial   []grpc.DialOption
 
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
@@ -114,8 +133,21 @@ func New(addrs []string, opts Options) (*Client, error) {
 	if opts.AbortTimeout <= 0 {
 		opts.AbortTimeout = 500 * time.Millisecond
 	}
+	tp := opts.TracerProvider
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
 	return &Client{
 		opts: opts, addrs: slices.Clone(addrs),
+		tracer: tp.Tracer("github.com/Shrutij516/paxos-txn-store/client"),
+		dial: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+				otelgrpc.WithTracerProvider(tp),
+				otelgrpc.WithPropagators(propagation.TraceContext{}),
+				otelgrpc.WithMeterProvider(metricnoop.NewMeterProvider()),
+			)),
+		},
 		conns: map[string]*grpc.ClientConn{}, leaders: map[int]string{},
 		rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}, nil
@@ -155,7 +187,7 @@ func (c *Client) stub(addr string) (txnv1.TxnClient, error) {
 	conn, ok := c.conns[addr]
 	if !ok {
 		var err error
-		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err = grpc.NewClient(addr, c.dial...)
 		if err != nil {
 			return nil, err
 		}
@@ -271,6 +303,7 @@ func (c *Client) onShard(ctx context.Context, sh int,
 // writes are buffered and sent with Commit.
 type Txn struct {
 	c      *Client
+	span   trace.Span // the attempt's span
 	id     api.TxnID
 	ts     uint64 // start timestamp, kept by retries in Run
 	shards int
@@ -286,6 +319,19 @@ func (c *Client) Begin(ctx context.Context) (*Txn, error) { return c.begin(ctx, 
 
 // begin starts an attempt; a non-zero ts keeps an earlier attempt's age.
 func (c *Client) begin(ctx context.Context, ts uint64) (*Txn, error) {
+	ctx, span := c.tracer.Start(ctx, "txn")
+	t, err := c.beginRPC(ctx, ts)
+	if err != nil {
+		span.SetStatus(otelcodes.Error, err.Error())
+		span.End()
+		return nil, err
+	}
+	t.span = span
+	span.SetAttributes(attribute.String("txn.id", strconv.FormatUint(uint64(t.id), 10)))
+	return t, nil
+}
+
+func (c *Client) beginRPC(ctx context.Context, ts uint64) (*Txn, error) {
 	backoff := c.opts.BackoffBase
 	var last error
 	for {
@@ -369,7 +415,7 @@ func (t *Txn) Read(ctx context.Context, key string) (string, error) {
 	sh := t.shardOf(key)
 	t.touch[sh] = true
 	var resp *txnv1.ReadResponse
-	err := t.c.onShard(ctx, sh, func(ctx context.Context, stub txnv1.TxnClient) (outcome, *txnv1.LeaderHint, error) {
+	err := t.c.onShard(t.traced(ctx), sh, func(ctx context.Context, stub txnv1.TxnClient) (outcome, *txnv1.LeaderHint, error) {
 		r, err := stub.Read(ctx, &txnv1.ReadRequest{Txn: t.protoMeta(), Key: key})
 		return classify(r.GetStatus(), r.GetLeader(), err, func() { resp = r })
 	})
@@ -392,7 +438,7 @@ func (t *Txn) Write(ctx context.Context, key, value string) error {
 	sh := t.shardOf(key)
 	t.touch[sh] = true
 	var st txnv1.Status
-	err := t.c.onShard(ctx, sh, func(ctx context.Context, stub txnv1.TxnClient) (outcome, *txnv1.LeaderHint, error) {
+	err := t.c.onShard(t.traced(ctx), sh, func(ctx context.Context, stub txnv1.TxnClient) (outcome, *txnv1.LeaderHint, error) {
 		r, err := stub.Write(ctx, &txnv1.WriteRequest{Txn: t.protoMeta(), Key: key})
 		return classify(r.GetStatus(), r.GetLeader(), err, func() { st = r.GetStatus() })
 	})
@@ -465,6 +511,32 @@ func (t *Txn) Commit(ctx context.Context) error {
 		return ErrDone
 	}
 	t.done = true
+	err := t.commit(t.traced(ctx))
+	t.endSpan(err)
+	return err
+}
+
+// traced returns ctx with the attempt's span, so RPCs become its children.
+func (t *Txn) traced(ctx context.Context) context.Context { return trace.ContextWithSpan(ctx, t.span) }
+
+// endSpan ends the attempt's span with its outcome.
+func (t *Txn) endSpan(err error) {
+	outcome := "committed"
+	switch {
+	case errors.Is(err, ErrAborted):
+		outcome = "aborted"
+	case errors.Is(err, ErrUnknown):
+		outcome = "unknown"
+		t.span.SetStatus(otelcodes.Error, err.Error())
+	case err != nil:
+		outcome = "error"
+		t.span.SetStatus(otelcodes.Error, err.Error())
+	}
+	t.span.SetAttributes(attribute.String("txn.outcome", outcome), attribute.IntSlice("txn.shards", t.Shards()))
+	t.span.End()
+}
+
+func (t *Txn) commit(ctx context.Context) error {
 	parts := t.parts()
 	if len(parts) == 0 {
 		return nil // touched nothing
@@ -509,7 +581,8 @@ func (t *Txn) Abort(ctx context.Context) {
 		return
 	}
 	t.done = true
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), t.c.opts.AbortTimeout)
+	defer t.endSpan(ErrAborted)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.traced(ctx)), t.c.opts.AbortTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, sh := range t.Shards() {
@@ -535,10 +608,20 @@ func (t *Txn) Abort(ctx context.Context) {
 // commit with an unknown outcome (ErrUnknown), which must not be retried
 // blindly. fn may run several times, so it must not have side effects
 // beyond the transaction.
-func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, t *Txn) error) error {
+func (c *Client) Run(ctx context.Context, fn func(ctx context.Context, t *Txn) error) (err error) {
+	ctx, span := c.tracer.Start(ctx, "txn.run")
+	attempts := 0
+	defer func() {
+		span.SetAttributes(attribute.Int("txn.attempts", attempts))
+		if err != nil {
+			span.SetStatus(otelcodes.Error, err.Error())
+		}
+		span.End()
+	}()
 	var ts uint64
 	backoff := c.opts.BackoffBase
 	for attempt := 1; ; attempt++ {
+		attempts = attempt
 		t, err := c.begin(ctx, ts)
 		if err != nil {
 			return err

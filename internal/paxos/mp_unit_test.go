@@ -194,15 +194,15 @@ func TestReplicaFollowerLearnsCommitAndCatchesUp(t *testing.T) {
 		t.Fatalf("want redirect to 2, got %v", rep)
 	}
 	r.Handle(paxos.Message{From: 2, To: 3, Body: paxos.Heartbeat{Ballot: lb, Commit: 3}})
-	if r.Commit() != 1 {
-		t.Fatalf("commit = %d, want 1 from own accepted entry", r.Commit())
+	if r.Commit() != 1 || r.Lag() != 2 {
+		t.Fatalf("commit = %d (want 1 from own accepted entry), lag = %d (want 2)", r.Commit(), r.Lag())
 	}
 	if req := bodies[paxos.CatchupRequest](tr.take()); len(req) != 1 || req[0].From != 2 {
 		t.Fatalf("want CatchupRequest from 2, got %v", req)
 	}
 	r.Handle(paxos.Message{From: 2, To: 3, Body: paxos.CatchupReply{Entries: []paxos.SlotEntry{{Slot: 3, Entry: e3}, {Slot: 2, Entry: e2}, {Slot: 1, Entry: e1}}}})
-	if r.Commit() != 3 {
-		t.Fatalf("commit = %d after catch-up, want 3", r.Commit())
+	if r.Commit() != 3 || r.Lag() != 0 {
+		t.Fatalf("commit = %d after catch-up (want 3), lag = %d (want 0)", r.Commit(), r.Lag())
 	}
 	// Serving catch-up is batched.
 	r.Handle(paxos.Message{From: 1, To: 3, Body: paxos.CatchupRequest{From: 1}})

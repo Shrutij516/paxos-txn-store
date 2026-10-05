@@ -51,6 +51,9 @@ type mpOpts struct {
 	CrashBeforeCommit float64
 	CrashAfterCommit  float64
 
+	// Observe attaches a recording paxos.Observer to every replica.
+	Observe bool
+
 	// Broken modes for the negative tests.
 	ReplyBeforePersist bool
 	SkipPrepare        bool
@@ -116,6 +119,49 @@ type mpCluster struct {
 	dbCrashes [2]int           // crashes injected before / after commit
 	gapActive bool
 	crashIn   map[paxos.NodeID]int // steps until a scheduled crash
+	observers []*recObserver       // one per replica incarnation, with Observe
+}
+
+// recObserver records a replica's events and checks their order: Applied
+// slots are consecutive, and Proposed only happens while leading.
+type recObserver struct {
+	id                           paxos.NodeID
+	leading                      bool
+	next                         uint64 // next slot expected in Applied (0: first one sets it)
+	elections, stepDowns         int
+	proposed, applied, outOfTurn int
+	err                          error
+}
+
+func (o *recObserver) BecameLeader(b paxos.Ballot) {
+	if b.Node != o.id && o.err == nil {
+		o.err = fmt.Errorf("replica %d became leader at foreign ballot %v", o.id, b)
+	}
+	o.leading = true
+	o.elections++
+}
+
+func (o *recObserver) SteppedDown(paxos.Ballot) {
+	if !o.leading && o.err == nil {
+		o.err = fmt.Errorf("replica %d stepped down without leading", o.id)
+	}
+	o.leading = false
+	o.stepDowns++
+}
+
+func (o *recObserver) Proposed(uint64, paxos.Entry) {
+	o.proposed++
+	if !o.leading {
+		o.outOfTurn++
+	}
+}
+
+func (o *recObserver) Applied(slot uint64, _ paxos.Entry) {
+	if o.next != 0 && slot != o.next && o.err == nil {
+		o.err = fmt.Errorf("replica %d applied slot %d, expected %d", o.id, slot, o.next)
+	}
+	o.next = slot + 1
+	o.applied++
 }
 
 // gapNet is the transport replicas use. Outside gap-heavy mode it passes
@@ -202,10 +248,16 @@ func (c *mpCluster) start(id paxos.NodeID) {
 	}
 	sm := &recSM{c: c, node: id, kv: store}
 	c.sms = append(c.sms, sm)
-	r, err := paxos.NewReplica(paxos.ReplicaConfig{
+	cfg := paxos.ReplicaConfig{
 		ID: id, Peers: c.ids, StateMachine: sm,
 		Rand: rand.New(rand.NewPCG(c.rng.Uint64(), uint64(id))),
-	}, c.openStore(id), gapNet{c})
+	}
+	if c.opts.Observe {
+		o := &recObserver{id: id, next: 0}
+		c.observers = append(c.observers, o)
+		cfg.Observer = o
+	}
+	r, err := paxos.NewReplica(cfg, c.openStore(id), gapNet{c})
 	if err != nil {
 		panic(err)
 	}
