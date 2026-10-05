@@ -21,6 +21,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -229,6 +230,12 @@ func (n *Node) openShard(sh txn.ShardID, ids []paxos.NodeID) (*shard, error) {
 	tc.Shard = sh
 	tc.ShardNodes = func(txn.ShardID) []paxos.NodeID { return ids }
 	tc.Observer = s.tel
+	if err := n.metrics.queueDepth(sh, n.cfg.ID, func() float64 {
+		return float64(len(s.inbox)) + float64(s.waiting.Load())
+	}); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	s.ts = txn.NewServer(tc, n.cfg.ID, s.rep, s.sm, s.send)
 	s.ts.After() // drop the events from replaying the log
 	return s, nil
@@ -327,8 +334,11 @@ type shard struct {
 
 	inbox chan inMsg  // from peers and from other shards on this node
 	calls chan func() // client requests and Inspect
-	quit  chan struct{}
-	done  chan struct{}
+	// waiting counts callers blocked handing a function to calls, for the
+	// queue depth gauge.
+	waiting atomic.Int64
+	quit    chan struct{}
+	done    chan struct{}
 
 	// Owned by the event loop goroutine.
 	selfQ   []paxos.Message
@@ -469,11 +479,14 @@ func (s *shard) settle() {
 // run executes f on the event loop and waits for it.
 func (s *shard) run(f func()) error {
 	ran := make(chan struct{})
+	s.waiting.Add(1)
 	select {
 	case s.calls <- func() { f(); close(ran) }:
+		s.waiting.Add(-1) // handed over; the loop is running it
 		<-ran
 		return nil
 	case <-s.done:
+		s.waiting.Add(-1)
 		return errStopped
 	}
 }

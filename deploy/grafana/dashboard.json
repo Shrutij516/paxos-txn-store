@@ -170,7 +170,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Abort rate by reason",
-      "description": "Aborted transactions per second, one series per reason (the txn_aborts_<reason>_total counters).",
+      "description": "Aborted transactions per second across the cluster, one series per reason (txn_aborts_total by reason).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -203,8 +203,8 @@
             "uid": "${datasource}"
           },
           "refId": "A",
-          "expr": "sum by (__name__) (rate({__name__=~\"txn_aborts_.+_total\"}[1m]))",
-          "legendFormat": "{{__name__}}"
+          "expr": "sum by (reason) (rate(txn_aborts_total[1m]))",
+          "legendFormat": "{{reason}}"
         }
       ]
     },
@@ -298,6 +298,48 @@
           "refId": "B",
           "expr": "histogram_quantile(0.99, sum by (le, node) (rate(storage_fsync_seconds_bucket[1m])))",
           "legendFormat": "p99 node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Event loop queue depth",
+      "description": "Events waiting for each shard's event loop on each node (shard_loop_queue_depth). Near 0 when the loop keeps up; a sustained rise means the shard's loop (and its fsyncs) is the bottleneck, and above 4096 queued peer messages are dropped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max by (shard, node) (shard_loop_queue_depth)",
+          "legendFormat": "shard {{shard}} node {{node}}"
         }
       ]
     }

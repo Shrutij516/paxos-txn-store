@@ -181,7 +181,7 @@ func TestMultiProcessTransactions(t *testing.T) {
 	var all []runResult
 	for it := 0; it < iters; it++ {
 		t.Run(fmt.Sprintf("iter%d", it), func(t *testing.T) {
-			all = append(all, runBank(t, bin, uint64(it)+1))
+			all = append(all, runBank(t, bin, uint64(it)+1, traceOn))
 		})
 	}
 	var commits, attempts, aborts, cross, unknown, unknownCommitted int
@@ -410,7 +410,15 @@ func leadersNow(t *testing.T, procs []*proc, sh txn.ShardID) (map[paxos.NodeID]m
 	}
 }
 
-func runBank(t *testing.T, bin string, seed uint64) runResult {
+// tracing selects how the nodes trace in a run.
+type tracing int
+
+const (
+	traceOn  tracing = iota // -trace-sample traceSample, exporting to a test collector
+	traceOff                // -trace-sample 0 and no OTLP endpoint
+)
+
+func runBank(t *testing.T, bin string, seed uint64, tr tracing) runResult {
 	dir := t.TempDir()
 	t.Cleanup(func() {
 		keep := os.Getenv(keepLogsEnv)
@@ -432,10 +440,19 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 		addrs = append(addrs, procs[i].addr)
 	}
 	cfg := writeConfig(t, dir, procs)
-	col, otlp := startCollector(t)
+	var col *collector
+	var traceArgs []string
+	if tr == traceOn {
+		var otlp string
+		col, otlp = startCollector(t)
+		traceArgs = []string{"-otlp-endpoint", otlp, "-trace-sample", traceSample}
+	} else {
+		traceArgs = []string{"-trace-sample", "0"}
+	}
 	for _, p := range procs {
 		p.args = []string{"-config", cfg, "-id", fmt.Sprint(p.id), "-data-dir", p.dir, "-tick", tick.String(), "-in-doubt-wait", inDoubtWait.String(),
-			"-metrics-listen", p.maddr, "-otlp-endpoint", otlp, "-trace-sample", traceSample}
+			"-metrics-listen", p.maddr}
+		p.args = append(p.args, traceArgs...)
 		p.start(t, bin)
 	}
 	defer func() {
@@ -553,7 +570,9 @@ func runBank(t *testing.T, bin string, seed uint64) runResult {
 	workTime := time.Since(workStart)
 
 	sms := quiesce(t, procs)
-	col.checkExported(t)
+	if col != nil {
+		col.checkExported(t)
+	}
 	return check(t, rec, sms, kills, workTime, dir)
 }
 
@@ -856,4 +875,38 @@ func check(t *testing.T, rec *recorder, sms map[txn.ShardID]*txn.SM, kills []kil
 	t.Logf("%d attempts in %v: %d committed (%.0f/s), %d aborted, %d cross-shard commits, %d unknown outcomes (%d committed); history of %d committed txns is strictly serializable",
 		r.attempts, workTime.Round(time.Millisecond), r.committed, float64(r.committed)/workTime.Seconds(), r.aborted, r.cross, r.unknown, r.unknownCommitted, len(h.Txns))
 	return r
+}
+
+// abEnv, when set, enables TestTracingThroughputAB.
+const abEnv = "PAXOSD_AB"
+
+// TestTracingThroughputAB compares committed transactions per second in the
+// multi-process run with tracing off (-trace-sample 0, no OTLP endpoint) and
+// on (-trace-sample 0.2, exporting to a test collector), interleaving 5
+// runs of each so drift on the machine hits both alike. It takes a few
+// minutes, so it only runs with PAXOSD_AB=1.
+func TestTracingThroughputAB(t *testing.T) {
+	if os.Getenv(abEnv) == "" {
+		t.Skip("set PAXOSD_AB=1 to run")
+	}
+	bin := buildPaxosd(t)
+	rates := map[tracing][]float64{}
+	for i := 0; i < 10; i++ {
+		tr := tracing(i % 2)
+		name := map[tracing]string{traceOff: "off", traceOn: "on"}[tr]
+		t.Run(fmt.Sprintf("%d-%s", i/2, name), func(t *testing.T) {
+			r := runBank(t, bin, uint64(i/2)+1, tr)
+			rates[tr] = append(rates[tr], float64(r.committed)/r.duration.Seconds())
+		})
+	}
+	for _, tr := range []tracing{traceOff, traceOn} {
+		rs := rates[tr]
+		mean, lo, hi := 0.0, rs[0], rs[0]
+		for _, r := range rs {
+			mean += r / float64(len(rs))
+			lo, hi = min(lo, r), max(hi, r)
+		}
+		t.Logf("tracing %s: committed txns/s %.1f mean, %.1f to %.1f, runs %.1f",
+			map[tracing]string{traceOff: "off (-trace-sample 0, no OTLP)", traceOn: "on (-trace-sample " + traceSample + ", OTLP)"}[tr], mean, lo, hi, rs)
+	}
 }

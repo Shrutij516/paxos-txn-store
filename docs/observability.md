@@ -23,7 +23,9 @@ The SDK takes a `TracerProvider` in `client.Options` (default: the global one, w
 
 ## Metrics
 
-Every metric has exactly two labels, `shard` and `node`, and one series per shard on each node. No label value ever comes from a transaction ID, a key or a client; an abort reason is part of the metric name instead (DECISIONS.md entry 29). `TestMetricLabels` checks this for every metric after a contended workload. The Go runtime collectors are not registered, since `go_info` carries a `version` label.
+Labels are only ever bounded (DECISIONS.md entry 29). The store's metrics carry `shard` and `node`, whose values come from the cluster config, so a node has one series per shard; `txn_aborts_total` adds `reason`, from the fixed set below. No label value ever comes from a transaction ID, a key or a client ID. The standard Go runtime and process collectors are registered too (`go_*`, `process_*`); their only labels are `quantile` (the fixed GC duration quantiles) and `version` (on `go_info`). `TestMetricLabels` checks every exported metric after a contended workload: only these label names exist, each value is in its fixed set, and every documented metric is there. `TestCheckLabelsRejects` shows the check refuses a `txn_id`, `key` or `client` label.
+
+Latency histograms (`paxos_commit_latency_seconds`, `txn_prepare_phase_seconds`, `txn_decide_phase_seconds`, `txn_participant_prepare_seconds`, `storage_fsync_seconds`) share explicit buckets from 50µs to 2s, in seconds: 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2. That covers an fsync on a fast disk (tens of µs) up to a stall of an election timeout or two; slower samples land in `+Inf`. `txn_outcome_query_seconds` adds 5 and 10, since a query only starts after the in-doubt wait and can span an election.
 
 "At the leader" means the counter moves only on the replica that leads the shard when the event happens, so summing over nodes counts each event once. Gauges are per replica.
 
@@ -43,13 +45,20 @@ Every metric has exactly two labels, `shard` and `node`, and one series per shar
 |---|---|---|
 | `txn_commits_total` | counter | Transactions committed, at the leader of the shard that decides them: the one shard of a single-shard transaction, the coordinator (lowest shard) of a cross-shard one. |
 | `txn_cross_shard_commits_total` | counter | Of those, the cross-shard ones. |
-| `txn_aborts_wounded_total` | counter | Aborted because an older transaction needed its locks (wound-wait). |
-| `txn_aborts_lock_lost_total` | counter | Aborted because a read lock was gone at commit (lease expiry or a leader change), so the read could be stale. |
-| `txn_aborts_validation_total` | counter | A one-phase record rejected by the state machine (a read version changed, or a prepared transaction conflicts). |
-| `txn_aborts_vote_no_total` | counter | A participant voted no. |
-| `txn_aborts_timeout_total` | counter | The coordinator gave up waiting for votes. |
-| `txn_aborts_presumed_total` | counter | A participant asked for the outcome and nobody was coordinating the transaction (presumed abort). |
-| `txn_aborts_unknown_total` | counter | The abort was decided under an earlier leader, so this one does not know why. |
+| `txn_aborts_total` | counter | Transactions aborted, at the leader of the deciding shard, with a `reason` label: |
+
+| `reason` | Meaning |
+|---|---|
+| `wounded` | An older transaction needed its locks (wound-wait). |
+| `lock_lost` | A read lock was gone at commit (lease expiry or a leader change), so the read could be stale. |
+| `validation` | The state machine rejected a one-phase record (a read version changed, or a prepared transaction conflicts). |
+| `vote_no` | A participant voted no. |
+| `timeout` | The coordinator gave up waiting for votes. |
+| `presumed` | A participant asked for the outcome and nobody was coordinating the transaction (presumed abort). |
+| `unknown` | The abort was decided under an earlier leader, so this one does not know why. |
+
+| Metric | Type | Meaning |
+|---|---|---|
 | `txn_prepare_phase_seconds` | histogram | Coordinator: from starting two-phase commit to proposing the decision. Mostly waiting for votes, which includes each participant's prepare round. |
 | `txn_decide_phase_seconds` | histogram | Coordinator: from proposing the decision to applying it from the log. |
 | `txn_participant_prepare_seconds` | histogram | Participant: from proposing a prepare record to applying it, after which it votes. It starts once the locks are granted, so lock waits are not included (see `txn_lock_waits_total`). |
@@ -60,11 +69,16 @@ Every metric has exactly two labels, `shard` and `node`, and one series per shar
 
 Aborts only count transactions whose outcome a shard logged. A transaction the client gives up on during its reads (it was wounded, or its deadline passed) is counted in `txn_wounds_total` but has no outcome record, so it is not an abort here.
 
-### Storage
+### Storage and the event loop
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `storage_fsync_seconds` | histogram | Each durable write of a shard's log (a promise, an accepted entry, a commit batch, a proposer round): one SQLite transaction ending in an fsync, which dominates its time. Paxos waits for it before every reply, so it bounds commit latency. |
+| `shard_loop_queue_depth` | gauge | Events waiting for the shard's event loop, read at scrape time: peer and cross-shard messages in its inbox plus client requests (and `Inspect` calls) waiting to be handed over. Near 0 when the loop keeps up. A sustained rise means the loop, usually its fsyncs, is the bottleneck; past 4096 queued messages new ones are dropped (Paxos and two-phase commit retry). |
+
+### Go runtime and process
+
+The standard collectors from `client_golang`: `go_goroutines`, `go_threads`, `go_gc_duration_seconds`, `go_memstats_*`, `go_info` and so on, and `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and the other `process_*` metrics. They describe the whole `paxosd` process, so they carry no `shard` or `node` label.
 
 ## Traces
 
@@ -106,10 +120,20 @@ The cluster is bound by fsyncs (every replica of every shard shares one disk), s
 ## What the tests check
 
 - `TestCrossShardTxnIsOneTrace` (in-memory exporter): one trace per cross-shard transaction, with spans from both shards and both nodes, including `2pc.prepare` and `2pc.decide`.
-- `TestMetricLabels`: every metric has only the `shard` and `node` labels, with values from the cluster config, and every documented metric exists. `TestDashboardUsesRealMetrics`: every metric the dashboard queries exists.
+- `TestMetricLabels`: only bounded labels (`shard`, `node`, `reason`, `quantile`, `version`), each value in its fixed set, and every documented metric exists; `TestCheckLabelsRejects` is its negative control. `TestDashboardUsesRealMetrics`: every metric the dashboard queries exists.
 - `TestRequestLogsCarryTraceID`: request logs are JSON with the transaction's trace ID.
 - `TestMultiProcessTransactions` (real processes): picks each kill's victim from the `paxos_is_leader` gauges just before the kill, checks that `paxos_leader_elections_total` on the surviving nodes rises after it, waits for `txn_in_doubt` to return to 0 on every node before stopping the cluster, checks that `paxos_commit_latency_seconds` has samples, and receives the nodes' spans in a small OTLP receiver (with `-trace-sample 0.2`), requiring two-phase commit and Paxos round spans from at least two nodes.
 - `TestMPObserver`, `TestObserverMatchesLogs`: the cores replay identically with observers attached, and the outcomes reported match the logs.
+
+**A/B in real processes.** `TestTracingThroughputAB` (run with `PAXOSD_AB=1`) runs the multi-process workload of docs/running.md with the nodes at `-trace-sample 0` and no OTLP endpoint (off), and at `-trace-sample 0.2` exporting to an OTLP receiver (on), interleaving 5 runs of each. Two batches in the development sandbox, committed transactions per second:
+
+| Batch | Off: mean (range) | On: mean (range) |
+|---|---|---|
+| 1 | 70.5 (58.4 to 91.7) | 59.3 (31.4 to 83.4) |
+| 2 | 59.4 (40.8 to 79.5) | 65.0 (46.3 to 97.5) |
+| Both, 10 runs each | 65.0 (40.8 to 91.7) | 62.2 (31.4 to 97.5) |
+
+The difference between the means (about 4%) is far inside the run-to-run spread, and the batches disagree on its sign: the workload's contention and its two leader kills vary more from run to run than tracing costs. Tracing at 0.2 is not measurably slower here, consistent with the in-process benchmark above.
 
 ## Logs
 
@@ -120,11 +144,12 @@ The cluster is bound by fsyncs (every replica of every shard shares one disk), s
 
 ## Reading the dashboard
 
-`deploy/grafana/dashboard.json` has six panels. All are rates or quantiles over 1 minute.
+`deploy/grafana/dashboard.json` has seven panels. All are rates or quantiles over 1 minute.
 
 - **Leader elections.** Elections won per shard per minute. It should be flat at 0. A spike on one shard is one failover; spikes on every shard at once mean a node died (each node leads replicas of every shard). Repeated spikes without a crash suggest timeouts too tight for the network or disk (DECISIONS.md entry 15).
 - **Commit latency p50 / p99.** Per shard, from proposal to apply at the leader. p50 is about one network round trip plus a majority's fsync. A rising p99 with flat p50 usually follows the fsync panel; a gap during an election is expected, since nothing commits without a leader.
 - **Throughput.** Committed transactions per second, all and cross-shard. A dip lines up with elections (transactions in flight on that shard abort and retry) and with in-doubt spikes (locks held).
-- **Abort rate by reason.** One series per `txn_aborts_<reason>_total`. Under contention `vote_no` and `wounded` dominate (wound-wait at work; see docs/running.md on the contended workload). `lock_lost` rises after leader changes. `timeout` or `presumed` mean coordinators are failing or slow, and should be near zero otherwise.
+- **Abort rate by reason.** `txn_aborts_total` summed by `reason`, one series per reason. Under contention `vote_no` and `wounded` dominate (wound-wait at work; see docs/running.md on the contended workload). `lock_lost` rises after leader changes. `timeout` or `presumed` mean coordinators are failing or slow, and should be near zero otherwise.
 - **In-doubt transactions.** Prepared transactions waiting for an outcome, per shard. Normally 0 or a few in flight. After a coordinator failure it rises and must fall back to 0 within about an election plus the in-doubt wait (`-in-doubt-wait`, docs/running.md). If it stays up, participants cannot reach the coordinator shard.
 - **fsync latency p50 / p99.** Per node. This is the floor under commit latency; if both rise together, the disk is the bottleneck.
+- **Event loop queue depth.** `shard_loop_queue_depth` per shard and node. Flat near 0 is healthy. A shard whose queue climbs while the others stay flat is the hot one; all shards on one node climbing together point at that node's disk or CPU. It usually rises together with fsync latency and commit latency.
