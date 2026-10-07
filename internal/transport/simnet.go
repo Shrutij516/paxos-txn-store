@@ -38,6 +38,7 @@ type SimNet struct {
 	handlers map[paxos.NodeID]Handler
 	down     map[paxos.NodeID]bool
 	group    map[paxos.NodeID]int // partition group; nodes talk only within a group
+	slow     map[paxos.NodeID]Slow
 
 	// OnSend, if set, sees every message handed to Send before any fault is
 	// applied. Tests use it to watch what acceptors actually did.
@@ -55,7 +56,27 @@ func NewSimNet(seed uint64) *SimNet {
 		handlers: make(map[paxos.NodeID]Handler),
 		down:     make(map[paxos.NodeID]bool),
 		group:    make(map[paxos.NodeID]int),
+		slow:     make(map[paxos.NodeID]Slow),
 	}
+}
+
+// Slow describes a slow node: a starved CPU or a slow disk. Every message
+// the node sends waits Persist extra steps (the write it makes durable
+// before replying), and every message it receives waits Handle extra steps
+// before the node gets to it. Messages a node sends to itself pay both.
+type Slow struct {
+	Persist, Handle int
+}
+
+// SetSlow makes id slow for messages sent from now on; the zero Slow makes
+// it normal again.
+func (n *SimNet) SetSlow(id paxos.NodeID, s Slow) {
+	if s == (Slow{}) {
+		delete(n.slow, id)
+	} else {
+		n.slow[id] = s
+	}
+	n.trace("slow %d %+v", id, s)
 }
 
 // Now returns the current step.
@@ -123,6 +144,7 @@ func (n *SimNet) enqueue(m paxos.Message) {
 	if n.faults.MaxDelay > 1 {
 		d += n.rng.IntN(n.faults.MaxDelay)
 	}
+	d += n.slow[m.From].Persist + n.slow[m.To].Handle
 	n.queue = append(n.queue, envelope{at: n.now + uint64(d), msg: m})
 }
 

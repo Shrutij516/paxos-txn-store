@@ -140,3 +140,29 @@ func TestSameSeedSameSchedule(t *testing.T) {
 		t.Fatal("different seeds produced the same trace")
 	}
 }
+
+func TestSlowNode(t *testing.T) {
+	n, recs := setup(1, Faults{})
+	n.SetSlow(2, Slow{Persist: 3, Handle: 5})
+	n.Send(msg(1, 2, 1)) // into the slow node: 1 + Handle
+	n.Send(msg(2, 3, 1)) // out of it: 1 + Persist
+	n.Send(msg(1, 3, 1)) // between normal nodes: 1
+	at := map[paxos.NodeID]uint64{}
+	for range 10 {
+		n.Step()
+		for id, r := range recs {
+			if _, ok := at[id]; !ok && len(r.got) > 0 {
+				at[id] = n.Now()
+			}
+		}
+	}
+	if at[3] != 1 || len(recs[3].got) != 2 || at[2] != 6 {
+		t.Fatalf("first delivery at %v with %d messages at node 3, want node 3 at 1 (2 messages), node 2 at 6", at, len(recs[3].got))
+	}
+	n.SetSlow(2, Slow{})
+	n.Send(msg(1, 2, 2))
+	n.Step()
+	if len(recs[2].got) != 2 {
+		t.Fatal("SetSlow with the zero Slow left the node slow")
+	}
+}

@@ -32,6 +32,8 @@ These takeover paths are rare under ordinary faults, so the tests also run a **g
 
 There is no wall clock. Every replica has an election timer counted in simulator ticks, reset to a random value in `[ElectionMin, ElectionMax]` whenever it hears from a leader (a heartbeat or an Accept) or grants a promise to a candidate. The leader sends a heartbeat every `HeartbeatEvery` ticks, carrying its ballot and commit index. If a follower's timer runs out, it picks a ballot above every ballot it has seen, persists the round, and runs Prepare. The randomized timeout makes it unlikely that two replicas start an election at the same moment, and if they do, the one with the lower ballot gets a Nack and steps down.
 
+**Election backoff.** If an election round (Prepare out, persist, Promise back) takes longer than the election timeout, as on a starved CPU or a slow disk, every candidate starts a new round, at a higher ballot, before the promises for its last one arrive, and no leader is ever elected. So when a replica's timer runs out after an election it started produced no leader (it timed out as candidate, or a rival's higher Prepare cut it short), its next timeout range is doubled, keeping the randomization, up to `ElectionBackoff` (default 8) times `[ElectionMin, ElectionMax]`. The backoff ends once the same leader has held for a whole backed-off timeout, not on its first heartbeat: rival Prepares sent before it won can still depose it, and resetting at once would send everyone back to colliding at the short timeout. In steady state nothing changes; a failover after such a period is slower until the backoff ends. The random chaos schedules now also make a node slow (1 to 15 extra steps on every message it sends, for the write before the reply, and on every message it receives) and normal again; `TestMPSlowNodesElectLeader` makes every replica slow by 12 and 12 steps, so a round takes about 50 steps against a timeout of at most 40, and fails without the backoff (no leader in 3000 steps). See DECISIONS.md entry 35.
+
 Anyone who is not the leader answers a client with "not leader" plus the ID of the leader it last heard from. The client retries there.
 
 ## How followers learn commits, and how catch-up works
@@ -73,6 +75,7 @@ Under `go test -short` (what `make test` runs) the seeded suites use 100 seeds. 
 | Client histories with retries are linearizable (porcupine), checked both mid-chaos and at the end | `TestMPLinearizable`, `TestMPGapHeavyLinearizable`, `TestMPLinearizabilityCheckerCatchesStaleRead` |
 | Operations that never got a response stay in the history, open-ended | `TestMPHistoryKeepsOutstandingOperations` |
 | A new leader commits within a bound after the old one crashes | `TestMPLeaderFailover` |
+| A leader is elected and clients finish when every replica is so slow that one election round outlasts the election timeout; the backoff doubles, caps and resets as specified | `TestMPSlowNodesElectLeader`, `TestReplicaElectionBackoff` |
 | A restarted node catches up to the leader's committed log | `TestMPCatchUp` |
 | A retried request is applied once | `TestMPExactlyOnce` |
 | Same seed, same trace | `TestMPReplay` |
