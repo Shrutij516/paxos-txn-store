@@ -1,0 +1,10 @@
+# Prometheus config for deploy/compose.yaml: scrapes the three nodes over
+# the compose network.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: paxosd
+    static_configs:
+      - targets: ["node1:9100", "node2:9100", "node3:9100"]

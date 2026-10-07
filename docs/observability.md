@@ -17,6 +17,8 @@ The server (`internal/server/telemetry.go`) implements both interfaces once per 
 | `-trace-sample` | `0.01` | fraction of new traces sampled; a trace a client started follows the client's decision (DECISIONS.md entry 28) |
 | `-log-level` | `info` | `debug` adds one line per client request, with its trace ID |
 
+The metrics port also serves `/healthz` (200 while the process is up) and `/readyz` (200 once every shard replica on the node knows its shard's leader, or is it, and has applied everything it knows to be committed; 503 with the reason otherwise). `paxosd -probe URL` checks one of them, for container healthchecks.
+
 `deploy/prometheus/prometheus.yml` scrapes a local cluster started with `-metrics-listen 127.0.0.1:9101`, `:9102` and `:9103`. `deploy/grafana/dashboard.json` is the dashboard described below; import it into Grafana with a Prometheus data source. Neither is run by tests yet.
 
 The SDK takes a `TracerProvider` in `client.Options` (default: the global one, which does nothing unless the program installs one).

@@ -1,0 +1,56 @@
+name: chaos
+
+# Fault injection against the compose stack (docs/chaos.md): a 2-minute run
+# on every pull request, a 20-minute run nightly, any length on demand.
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Chaos run length (Go duration)"
+        default: "2m"
+
+permissions:
+  contents: read
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      DURATION: ${{ github.event_name == 'schedule' && '20m' || inputs.duration || '2m' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build the image, loadgen and the chaos runner
+        run: |
+          docker build -t paxos-txn-store:dev .
+          docker image ls paxos-txn-store:dev
+          go build -o bin/loadgen ./cmd/loadgen
+          go build -o bin/chaos ./cmd/chaos
+          docker pull -q mirror.gcr.io/nicolaka/netshoot:v0.14
+
+      - name: chaos run (${{ env.DURATION }})
+        run: ./bin/chaos -duration "$DURATION" -loadgen ./bin/loadgen -out chaos-out
+
+      - name: report
+        if: always()
+        run: cat chaos-out/report.json || true
+
+      - name: upload node logs, history and data
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-out-${{ github.run_id }}
+          path: chaos-out
+          retention-days: 14
+
+      - name: tear down
+        if: always()
+        run: docker compose -f deploy/compose.yaml -p paxos down -v

@@ -598,6 +598,22 @@ func quiesce(t *testing.T, procs []*proc) map[txn.ShardID]*txn.SM {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// Every node is healthy and, once settled, ready.
+	for _, p := range procs {
+		for _, path := range []string{"/healthz", "/readyz"} {
+			ok := false
+			for wait := time.Now(); !ok && time.Since(wait) < 10*time.Second; time.Sleep(50 * time.Millisecond) {
+				resp, err := http.Get("http://" + p.maddr + path)
+				if err == nil {
+					ok = resp.StatusCode == http.StatusOK
+					_ = resp.Body.Close()
+				}
+			}
+			if !ok {
+				t.Fatalf("node %d: %s never answered 200", p.id, path)
+			}
+		}
+	}
 	samples := 0.0
 	for _, p := range procs {
 		samples += histCount(scrape(t, p), "paxos_commit_latency_seconds")

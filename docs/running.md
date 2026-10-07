@@ -2,6 +2,32 @@
 
 `paxosd` is one node of the sharded transaction store. Every node hosts one replica of every shard (DECISIONS.md entry 22), so a 3-node, 3-shard cluster is three processes, each running three Multi-Paxos replicas. The `client` package is the Go SDK. There is no TLS yet.
 
+## The local stack in one command
+
+With Docker and Docker Compose v2, from the repository root:
+
+```sh
+docker compose -f deploy/compose.yaml up -d --build --wait
+```
+
+This builds the `paxosd` image (`Dockerfile`), starts three nodes hosting the three shards, Prometheus, Grafana and Jaeger, and returns once every container is healthy (a node is healthy when `/readyz` answers: every shard on it has a known leader and is caught up). Then open:
+
+| What | URL |
+|---|---|
+| Grafana, with the dashboard (anonymous viewer; `admin`/`admin` to edit) | http://localhost:3000 |
+| Jaeger, traces of sampled transactions (service `paxosd`) | http://localhost:16686 |
+| Prometheus | http://localhost:9090 |
+| Node gRPC (for the SDK and `loadgen`) | `localhost:7001`, `7002`, `7003` |
+| Node metrics, `/healthz`, `/readyz` | http://localhost:9101, `9102`, `9103` |
+
+Put some load on it with the bank workload, which writes its history to a file:
+
+```sh
+go run ./cmd/loadgen -duration 1m -out history.jsonl
+```
+
+The nodes keep their SQLite files on named volumes (`node1-data` and so on) and sample 10% of new traces. Stop with `docker compose -f deploy/compose.yaml down` (the nodes get SIGTERM and 15 seconds to stop), or `down -v` to delete the data too. To inject faults and check the result, see docs/chaos.md.
+
 ## Build
 
 ```sh
@@ -50,6 +76,7 @@ Each shard elects its own leader within a few hundred milliseconds, so the leade
 | `-otlp-endpoint` | empty (off) | OTLP/gRPC collector for traces |
 | `-trace-sample` | `0.01` | fraction of new traces sampled; traces a client starts follow the client |
 | `-log-level` | `info` | JSON logs on stderr; `debug` logs every client request with its trace ID |
+| `-probe` | empty | check a health URL and exit 0 if it answers 200 (the image's healthcheck, since it has no shell) |
 
 With the default tick, a shard leader sends a heartbeat every 40 ms and a follower starts an election after 200 to 400 ms without one (DECISIONS.md entry 15). The transaction layer's timeouts are also in ticks: a prepared participant asks its coordinator for the outcome after `-in-doubt-wait` (0.6 s), a coordinator gives up on missing votes after 3 s, and an idle read lock expires after 2 s.
 

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -59,8 +60,12 @@ func run(args []string) error {
 	sample := fs.Float64("trace-sample", DefaultTraceSample,
 		"fraction of new traces to sample, 0 to 1; traces a client starts follow the client's decision")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error; debug logs every client request with its trace ID")
+	probe := fs.String("probe", "", "check a health URL (for example http://127.0.0.1:9100/readyz) and exit 0 if it answers 200, else 1; for container healthchecks, since the image has no shell or curl")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *probe != "" {
+		return probeURL(*probe)
 	}
 	if *config == "" || *id <= 0 || *dataDir == "" {
 		return fmt.Errorf("-config, -id and -data-dir are required")
@@ -115,6 +120,19 @@ func run(args []string) error {
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.HandlerFor(n.Registry(), promhttp.HandlerOpts{}))
+		// /healthz: the process is up and serving. /readyz: every shard on
+		// this node has a known leader and has applied all it knows to be
+		// committed, so it can serve its part of the cluster.
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+			defer cancel()
+			if err := n.Ready(ctx); err != nil {
+				http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = io.WriteString(w, "ready\n")
+		})
 		metricsSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			if err := metricsSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -137,5 +155,20 @@ func run(args []string) error {
 		cancel()
 	}
 	mainLog.Info("stopped", "took_ms", time.Since(start).Milliseconds())
+	return nil
+}
+
+// probeURL GETs url and fails unless it answers 200 within 2 seconds.
+func probeURL(url string) error {
+	c := http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get(url)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s: %s: %s", url, resp.Status, body)
+	}
 	return nil
 }

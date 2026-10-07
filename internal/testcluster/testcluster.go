@@ -123,3 +123,6 @@ func (c *Cluster) Commit(id paxos.NodeID, sh txn.ShardID) uint64 {
 	c.Nodes[id].Inspect(sh, func(r *paxos.Replica, _ *txn.SM, _ *txn.Server) { commit = r.Commit() })
 	return commit
 }
+
+// DataDir returns a node's data directory.
+func (c *Cluster) DataDir(id paxos.NodeID) string { return c.cfgs[id].DataDir }

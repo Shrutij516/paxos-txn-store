@@ -340,3 +340,38 @@ func TestInDoubtWaitInTicks(t *testing.T) {
 		}
 	}
 }
+
+func TestReady(t *testing.T) {
+	nodes := startCluster(t, 3, 2)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := nodes[0].Ready(ctx)
+		cancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never ready: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// A lone node of a 3-node cluster never learns a leader.
+	lone := Cluster{Shards: 1, Nodes: []NodeConfig{{ID: 1, Addr: "127.0.0.1:0"}, {ID: 2, Addr: "127.0.0.1:1"}, {ID: 3, Addr: "127.0.0.1:2"}}}
+	n, err := Start(Config{ID: 1, Cluster: lone, DataDir: t.TempDir(), Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Stop()
+	time.Sleep(100 * time.Millisecond)
+	if err := n.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "no known leader") {
+		t.Fatalf("lone node: %v, want no known leader", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = n.Ready(ctx) // an expired context does not hang
+	n.Stop()
+	if err := n.Ready(context.Background()); err == nil {
+		t.Fatal("stopped node is ready")
+	}
+}
