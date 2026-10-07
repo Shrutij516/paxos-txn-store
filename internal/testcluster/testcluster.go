@@ -13,6 +13,28 @@ import (
 	"github.com/Shrutij516/paxos-txn-store/internal/txn"
 )
 
+// Tick is the test cluster's logical tick. Under -race it is longer: the
+// race detector slows every node several times over, and with the short
+// tick the heartbeats and timers of nine replicas alone can starve a busy
+// CI runner until leaders are deposed faster than they can commit (six
+// race-instrumented copies of TestConcurrentIncrements on one CPU fail at
+// 5 ms and pass at RaceTick; DECISIONS.md entry 36). Production defaults
+// (server.DefaultTick) are not affected.
+var Tick = NormalTick
+
+const (
+	// NormalTick is the tick without -race.
+	NormalTick = 5 * time.Millisecond
+	// RaceTick is the tick under -race.
+	RaceTick = 60 * time.Millisecond
+)
+
+func init() {
+	if raceEnabled {
+		Tick = RaceTick
+	}
+}
+
 // Cluster is a set of nodes, each with its own data dir, each hosting one
 // replica of every shard.
 type Cluster struct {
@@ -42,7 +64,7 @@ func Start(t testing.TB, n, shards int, opts func(*server.Config)) *Cluster {
 		c.Addrs = append(c.Addrs, l.Addr().String())
 	}
 	for _, id := range c.IDs {
-		cfg := server.Config{ID: id, Cluster: cl, DataDir: t.TempDir(), Tick: 5 * time.Millisecond}
+		cfg := server.Config{ID: id, Cluster: cl, DataDir: t.TempDir(), Tick: Tick}
 		if opts != nil {
 			opts(&cfg)
 		}

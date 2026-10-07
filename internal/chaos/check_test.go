@@ -64,6 +64,13 @@ func runLoadgen(t *testing.T) (history.Meta, []history.Attempt, map[txn.ShardID]
 // TestCheckRealRun: a real loadgen history against a real cluster with a
 // node stopped mid-run passes every check; tampered versions of it fail.
 func TestCheckRealRun(t *testing.T) {
+	if testing.Short() {
+		// It builds loadgen and runs a real cluster for several seconds,
+		// which under -race competes with every other package for the CI
+		// runner. The full suite still runs it, and the chaos workflow
+		// runs the same checks on a real loadgen history on every PR.
+		t.Skip("real cluster run; covered by the full suite and the chaos job")
+	}
 	meta, atts, sms := runLoadgen(t)
 	r := Check(meta, atts, sms)
 	if len(r.Violations) > 0 {
