@@ -34,28 +34,28 @@ services:
     volumes:
       - ./cluster.json:/etc/paxosd/cluster.json:ro
       - node1-data:/data
-    ports: ["7001:7001", "9101:9100"]
+    ports: ["127.0.0.1:7001:7001", "127.0.0.1:9101:9100"]
   node2:
     <<: *node
     command: ["-id=2", "-config=/etc/paxosd/cluster.json", "-listen=0.0.0.0:7001", "-data-dir=/data", "-metrics-listen=0.0.0.0:9100", "-otlp-endpoint=jaeger:4317", "-trace-sample=0.1"]
     volumes:
       - ./cluster.json:/etc/paxosd/cluster.json:ro
       - node2-data:/data
-    ports: ["7002:7001", "9102:9100"]
+    ports: ["127.0.0.1:7002:7001", "127.0.0.1:9102:9100"]
   node3:
     <<: *node
     command: ["-id=3", "-config=/etc/paxosd/cluster.json", "-listen=0.0.0.0:7001", "-data-dir=/data", "-metrics-listen=0.0.0.0:9100", "-otlp-endpoint=jaeger:4317", "-trace-sample=0.1"]
     volumes:
       - ./cluster.json:/etc/paxosd/cluster.json:ro
       - node3-data:/data
-    ports: ["7003:7001", "9103:9100"]
+    ports: ["127.0.0.1:7003:7001", "127.0.0.1:9103:9100"]
 
   prometheus:
     image: mirror.gcr.io/prom/prometheus:v3.5.0
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
     volumes:
       - ./prometheus/compose.yml:/etc/prometheus/prometheus.yml:ro
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:9090:9090"]
     stop_grace_period: 10s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
@@ -72,7 +72,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboard.json:/var/lib/grafana/dashboards/paxos-txn-store.json:ro
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     depends_on: [prometheus]
     stop_grace_period: 10s
     healthcheck:
@@ -83,7 +83,7 @@ services:
 
   jaeger:
     image: mirror.gcr.io/jaegertracing/jaeger:2.9.0
-    ports: ["16686:16686"]
+    ports: ["127.0.0.1:16686:16686"]
     stop_grace_period: 10s
 
 volumes:

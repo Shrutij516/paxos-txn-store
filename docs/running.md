@@ -20,6 +20,8 @@ This builds the `paxosd` image (`Dockerfile`), starts three nodes hosting the th
 | Node gRPC (for the SDK and `loadgen`) | `localhost:7001`, `7002`, `7003` |
 | Node metrics, `/healthz`, `/readyz` | http://localhost:9101, `9102`, `9103` |
 
+All ports are published on 127.0.0.1 only, so the stack is not reachable from other machines (see DECISIONS.md entry 34).
+
 Put some load on it with the bank workload, which writes its history to a file:
 
 ```sh

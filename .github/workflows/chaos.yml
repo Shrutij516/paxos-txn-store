@@ -3,8 +3,6 @@ name: chaos
 # Fault injection against the compose stack (docs/chaos.md): a 2-minute run
 # on every pull request, a 20-minute run nightly, any length on demand.
 on:
-  push: # TEMPORARY: verify on the branch before a PR exists; removed before review
-    branches: [phase-8]
   pull_request:
   schedule:
     - cron: "17 3 * * *" # 03:17 UTC

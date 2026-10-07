@@ -47,7 +47,8 @@ jobs:
         run: make sdk-check
 
   # Fails if code the module actually calls, in its dependencies or the Go
-  # standard library, has a known vulnerability.
+  # standard library, has a known vulnerability. scripts/govulncheck.sh allows
+  # exactly GO-2026-6443 until grpc v1.85.0 ships and fails once it is gone.
   govulncheck:
     runs-on: ubuntu-latest
     steps:
@@ -58,7 +59,7 @@ jobs:
           go-version-file: go.mod
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: scripts/govulncheck.sh
 
   # Regenerates the protobuf code with pinned tools and fails if the
   # committed files differ from what the .proto files produce.
