@@ -49,8 +49,8 @@ bench:
 bench-trace:
 	$(GO) test -run xxx -bench TracingOverhead -benchtime 3s -count 3 ./internal/server/
 
-# Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.6
-# and protoc-gen-go-grpc v1.5.1 on PATH (pinned in CI; see docs/running.md).
+# Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.12
+# and protoc-gen-go-grpc v1.6.2 on PATH (pinned in CI; see docs/running.md).
 PROTOS := proto/paxos/v1/paxos.proto proto/txn/v1/txn.proto
 proto:
 	protoc --go_out=. --go_opt=paths=source_relative \

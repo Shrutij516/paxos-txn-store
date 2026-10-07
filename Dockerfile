@@ -5,7 +5,7 @@
 # Base images come from mirror.gcr.io (Google's cache of Docker Hub) to
 # avoid Docker Hub rate limits in CI. Behind a TLS-intercepting proxy, pass
 # its CA as a build secret: --secret id=ca,src=/path/to/ca.pem.
-ARG GO_IMAGE=mirror.gcr.io/library/golang:1.24
+ARG GO_IMAGE=mirror.gcr.io/library/golang:1.26.8
 ARG RUN_IMAGE=gcr.io/distroless/static-debian12:nonroot
 
 FROM ${GO_IMAGE} AS build

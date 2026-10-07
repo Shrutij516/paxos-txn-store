@@ -71,7 +71,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 
 ## 11. modernc.org/sqlite instead of mattn/go-sqlite3
 
-- **What:** The SQLite backend uses `modernc.org/sqlite`, a pure Go translation of SQLite, pinned to v1.44.3 (the newest release that still builds with Go 1.24).
+- **What:** The SQLite backend uses `modernc.org/sqlite`, a pure Go translation of SQLite, now at v1.60.1 (it was held at v1.44.3, the newest release that built with Go 1.24, until the move to Go 1.26.8).
 - **Why:** No cgo: builds and cross-compiles with the plain Go toolchain, works with `-race` and in minimal CI images without a C compiler, and keeps static binaries simple for later chaos tests on real processes. It is the same SQLite code base, so file format, pragmas and durability semantics match.
 - **Rejected:** `mattn/go-sqlite3` (the most widely used driver and somewhat faster, but needs cgo and a C toolchain everywhere, slows builds, and complicates cross-compiling); `ncruces/go-sqlite3` (pure Go via WebAssembly, promising but younger).
 - **Tradeoff:** modernc is slower on CPU-heavy queries and adds a large dependency tree. Our workload is a few small writes per consensus step, dominated by fsync, so CPU cost does not matter yet. Newer modernc releases need a newer Go, so upgrading the driver will mean upgrading Go.
@@ -179,7 +179,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **What:** Traces use the OpenTelemetry Go SDK with the OTLP/gRPC exporter and the otelgrpc instrumentation; metrics use the Prometheus client library with a `/metrics` endpoint on its own port; logs use the standard library's `log/slog` with a JSON handler. The SDK takes any OpenTelemetry `TracerProvider`.
 - **Why:** OpenTelemetry is the vendor-neutral standard: OTLP is accepted by Jaeger, Tempo, Honeycomb, Datadog and the OpenTelemetry Collector, so the backend is a deployment choice, not a code change. W3C trace context is the propagation format everyone reads, which is what lets a client, every shard and every node add to one trace. Prometheus is the de facto pull format for metrics and what the Grafana dashboard reads; pulling also means a node does no work for metrics nobody scrapes. `slog` is in the standard library, structured, and cheap when a level is off.
 - **Rejected:** Vendor SDKs (Datadog, New Relic and others: good tooling, but they tie the code to one backend and each propagates context its own way); OpenTelemetry for metrics too (one SDK for both, but the Prometheus client is simpler and more mature for a pull endpoint, and exporting OTel metrics to Prometheus adds a translation layer); zap or zerolog for logs (faster in benchmarks, but logging is not on the hot path here except at debug level, and they are extra dependencies).
-- **Tradeoff:** Two telemetry libraries instead of one, and the module now depends on the OpenTelemetry and Prometheus packages (the SDK depends on OpenTelemetry's API and otelgrpc). OpenTelemetry's Go packages move quickly; versions are pinned to ones that build with Go 1.24.
+- **Tradeoff:** Two telemetry libraries instead of one, and the module now depends on the OpenTelemetry and Prometheus packages (the SDK depends on OpenTelemetry's API and otelgrpc). OpenTelemetry's Go packages move quickly; versions are pinned in go.mod and are bumped together with Go when govulncheck flags them (as in the move to Go 1.26.8).
 
 ## 27. The cores emit events; only the server adds telemetry
 

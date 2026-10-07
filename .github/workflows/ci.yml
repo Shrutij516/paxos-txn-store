@@ -30,7 +30,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.5.0
+          version: v2.14.0
 
   # The public SDK must not depend on this module's internal packages,
   # which programs outside the module cannot import.
@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PROTOC_VERSION: "29.3"
-      PROTOC_GEN_GO_VERSION: v1.36.6
-      PROTOC_GEN_GO_GRPC_VERSION: v1.5.1
+      PROTOC_GEN_GO_VERSION: v1.36.12
+      PROTOC_GEN_GO_GRPC_VERSION: v1.6.2
     steps:
       - uses: actions/checkout@v4
 

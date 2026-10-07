@@ -197,8 +197,8 @@ The workload is deliberately contended: 10 clients on 12 accounts, where two tra
 The generated files in `proto/` are committed, and CI regenerates them with pinned tools (`make proto-check`) and fails if anything differs. After editing a `.proto` file, install `protoc` 29.3, then:
 
 ```sh
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 make proto
 ```
 
