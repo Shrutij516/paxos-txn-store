@@ -143,4 +143,40 @@ type ReplicaConfig struct {
 	Rand         Rand
 	Timing       LogTiming // zero value means DefaultLogTiming
 	StateMachine StateMachine
+	// Observer receives the replica's events; nil means none.
+	Observer Observer
 }
+
+// Observer receives a Replica's events so the layer above can turn them
+// into metrics and traces. The replica calls it synchronously from Handle
+// and Tick. It must not call back into the replica, and nothing it does
+// affects the replica, so a replica behaves the same with or without one
+// (the simulator runs without). Any wall-clock timing is the observer's
+// business.
+type Observer interface {
+	// BecameLeader: this replica won an election at ballot b.
+	BecameLeader(b Ballot)
+	// SteppedDown: this replica stopped leading because it saw a higher
+	// ballot.
+	SteppedDown(b Ballot)
+	// Proposed: as leader, this replica proposed e at slot (a new entry,
+	// or one re-proposed while taking over). Retransmissions do not count.
+	Proposed(slot uint64, e Entry)
+	// Applied: e was committed at slot and applied to the state machine.
+	Applied(slot uint64, e Entry)
+}
+
+// NoObserver ignores every event.
+type NoObserver struct{}
+
+// BecameLeader does nothing.
+func (NoObserver) BecameLeader(Ballot) {}
+
+// SteppedDown does nothing.
+func (NoObserver) SteppedDown(Ballot) {}
+
+// Proposed does nothing.
+func (NoObserver) Proposed(uint64, Entry) {}
+
+// Applied does nothing.
+func (NoObserver) Applied(uint64, Entry) {}

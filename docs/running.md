@@ -46,6 +46,10 @@ Each shard elects its own leader within a few hundred milliseconds, so the leade
 | `-tick` | `10ms` | wall-clock length of one logical tick |
 | `-rpc-timeout` | `200ms` | deadline for each peer RPC |
 | `-in-doubt-wait` | `600ms` | how long a prepared transaction waits for its coordinator's decision before its shard leader asks for it (rounded up to whole ticks); see below |
+| `-metrics-listen` | empty (off) | address for the Prometheus `/metrics` endpoint (docs/observability.md) |
+| `-otlp-endpoint` | empty (off) | OTLP/gRPC collector for traces |
+| `-trace-sample` | `0.01` | fraction of new traces sampled; traces a client starts follow the client |
+| `-log-level` | `info` | JSON logs on stderr; `debug` logs every client request with its trace ID |
 
 With the default tick, a shard leader sends a heartbeat every 40 ms and a follower starts an election after 200 to 400 ms without one (DECISIONS.md entry 15). The transaction layer's timeouts are also in ticks: a prepared participant asks its coordinator for the outcome after `-in-doubt-wait` (0.6 s), a coordinator gives up on missing votes after 3 s, and an idle read lock expires after 2 s.
 
@@ -135,7 +139,7 @@ Transactions are strictly serializable (docs/transactions.md).
 
 ## Multi-process test
 
-`TestMultiProcessTransactions` (in `cmd/paxosd`) starts three real `paxosd` processes with three shards and runs 10 concurrent SDK clients doing bank transfers between 12 accounts, plus 10% audits that read every account. Eight clients give each transaction 10 s; two give it 150 ms, less than an election timeout. During the run the test SIGKILLs the leader of shard 2 and restarts it 1.5 s later. Then it waits until a short client's commit is in flight at shard 0 (the coordinator of every transaction that touches it), SIGKILLs the node leading shard 0 and restarts it 1.5 s later. Afterwards it stops every process with SIGTERM, rebuilds every shard from the SQLite files (checking that all replicas' logs agree), and runs the Phase 5 checkers on the real history: atomicity, the bank invariant (final state and every committed audit), and strict serializability, which also rejects G1a and G1b. It also checks that every transaction the SDK reported committed is committed in the logs, and every one reported aborted is not. A transaction with an unknown outcome counts as whatever the logs say. The test fails if no transaction ended with an unknown outcome, or if no cross-shard transaction was in flight across each kill. It runs 3 times in full CI, once under `-short`. Set `PAXOSD_KEEP_LOGS` to a directory to keep a failed run's node logs, config and SQLite files there.
+`TestMultiProcessTransactions` (in `cmd/paxosd`) starts three real `paxosd` processes with three shards and runs 10 concurrent SDK clients doing bank transfers between 12 accounts, plus 10% audits that read every account. Eight clients give each transaction 10 s; two give it 150 ms, less than an election timeout. During the run the test SIGKILLs the leader of shard 2 and restarts it 1.5 s later. Then it waits until a short client's commit is in flight at shard 0 (the coordinator of every transaction that touches it), SIGKILLs the node leading shard 0 and restarts it 1.5 s later. Afterwards it stops every process with SIGTERM, rebuilds every shard from the SQLite files (checking that all replicas' logs agree), and runs the Phase 5 checkers on the real history: atomicity, the bank invariant (final state and every committed audit), and strict serializability, which also rejects G1a and G1b. It also checks that every transaction the SDK reported committed is committed in the logs, and every one reported aborted is not. A transaction with an unknown outcome counts as whatever the logs say. The test fails if no transaction ended with an unknown outcome, or if no cross-shard transaction was in flight across each kill. It also checks metrics and traces from the real processes (docs/observability.md, What the tests check). It runs 3 times in full CI, once under `-short`. Set `PAXOSD_KEEP_LOGS` to a directory to keep a failed run's node logs, config and SQLite files there.
 
 Numbers from one full run of 3 iterations in the development sandbox:
 
@@ -180,3 +184,4 @@ make proto
 - `internal/server`: one node. Each shard has its own event-loop goroutine that owns its replica, transaction state machine and transaction server; gRPC handlers, the ticker and the other shards only send it events over channels.
 - `cmd/paxosd`: flags, config file, signal handling.
 - `client`: the SDK.
+- Metrics, traces and logs: docs/observability.md.

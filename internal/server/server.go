@@ -15,13 +15,18 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 
 	"github.com/Shrutij516/paxos-txn-store/internal/grpcnet"
@@ -80,6 +85,16 @@ type Config struct {
 	Txn txn.Config
 	// ServerOptions are extra gRPC server options (tests add interceptors).
 	ServerOptions []grpc.ServerOption
+
+	// TracerProvider produces the node's spans: gRPC server spans for the
+	// Txn service, two-phase commit phases and Paxos rounds. Nil means no
+	// tracing.
+	TracerProvider trace.TracerProvider
+	// Registry receives the node's metrics. Nil means a new registry;
+	// Node.Registry returns it either way.
+	Registry *prometheus.Registry
+	// Logger receives the node's structured logs. Nil means none.
+	Logger *slog.Logger
 }
 
 // Node is a running node.
@@ -92,7 +107,16 @@ type Node struct {
 	lis    net.Listener
 	addr   string
 	stop   sync.Once
+
+	tp      trace.TracerProvider
+	tracing bool // TracerProvider was given
+	reg     *prometheus.Registry
+	metrics *metrics
+	log     *slog.Logger
 }
+
+// Registry returns the registry holding the node's metrics.
+func (n *Node) Registry() *prometheus.Registry { return n.reg }
 
 // DBPath returns the SQLite file of a node's replica of a shard.
 func DBPath(dataDir string, id paxos.NodeID, sh txn.ShardID) string {
@@ -124,8 +148,21 @@ func Start(cfg Config) (*Node, error) {
 	if cfg.Txn.QueryAfter <= 0 {
 		cfg.Txn.QueryAfter = int((cfg.InDoubtWait + cfg.Tick - 1) / cfg.Tick)
 	}
-	n := &Node{cfg: cfg, addrs: addrs}
+	n := &Node{cfg: cfg, addrs: addrs, tp: cfg.TracerProvider, tracing: cfg.TracerProvider != nil, reg: cfg.Registry, log: cfg.Logger}
+	if n.tp == nil {
+		n.tp = noop.NewTracerProvider()
+	}
+	if n.reg == nil {
+		n.reg = prometheus.NewRegistry()
+	}
+	if n.log == nil {
+		n.log = slog.New(slog.DiscardHandler)
+	}
+	n.log = n.log.With("node", int(cfg.ID))
 	var err error
+	if n.metrics, err = registerMetrics(n.reg); err != nil {
+		return nil, err
+	}
 	// The servers never address a non-peer ID through the transport (they
 	// deliver locally first), so its local callback has nothing to do.
 	n.tr, err = grpcnet.New(cfg.ID, addrs, func(uint32, paxos.Message) {}, cfg.RPCTimeout)
@@ -153,13 +190,14 @@ func Start(cfg Config) (*Node, error) {
 		}
 	}
 	n.addr = n.lis.Addr().String()
-	n.srv = grpc.NewServer(cfg.ServerOptions...)
+	n.srv = grpc.NewServer(append(n.serverOptions(), cfg.ServerOptions...)...)
 	paxosv1.RegisterPeerServer(n.srv, peerService{n: n})
 	txnv1.RegisterTxnServer(n.srv, txnService{n: n})
 	for _, s := range n.shards {
 		go s.loop()
 	}
 	go func() { _ = n.srv.Serve(n.lis) }()
+	n.log.Info("serving", "addr", n.addr, "shards", len(n.shards), "tick", cfg.Tick.String())
 	return n, nil
 }
 
@@ -169,19 +207,21 @@ func (n *Node) openShard(sh txn.ShardID, ids []paxos.NodeID) (*shard, error) {
 		return nil, err
 	}
 	s := &shard{
-		n: n, id: sh, db: db,
-		inbox:   make(chan paxos.Message, inboxSize),
+		n: n, id: sh, db: db, log: n.log.With("shard", int(sh)),
+		inbox:   make(chan inMsg, inboxSize),
 		calls:   make(chan func()),
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
 		reads:   make(map[readKey]chan readResult),
 		commits: make(map[txn.ID]chan commitResult),
 	}
+	m := n.metrics.forShard(sh, n.cfg.ID)
+	s.tel = newTelemetry(s, m, n.tp)
 	s.sm = txn.NewSM(nil)
 	s.rep, err = paxos.NewReplica(paxos.ReplicaConfig{
 		ID: n.cfg.ID, Peers: ids, Rand: rand.New(rand.NewPCG(seed(), seed())),
-		Timing: n.cfg.Timing, StateMachine: s.sm,
-	}, db, shardSender{s})
+		Timing: n.cfg.Timing, StateMachine: s.sm, Observer: s.tel,
+	}, timedLog{LogStorage: db, h: m.fsync}, shardSender{s})
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -189,6 +229,13 @@ func (n *Node) openShard(sh txn.ShardID, ids []paxos.NodeID) (*shard, error) {
 	tc := n.cfg.Txn
 	tc.Shard = sh
 	tc.ShardNodes = func(txn.ShardID) []paxos.NodeID { return ids }
+	tc.Observer = s.tel
+	if err := n.metrics.queueDepth(sh, n.cfg.ID, func() float64 {
+		return float64(len(s.inbox)) + float64(s.waiting.Load())
+	}); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	s.ts = txn.NewServer(tc, n.cfg.ID, s.rep, s.sm, s.send)
 	s.ts.After() // drop the events from replaying the log
 	return s, nil
@@ -225,6 +272,7 @@ func (n *Node) Shards() int { return len(n.shards) }
 func (n *Node) Stop() { n.stop.Do(n.shutdown) }
 
 func (n *Node) shutdown() {
+	n.log.Info("stopping")
 	stopped := make(chan struct{})
 	go func() { n.srv.GracefulStop(); close(stopped) }()
 	select {
@@ -281,11 +329,16 @@ type shard struct {
 	sm  *txn.SM
 	rep *paxos.Replica
 	ts  *txn.Server
+	tel *telemetry
+	log *slog.Logger
 
-	inbox chan paxos.Message // from peers and from other shards on this node
-	calls chan func()        // client requests and Inspect
-	quit  chan struct{}
-	done  chan struct{}
+	inbox chan inMsg  // from peers and from other shards on this node
+	calls chan func() // client requests and Inspect
+	// waiting counts callers blocked handing a function to calls, for the
+	// queue depth gauge.
+	waiting atomic.Int64
+	quit    chan struct{}
+	done    chan struct{}
 
 	// Owned by the event loop goroutine.
 	selfQ   []paxos.Message
@@ -293,6 +346,12 @@ type shard struct {
 	commits map[txn.ID]chan commitResult
 	leading bool
 	ballot  paxos.Ballot
+}
+
+// inMsg is a message for a shard, with the trace context it carried.
+type inMsg struct {
+	m     paxos.Message
+	trace map[string]string
 }
 
 // shardSender is the replica's transport: it sends within the shard.
@@ -313,15 +372,23 @@ func (s *shard) send(sh txn.ShardID, m paxos.Message) {
 	case m.To < 0:
 		// Replies to a transaction server's own proposals: unused.
 	case m.To != s.n.cfg.ID:
-		s.n.tr.Send(uint32(sh), m)
+		s.n.tr.SendTraced(uint32(sh), m, s.carrier(m))
 	case sh == s.id:
 		s.selfQ = append(s.selfQ, m)
 	case int(sh) < len(s.n.shards):
 		select {
-		case s.n.shards[sh].inbox <- m:
+		case s.n.shards[sh].inbox <- inMsg{m: m, trace: s.carrier(m)}:
 		default:
 		}
 	}
+}
+
+// carrier is the trace context to send with m, if tracing is on.
+func (s *shard) carrier(m paxos.Message) map[string]string {
+	if !s.n.tracing {
+		return nil
+	}
+	return s.tel.inject(m)
 }
 
 // reply hands a transaction server's answer to the waiting client handler.
@@ -358,8 +425,12 @@ func (s *shard) loop() {
 		case <-tick.C:
 			s.rep.Tick()
 			s.ts.Tick()
-		case m := <-s.inbox:
-			s.dispatch(m)
+			s.tel.tick()
+		case in := <-s.inbox:
+			if s.n.tracing {
+				s.tel.extract(in.m, in.trace)
+			}
+			s.dispatch(in.m)
 		case f := <-s.calls:
 			f()
 		}
@@ -391,6 +462,9 @@ func (s *shard) settle() {
 	if leading == s.leading && ballot == s.ballot {
 		return
 	}
+	if leading != s.leading {
+		s.tel.leadership(leading)
+	}
 	s.leading, s.ballot = leading, ballot
 	for k, ch := range s.reads {
 		ch <- readResult{notLeader: true}
@@ -405,11 +479,14 @@ func (s *shard) settle() {
 // run executes f on the event loop and waits for it.
 func (s *shard) run(f func()) error {
 	ran := make(chan struct{})
+	s.waiting.Add(1)
 	select {
 	case s.calls <- func() { f(); close(ran) }:
+		s.waiting.Add(-1) // handed over; the loop is running it
 		<-ran
 		return nil
 	case <-s.done:
+		s.waiting.Add(-1)
 		return errStopped
 	}
 }

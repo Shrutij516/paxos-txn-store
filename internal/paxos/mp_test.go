@@ -366,3 +366,29 @@ func TestMPGapHeavyNegativeSkipPrepare(t *testing.T) {
 func TestMPGapHeavyNegativeIgnorePromisedValues(t *testing.T) {
 	findMPViolation(t, func(o *mpOpts) { gapHeavy(o); o.IgnorePromised = true })
 }
+
+// The Observer only watches: the same seed replays to the same trace hash
+// with and without observers, and the events they see are consistent.
+func TestMPObserver(t *testing.T) {
+	var elections, proposed, applied int
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
+		plain, _ := runMP(seed, nil)
+		obs, _ := runMP(seed, func(o *mpOpts) { o.Observe = true })
+		if plain.TraceHash() != obs.TraceHash() {
+			t.Fatalf("seed=%d: an observer changed the run", seed)
+		}
+		for _, o := range obs.observers {
+			if o.err != nil {
+				t.Fatalf("seed=%d: %v", seed, o.err)
+			}
+			if o.outOfTurn > 0 {
+				t.Fatalf("seed=%d: replica %d proposed %d entries while not leading", seed, o.id, o.outOfTurn)
+			}
+			elections, proposed, applied = elections+o.elections, proposed+o.proposed, applied+o.applied
+		}
+	}
+	if elections == 0 || proposed == 0 || applied == 0 {
+		t.Fatalf("observers saw %d elections, %d proposals, %d applies", elections, proposed, applied)
+	}
+	t.Logf("observers saw %d elections, %d proposals, %d applies", elections, proposed, applied)
+}

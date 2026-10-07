@@ -102,6 +102,9 @@ func (s *SM) IsOnePhase(id ID) bool { return s.onePhase[id] }
 // Prepared returns the prepared record of txn, or nil.
 func (s *SM) Prepared(id ID) *Record { return s.prepared[id] }
 
+// NumPrepared returns the number of prepared transactions (in doubt here).
+func (s *SM) NumPrepared() int { return len(s.prepared) }
+
 // PreparedTxns returns the IDs of all prepared transactions, sorted.
 func (s *SM) PreparedTxns() []ID { return sortedTxns(s.prepared) }
 

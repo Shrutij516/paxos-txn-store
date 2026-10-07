@@ -1029,6 +1029,10 @@ type Envelope struct {
 	From  int32                  `protobuf:"varint,1,opt,name=from,proto3" json:"from,omitempty"`
 	To    int32                  `protobuf:"varint,2,opt,name=to,proto3" json:"to,omitempty"`
 	Shard uint32                 `protobuf:"varint,3,opt,name=shard,proto3" json:"shard,omitempty"`
+	// W3C trace context (traceparent, tracestate) of the transaction a
+	// two-phase commit message belongs to, so one transaction is one trace
+	// across shards and nodes. Empty for Paxos messages.
+	Trace map[string]string `protobuf:"bytes,4,rep,name=trace,proto3" json:"trace,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Envelope_Prepare
@@ -1105,6 +1109,13 @@ func (x *Envelope) GetShard() uint32 {
 		return x.Shard
 	}
 	return 0
+}
+
+func (x *Envelope) GetTrace() map[string]string {
+	if x != nil {
+		return x.Trace
+	}
+	return nil
 }
 
 func (x *Envelope) GetBody() isEnvelope_Body {
@@ -1521,11 +1532,12 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x0e\n" +
 	"\x02ok\x18\x03 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06result\x18\x04 \x01(\fR\x06result\x12\x16\n" +
-	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\xf2\b\n" +
+	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\xe1\t\n" +
 	"\bEnvelope\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\x05R\x02to\x12\x14\n" +
-	"\x05shard\x18\x03 \x01(\rR\x05shard\x12-\n" +
+	"\x05shard\x18\x03 \x01(\rR\x05shard\x123\n" +
+	"\x05trace\x18\x04 \x03(\v2\x1d.paxos.v1.Envelope.TraceEntryR\x05trace\x12-\n" +
 	"\aprepare\x18\n" +
 	" \x01(\v2\x11.paxos.v1.PrepareH\x00R\aprepare\x12-\n" +
 	"\apromise\x18\v \x01(\v2\x11.paxos.v1.PromiseH\x00R\apromise\x12*\n" +
@@ -1550,7 +1562,11 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x04vote\x18\x1f \x01(\v2\f.txn.v1.VoteH\x00R\x04vote\x12.\n" +
 	"\bdecision\x18  \x01(\v2\x10.txn.v1.DecisionH\x00R\bdecision\x12;\n" +
 	"\rquery_outcome\x18! \x01(\v2\x14.txn.v1.QueryOutcomeH\x00R\fqueryOutcome\x12/\n" +
-	"\twound_req\x18\" \x01(\v2\x10.txn.v1.WoundReqH\x00R\bwoundReqB\x06\n" +
+	"\twound_req\x18\" \x01(\v2\x10.txn.v1.WoundReqH\x00R\bwoundReq\x1a8\n" +
+	"\n" +
+	"TraceEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x06\n" +
 	"\x04body\"\t\n" +
 	"\aSendAck25\n" +
 	"\x04Peer\x12-\n" +
@@ -1568,7 +1584,7 @@ func file_proto_paxos_v1_paxos_proto_rawDescGZIP() []byte {
 	return file_proto_paxos_v1_paxos_proto_rawDescData
 }
 
-var file_proto_paxos_v1_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_proto_paxos_v1_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_proto_paxos_v1_paxos_proto_goTypes = []any{
 	(*Ballot)(nil),          // 0: paxos.v1.Ballot
 	(*Entry)(nil),           // 1: paxos.v1.Entry
@@ -1590,11 +1606,12 @@ var file_proto_paxos_v1_paxos_proto_goTypes = []any{
 	(*ClientReply)(nil),     // 17: paxos.v1.ClientReply
 	(*Envelope)(nil),        // 18: paxos.v1.Envelope
 	(*SendAck)(nil),         // 19: paxos.v1.SendAck
-	(*v1.PrepareReq)(nil),   // 20: txn.v1.PrepareReq
-	(*v1.Vote)(nil),         // 21: txn.v1.Vote
-	(*v1.Decision)(nil),     // 22: txn.v1.Decision
-	(*v1.QueryOutcome)(nil), // 23: txn.v1.QueryOutcome
-	(*v1.WoundReq)(nil),     // 24: txn.v1.WoundReq
+	nil,                     // 20: paxos.v1.Envelope.TraceEntry
+	(*v1.PrepareReq)(nil),   // 21: txn.v1.PrepareReq
+	(*v1.Vote)(nil),         // 22: txn.v1.Vote
+	(*v1.Decision)(nil),     // 23: txn.v1.Decision
+	(*v1.QueryOutcome)(nil), // 24: txn.v1.QueryOutcome
+	(*v1.WoundReq)(nil),     // 25: txn.v1.WoundReq
 }
 var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	0,  // 0: paxos.v1.SlotEntry.ballot:type_name -> paxos.v1.Ballot
@@ -1617,33 +1634,34 @@ var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	0,  // 17: paxos.v1.LogNack.promised:type_name -> paxos.v1.Ballot
 	0,  // 18: paxos.v1.Heartbeat.ballot:type_name -> paxos.v1.Ballot
 	2,  // 19: paxos.v1.CatchupReply.entries:type_name -> paxos.v1.SlotEntry
-	3,  // 20: paxos.v1.Envelope.prepare:type_name -> paxos.v1.Prepare
-	4,  // 21: paxos.v1.Envelope.promise:type_name -> paxos.v1.Promise
-	5,  // 22: paxos.v1.Envelope.accept:type_name -> paxos.v1.Accept
-	6,  // 23: paxos.v1.Envelope.accepted:type_name -> paxos.v1.Accepted
-	7,  // 24: paxos.v1.Envelope.nack:type_name -> paxos.v1.Nack
-	8,  // 25: paxos.v1.Envelope.log_prepare:type_name -> paxos.v1.LogPrepare
-	9,  // 26: paxos.v1.Envelope.log_promise:type_name -> paxos.v1.LogPromise
-	10, // 27: paxos.v1.Envelope.log_accept:type_name -> paxos.v1.LogAccept
-	11, // 28: paxos.v1.Envelope.log_accepted:type_name -> paxos.v1.LogAccepted
-	12, // 29: paxos.v1.Envelope.log_nack:type_name -> paxos.v1.LogNack
-	13, // 30: paxos.v1.Envelope.heartbeat:type_name -> paxos.v1.Heartbeat
-	14, // 31: paxos.v1.Envelope.catchup_request:type_name -> paxos.v1.CatchupRequest
-	15, // 32: paxos.v1.Envelope.catchup_reply:type_name -> paxos.v1.CatchupReply
-	16, // 33: paxos.v1.Envelope.client_request:type_name -> paxos.v1.ClientRequest
-	17, // 34: paxos.v1.Envelope.client_reply:type_name -> paxos.v1.ClientReply
-	20, // 35: paxos.v1.Envelope.prepare_req:type_name -> txn.v1.PrepareReq
-	21, // 36: paxos.v1.Envelope.vote:type_name -> txn.v1.Vote
-	22, // 37: paxos.v1.Envelope.decision:type_name -> txn.v1.Decision
-	23, // 38: paxos.v1.Envelope.query_outcome:type_name -> txn.v1.QueryOutcome
-	24, // 39: paxos.v1.Envelope.wound_req:type_name -> txn.v1.WoundReq
-	18, // 40: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
-	19, // 41: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
-	41, // [41:42] is the sub-list for method output_type
-	40, // [40:41] is the sub-list for method input_type
-	40, // [40:40] is the sub-list for extension type_name
-	40, // [40:40] is the sub-list for extension extendee
-	0,  // [0:40] is the sub-list for field type_name
+	20, // 20: paxos.v1.Envelope.trace:type_name -> paxos.v1.Envelope.TraceEntry
+	3,  // 21: paxos.v1.Envelope.prepare:type_name -> paxos.v1.Prepare
+	4,  // 22: paxos.v1.Envelope.promise:type_name -> paxos.v1.Promise
+	5,  // 23: paxos.v1.Envelope.accept:type_name -> paxos.v1.Accept
+	6,  // 24: paxos.v1.Envelope.accepted:type_name -> paxos.v1.Accepted
+	7,  // 25: paxos.v1.Envelope.nack:type_name -> paxos.v1.Nack
+	8,  // 26: paxos.v1.Envelope.log_prepare:type_name -> paxos.v1.LogPrepare
+	9,  // 27: paxos.v1.Envelope.log_promise:type_name -> paxos.v1.LogPromise
+	10, // 28: paxos.v1.Envelope.log_accept:type_name -> paxos.v1.LogAccept
+	11, // 29: paxos.v1.Envelope.log_accepted:type_name -> paxos.v1.LogAccepted
+	12, // 30: paxos.v1.Envelope.log_nack:type_name -> paxos.v1.LogNack
+	13, // 31: paxos.v1.Envelope.heartbeat:type_name -> paxos.v1.Heartbeat
+	14, // 32: paxos.v1.Envelope.catchup_request:type_name -> paxos.v1.CatchupRequest
+	15, // 33: paxos.v1.Envelope.catchup_reply:type_name -> paxos.v1.CatchupReply
+	16, // 34: paxos.v1.Envelope.client_request:type_name -> paxos.v1.ClientRequest
+	17, // 35: paxos.v1.Envelope.client_reply:type_name -> paxos.v1.ClientReply
+	21, // 36: paxos.v1.Envelope.prepare_req:type_name -> txn.v1.PrepareReq
+	22, // 37: paxos.v1.Envelope.vote:type_name -> txn.v1.Vote
+	23, // 38: paxos.v1.Envelope.decision:type_name -> txn.v1.Decision
+	24, // 39: paxos.v1.Envelope.query_outcome:type_name -> txn.v1.QueryOutcome
+	25, // 40: paxos.v1.Envelope.wound_req:type_name -> txn.v1.WoundReq
+	18, // 41: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
+	19, // 42: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
+	42, // [42:43] is the sub-list for method output_type
+	41, // [41:42] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_proto_paxos_v1_paxos_proto_init() }
@@ -1679,7 +1697,7 @@ func file_proto_paxos_v1_paxos_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_paxos_v1_paxos_proto_rawDesc), len(file_proto_paxos_v1_paxos_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   20,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

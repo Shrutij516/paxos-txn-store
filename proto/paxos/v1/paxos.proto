@@ -116,6 +116,10 @@ message Envelope {
   int32 from = 1;
   int32 to = 2;
   uint32 shard = 3;
+  // W3C trace context (traceparent, tracestate) of the transaction a
+  // two-phase commit message belongs to, so one transaction is one trace
+  // across shards and nodes. Empty for Paxos messages.
+  map<string, string> trace = 4;
   oneof body {
     Prepare prepare = 10;
     Promise promise = 11;

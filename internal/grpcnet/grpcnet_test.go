@@ -54,7 +54,7 @@ func TestTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	hb := paxos.Heartbeat{Ballot: paxos.Ballot{Round: 3, Node: 1}, Commit: 7}
-	tr.Send(2, paxos.Message{From: 1, To: 2, Body: hb})
+	tr.SendTraced(2, paxos.Message{From: 1, To: 2, Body: hb}, map[string]string{"traceparent": "x"})
 	tr.Send(1, paxos.Message{From: 1, To: 1, Body: hb})  // self: local
 	tr.Send(4, paxos.Message{From: 1, To: -1, Body: hb}) // not a peer: local
 	// A dead peer must never block Send, even past its queue size.
@@ -69,7 +69,7 @@ func TestTransport(t *testing.T) {
 	for sk.count() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if sk.count() != 1 || sk.got[0].GetHeartbeat().GetCommit() != 7 || sk.got[0].GetTo() != 2 || sk.got[0].GetShard() != 2 {
+	if sk.count() != 1 || sk.got[0].GetHeartbeat().GetCommit() != 7 || sk.got[0].GetTo() != 2 || sk.got[0].GetShard() != 2 || sk.got[0].GetTrace()["traceparent"] != "x" {
 		t.Fatalf("peer received %v", sk.got)
 	}
 	if len(local) != 2 || local[0].To != 1 || local[1].To != -1 || localShards[0] != 1 || localShards[1] != 4 {

@@ -155,6 +155,9 @@ func encode(r Record) paxos.Value {
 	return paxos.Value(b)
 }
 
+// DecodeRecord decodes a transaction record from a log entry's command.
+func DecodeRecord(v paxos.Value) (Record, error) { return decode(v) }
+
 func decode(v paxos.Value) (Record, error) {
 	var r Record
 	err := json.Unmarshal([]byte(v), &r)
