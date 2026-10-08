@@ -2,6 +2,34 @@
 
 `paxosd` is one node of the sharded transaction store. Every node hosts one replica of every shard (DECISIONS.md entry 22), so a 3-node, 3-shard cluster is three processes, each running three Multi-Paxos replicas. The `client` package is the Go SDK. There is no TLS yet.
 
+## The local stack in one command
+
+With Docker and Docker Compose v2, from the repository root:
+
+```sh
+docker compose -f deploy/compose.yaml up -d --build --wait
+```
+
+This builds the `paxosd` image (`Dockerfile`), starts three nodes hosting the three shards, Prometheus, Grafana and Jaeger, and returns once every container is healthy (a node is healthy when `/readyz` answers: every shard on it has a known leader and is caught up). Then open:
+
+| What | URL |
+|---|---|
+| Grafana, with the dashboard (anonymous viewer; `admin`/`admin` to edit) | http://localhost:3000 |
+| Jaeger, traces of sampled transactions (service `paxosd`) | http://localhost:16686 |
+| Prometheus | http://localhost:9090 |
+| Node gRPC (for the SDK and `loadgen`) | `localhost:7001`, `7002`, `7003` |
+| Node metrics, `/healthz`, `/readyz` | http://localhost:9101, `9102`, `9103` |
+
+All ports are published on 127.0.0.1 only, so the stack is not reachable from other machines (see DECISIONS.md entry 34).
+
+Put some load on it with the bank workload, which writes its history to a file:
+
+```sh
+go run ./cmd/loadgen -duration 1m -out history.jsonl
+```
+
+The nodes keep their SQLite files on named volumes (`node1-data` and so on) and sample 10% of new traces. Stop with `docker compose -f deploy/compose.yaml down` (the nodes get SIGTERM and 15 seconds to stop), or `down -v` to delete the data too. To inject faults and check the result, see docs/chaos.md.
+
 ## Build
 
 ```sh
@@ -50,6 +78,7 @@ Each shard elects its own leader within a few hundred milliseconds, so the leade
 | `-otlp-endpoint` | empty (off) | OTLP/gRPC collector for traces |
 | `-trace-sample` | `0.01` | fraction of new traces sampled; traces a client starts follow the client |
 | `-log-level` | `info` | JSON logs on stderr; `debug` logs every client request with its trace ID |
+| `-probe` | empty | check a health URL and exit 0 if it answers 200 (the image's healthcheck, since it has no shell) |
 
 With the default tick, a shard leader sends a heartbeat every 40 ms and a follower starts an election after 200 to 400 ms without one (DECISIONS.md entry 15). The transaction layer's timeouts are also in ticks: a prepared participant asks its coordinator for the outcome after `-in-doubt-wait` (0.6 s), a coordinator gives up on missing votes after 3 s, and an idle read lock expires after 2 s.
 
@@ -154,6 +183,8 @@ Numbers from one full run of 3 iterations in the development sandbox:
 
 They vary a lot between runs on a shared machine: another full run gave 26 to 59 committed transactions per second and one second-kill failover of 1.36 s. Failover is the time from the SIGKILL to the commit of the first transaction that began after it and touched a shard the killed node led. It is at least an election timeout (200 to 400 ms), and more when that transaction needs a key locked by a transaction left prepared by the kill: such a transaction stays prepared until its participants ask the new coordinator leader (after `-in-doubt-wait`) and learn the outcome. That is the blocking window two-phase commit keeps even with replicated coordinators, now bounded by the in-doubt wait instead of by a coordinator restart.
 
+The election backoff (DECISIONS.md entry 35) leaves these numbers alone, since elections in this test succeed at the first try. Measured back to back on one machine, 3 iterations each, failover per kill was 270 to 466 ms before and 238 to 356 ms after at the 10 ms tick, and 466 to 773 ms before and 481 to 706 ms after at a 20 ms tick (election timeout 400 to 800 ms); throughput was 58 and 66, and 60 and 57, committed transactions per second.
+
 ### The in-doubt wait and failover
 
 `-in-doubt-wait` sets how long a shard leader holding a prepared transaction waits for the coordinator's decision before asking the coordinator shard for it. Normally the decision arrives within milliseconds and the wait never expires. It matters when the coordinator shard's leader dies between collecting votes and telling the participants: the participants keep the transaction's locks for an election plus up to the in-doubt wait plus one round trip. Any transaction that needs one of those keys waits that long, or is wounded and retried. A participant whose leader changes starts the wait again under the new leader.
@@ -170,8 +201,8 @@ The workload is deliberately contended: 10 clients on 12 accounts, where two tra
 The generated files in `proto/` are committed, and CI regenerates them with pinned tools (`make proto-check`) and fails if anything differs. After editing a `.proto` file, install `protoc` 29.3, then:
 
 ```sh
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 make proto
 ```
 

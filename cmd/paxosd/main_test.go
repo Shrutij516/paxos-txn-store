@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,5 +32,21 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		if err := run(args); err == nil {
 			t.Errorf("run(%q) should fail", args)
 		}
+	}
+}
+
+func TestProbe(t *testing.T) {
+	code := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
+	defer srv.Close()
+	if err := run([]string{"-probe", srv.URL}); err != nil {
+		t.Fatalf("probe of a 200: %v", err)
+	}
+	code = http.StatusServiceUnavailable
+	if err := run([]string{"-probe", srv.URL}); err == nil {
+		t.Fatal("probe of a 503 succeeded")
+	}
+	if err := run([]string{"-probe", "http://127.0.0.1:1/readyz"}); err == nil {
+		t.Fatal("probe of a closed port succeeded")
 	}
 }

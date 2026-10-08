@@ -131,10 +131,19 @@ type LogTiming struct {
 	ElectionMin    int // follower election timeout is drawn from
 	ElectionMax    int // [ElectionMin, ElectionMax]
 	CatchupBatch   int // max entries per CatchupReply
+	// ElectionBackoff caps the election backoff: each time a replica's own
+	// election times out, its next timeout range is doubled, up to
+	// ElectionBackoff times [ElectionMin, ElectionMax]. Hearing from a
+	// leader resets it. Values < 1 mean DefaultElectionBackoff.
+	ElectionBackoff int
 }
 
+// DefaultElectionBackoff is the default cap on the election backoff.
+const DefaultElectionBackoff = 8
+
 // DefaultLogTiming suits the simulator's default delays.
-var DefaultLogTiming = LogTiming{HeartbeatEvery: 4, ElectionMin: 20, ElectionMax: 40, CatchupBatch: 64}
+var DefaultLogTiming = LogTiming{HeartbeatEvery: 4, ElectionMin: 20, ElectionMax: 40, CatchupBatch: 64,
+	ElectionBackoff: DefaultElectionBackoff}
 
 // ReplicaConfig describes one replica.
 type ReplicaConfig struct {

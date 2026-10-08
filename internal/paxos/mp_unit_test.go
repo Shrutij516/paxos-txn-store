@@ -3,6 +3,7 @@ package paxos_test
 import (
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/Shrutij516/paxos-txn-store/internal/kv"
@@ -356,5 +357,59 @@ func TestReplicaRejectsBadCommittedLog(t *testing.T) {
 	gap := &flakyLog{Memory: storage.NewMemory(), committed: []paxos.SlotEntry{{Slot: 1}, {Slot: 3}}}
 	if _, err := paxos.NewReplica(cfg, gap, &outbox{}); err == nil {
 		t.Error("want error for a committed log with a gap")
+	}
+}
+
+// Each election that produces no leader doubles the next election timeout,
+// up to ElectionBackoff times the base; a leader that holds for a whole
+// backed-off timeout ends the backoff, and a short-lived one does not.
+func TestReplicaElectionBackoff(t *testing.T) {
+	tr := &outbox{}
+	r, err := paxos.NewReplica(paxos.ReplicaConfig{
+		ID: 1, Peers: peers3, Rand: rand.New(rand.NewPCG(1, 2)), StateMachine: kv.New(),
+		Timing: paxos.LogTiming{HeartbeatEvery: 2, ElectionMin: 10, ElectionMax: 10, CatchupBatch: 2, ElectionBackoff: 4},
+	}, storage.NewMemory(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ticksToPrepare ticks until the replica sends a Prepare, feeding it a
+	// heartbeat from leader 2 at ballot hb on each of the first beats ticks.
+	ticksToPrepare := func(hb paxos.Ballot, beats int) int {
+		for n := 1; n <= 1000; n++ {
+			if n <= beats {
+				r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.Heartbeat{Ballot: hb}})
+			}
+			r.Tick()
+			if len(bodies[paxos.LogPrepare](tr.take())) > 0 {
+				return n
+			}
+		}
+		t.Fatal("no election within 1000 ticks")
+		return 0
+	}
+	// The follower timeout, the first election at the base timeout, then
+	// doubling up to the cap.
+	var gaps []int
+	for range 5 {
+		gaps = append(gaps, ticksToPrepare(paxos.Ballot{}, 0))
+	}
+	if want := []int{10, 10, 20, 40, 40}; !slices.Equal(gaps, want) {
+		t.Fatalf("ticks between failed elections %v, want %v", gaps, want)
+	}
+	// A leader heard once, then silent: the backoff stays, so the next
+	// election comes 40 ticks after its heartbeat (delivered before tick 1).
+	if n := ticksToPrepare(b(100, 2), 1); n != 40 {
+		t.Fatalf("election %d ticks after a short-lived leader, want 40", n)
+	}
+	// A leader heard on 41 ticks in a row has held for 40 ticks, the whole
+	// backed-off timeout: its last heartbeat (before tick 41) ends the
+	// backoff and the election comes 10 ticks later.
+	if n := ticksToPrepare(b(200, 2), 41); n != 40+10 {
+		t.Fatalf("election %d ticks after a steady leader, want %d", n, 40+10)
+	}
+	// The backoff is gone: that election ran at the base timeout, and only
+	// its failure doubles the next one.
+	if a, c := ticksToPrepare(paxos.Ballot{}, 0), ticksToPrepare(paxos.Ballot{}, 0); a != 10 || c != 20 {
+		t.Fatalf("elections %d and %d ticks apart after the backoff ended, want 10 and 20", a, c)
 	}
 }

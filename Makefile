@@ -49,8 +49,8 @@ bench:
 bench-trace:
 	$(GO) test -run xxx -bench TracingOverhead -benchtime 3s -count 3 ./internal/server/
 
-# Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.6
-# and protoc-gen-go-grpc v1.5.1 on PATH (pinned in CI; see docs/running.md).
+# Regenerate Go code from proto/. Needs protoc 29.3, protoc-gen-go v1.36.12
+# and protoc-gen-go-grpc v1.6.2 on PATH (pinned in CI; see docs/running.md).
 PROTOS := proto/paxos/v1/paxos.proto proto/txn/v1/txn.proto
 proto:
 	protoc --go_out=. --go_opt=paths=source_relative \
@@ -62,9 +62,10 @@ proto-check: proto
 	@test -z "$$(git status --porcelain -- proto/)" || { git status --porcelain -- proto/; exit 1; }
 
 # The SDK must build for programs outside this module, which cannot import
-# its internal packages. Fails if package client depends on any of them.
+# its internal packages. Fails if package client, the history format or
+# loadgen (which uses only the public SDK) depends on any of them.
 MODULE := $(shell $(GO) list -m)
 sdk-check:
-	@bad=$$($(GO) list -deps ./client | grep '^$(MODULE)/internal/' || true); \
-	if [ -n "$$bad" ]; then echo "client imports internal packages:"; echo "$$bad"; exit 1; fi; \
-	echo "client depends on no internal package"
+	@bad=$$($(GO) list -deps ./client ./history ./cmd/loadgen | grep '^$(MODULE)/internal/' || true); \
+	if [ -n "$$bad" ]; then echo "public packages import internal packages:"; echo "$$bad"; exit 1; fi; \
+	echo "client, history and loadgen depend on no internal package"

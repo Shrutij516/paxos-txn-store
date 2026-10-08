@@ -51,6 +51,10 @@ type mpOpts struct {
 	CrashBeforeCommit float64
 	CrashAfterCommit  float64
 
+	// Slow, if set, makes every replica slow from the start (a starved CPU
+	// or a slow disk): see transport.Slow.
+	Slow transport.Slow
+
 	// Observe attaches a recording paxos.Observer to every replica.
 	Observe bool
 
@@ -118,8 +122,9 @@ type mpCluster struct {
 	dbFaults  bool             // crash-at-commit faults active
 	dbCrashes [2]int           // crashes injected before / after commit
 	gapActive bool
-	crashIn   map[paxos.NodeID]int // steps until a scheduled crash
-	observers []*recObserver       // one per replica incarnation, with Observe
+	crashIn   map[paxos.NodeID]int  // steps until a scheduled crash
+	slow      map[paxos.NodeID]bool // made slow by chaos
+	observers []*recObserver        // one per replica incarnation, with Observe
 }
 
 // recObserver records a replica's events and checks their order: Applied
@@ -205,6 +210,7 @@ func newMPCluster(seed uint64, o mpOpts) *mpCluster {
 		chosenAt:  map[uint64]paxos.Entry{},
 		h:         sha256.New(),
 		crashIn:   map[paxos.NodeID]int{},
+		slow:      map[paxos.NodeID]bool{},
 		gapActive: o.AcceptDrop > 0 || o.CrashAfterAccept > 0,
 		dbFaults:  o.CrashBeforeCommit > 0 || o.CrashAfterCommit > 0,
 	}
@@ -217,6 +223,9 @@ func newMPCluster(seed uint64, o mpOpts) *mpCluster {
 	for _, id := range c.ids {
 		c.mem[id] = storage.NewMemory()
 		c.start(id)
+		if o.Slow != (transport.Slow{}) {
+			c.net.SetSlow(id, o.Slow)
+		}
 	}
 	for i := 0; i < o.Clients; i++ {
 		cl := &simClient{
@@ -472,6 +481,16 @@ func (c *mpCluster) injectChaos() {
 	if c.rng.Float64() < ch.HealProb {
 		c.net.Heal()
 	}
+	if c.rng.Float64() < ch.SlowProb {
+		id := c.ids[c.rng.IntN(len(c.ids))]
+		if c.slow[id] {
+			delete(c.slow, id)
+			c.net.SetSlow(id, transport.Slow{})
+		} else {
+			c.slow[id] = true
+			c.net.SetSlow(id, transport.Slow{Persist: 1 + c.rng.IntN(15), Handle: 1 + c.rng.IntN(15)})
+		}
+	}
 }
 
 func (c *mpCluster) step(withChaos bool) {
@@ -511,6 +530,12 @@ func (c *mpCluster) calm() {
 	c.gapActive = false
 	c.dbFaults = false
 	clear(c.crashIn)
+	for _, id := range c.ids { // in order: the trace must not depend on map order
+		if c.slow[id] {
+			c.net.SetSlow(id, transport.Slow{})
+		}
+	}
+	clear(c.slow)
 	c.net.SetFaults(transport.Faults{MaxDelay: 2})
 	c.net.Heal()
 	for _, id := range c.ids {

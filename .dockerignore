@@ -1,0 +1,6 @@
+.git
+bin
+covdata
+coverage*.out
+chaos-out
+*.test

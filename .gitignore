@@ -4,3 +4,5 @@ coverage-child.out
 coverage-all.out
 coverage-pkg.out
 covdata/
+chaos-out/
+bin/

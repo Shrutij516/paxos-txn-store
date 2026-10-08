@@ -1,0 +1,8 @@
+{
+  "shards": 3,
+  "nodes": [
+    {"id": 1, "addr": "node1:7001"},
+    {"id": 2, "addr": "node2:7001"},
+    {"id": 3, "addr": "node3:7001"}
+  ]
+}

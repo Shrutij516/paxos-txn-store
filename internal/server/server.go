@@ -11,6 +11,7 @@
 package server
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -299,6 +300,37 @@ func (n *Node) shutdown() {
 func (n *Node) Inspect(sh txn.ShardID, f func(r *paxos.Replica, sm *txn.SM, ts *txn.Server)) bool {
 	s := n.shards[sh]
 	return s.run(func() { f(s.rep, s.sm, s.ts) }) == nil
+}
+
+// Ready reports whether every shard replica on this node knows its shard's
+// leader (or is it) and has applied everything it knows to be committed.
+// It returns an error naming the first shard that is not, or ctx's error if
+// a shard's event loop did not answer in time.
+func (n *Node) Ready(ctx context.Context) error {
+	for _, s := range n.shards {
+		type state struct {
+			leader paxos.NodeID
+			lag    uint64
+		}
+		ch := make(chan state, 1)
+		go func() {
+			_ = s.run(func() { ch <- state{s.rep.Leader(), s.rep.Lag()} })
+		}()
+		select {
+		case st := <-ch:
+			switch {
+			case st.leader == 0:
+				return fmt.Errorf("shard %d: no known leader", s.id)
+			case st.lag > 0:
+				return fmt.Errorf("shard %d: %d committed slots not applied yet", s.id, st.lag)
+			}
+		case <-ctx.Done():
+			return fmt.Errorf("shard %d: event loop did not answer: %w", s.id, ctx.Err())
+		case <-s.done:
+			return fmt.Errorf("shard %d: %w", s.id, errStopped)
+		}
+	}
+	return nil
 }
 
 // errStopped means the shard's event loop has exited.

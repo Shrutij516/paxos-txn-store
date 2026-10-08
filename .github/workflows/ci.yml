@@ -8,8 +8,10 @@ on:
 permissions:
   contents: read
 
-# Five jobs run in parallel: lint, sdk-deps (the SDK imports no internal
-# package), proto (generated code is up to date), race-short and full. The race detector slows the seeded simulation
+# Six jobs run in parallel: lint, sdk-deps (the SDK imports no internal
+# package), govulncheck (known vulnerabilities in reachable code), proto
+# (generated code is up to date), race-short and full. The chaos run against
+# the compose stack is in chaos.yml. The race detector slows the seeded simulation
 # suites about 9x, so it runs on the short seed counts, while the full 1000
 # seed suites run once without -race and also feed the coverage gate.
 jobs:
@@ -28,7 +30,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.5.0
+          version: v2.14.0
 
   # The public SDK must not depend on this module's internal packages,
   # which programs outside the module cannot import.
@@ -44,14 +46,29 @@ jobs:
       - name: client imports no internal package
         run: make sdk-check
 
+  # Fails if code the module actually calls, in its dependencies or the Go
+  # standard library, has a known vulnerability. scripts/govulncheck.sh allows
+  # exactly GO-2026-6443 until grpc v1.85.0 ships and fails once it is gone.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: scripts/govulncheck.sh
+
   # Regenerates the protobuf code with pinned tools and fails if the
   # committed files differ from what the .proto files produce.
   proto:
     runs-on: ubuntu-latest
     env:
       PROTOC_VERSION: "29.3"
-      PROTOC_GEN_GO_VERSION: v1.36.6
-      PROTOC_GEN_GO_GRPC_VERSION: v1.5.1
+      PROTOC_GEN_GO_VERSION: v1.36.12
+      PROTOC_GEN_GO_GRPC_VERSION: v1.6.2
     steps:
       - uses: actions/checkout@v4
 

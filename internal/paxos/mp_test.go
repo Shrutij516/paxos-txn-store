@@ -33,6 +33,7 @@ func randomMPOpts(rng *rand.Rand) mpOpts {
 			RestartProb:   0.05,
 			PartitionProb: rng.Float64() * 0.01,
 			HealProb:      0.05,
+			SlowProb:      rng.Float64() * 0.02,
 		},
 	}
 }
@@ -168,6 +169,28 @@ func TestMPLeaderFailover(t *testing.T) {
 		}
 	}
 	t.Logf("worst steps from leader crash to new commit: %d (bound %d)", worst, bound)
+}
+
+// Every replica is slow (a starved CPU, a slow disk): one election round,
+// a Prepare out and a Promise back, takes about 50 steps, longer than the
+// longest election timeout (DefaultLogTiming.ElectionMax, 40). A leader
+// must still be elected and every client must finish.
+func TestMPSlowNodesElectLeader(t *testing.T) {
+	const bound = 3000
+	worst := 0
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
+		c := newMPCluster(seed, mpOpts{N: []int{3, 5}[seed%2], Clients: 2, OpsPerClient: 3, Keys: 2,
+			Faults: transport.Faults{MaxDelay: 2}, Slow: transport.Slow{Persist: 12, Handle: 12}})
+		used, ok := c.runUntil(bound, c.clientsDone)
+		if !ok {
+			t.Fatalf("seed=%d: clients not done within %d steps (leader %v)", seed, bound, c.leader() != nil)
+		}
+		worst = max(worst, used)
+		if err := c.checkSafety(); err != nil {
+			t.Fatalf("seed=%d: %v", seed, err)
+		}
+	}
+	t.Logf("worst steps until every client finished: %d (bound %d)", worst, bound)
 }
 
 // Test 5: a crashed follower restarts and catches up to the leader's

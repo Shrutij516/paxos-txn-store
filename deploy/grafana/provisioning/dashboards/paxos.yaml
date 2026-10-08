@@ -1,0 +1,9 @@
+# Loads deploy/grafana/dashboard.json, mounted at
+# /var/lib/grafana/dashboards by deploy/compose.yaml.
+apiVersion: 1
+providers:
+  - name: paxos-txn-store
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -18,6 +18,7 @@ type chaos struct {
 	RestartProb   float64
 	PartitionProb float64
 	HealProb      float64
+	SlowProb      float64 // Multi-Paxos only: make a random node slow, or normal again
 }
 
 type clusterOpts struct {

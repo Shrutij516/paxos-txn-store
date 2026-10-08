@@ -46,6 +46,11 @@ type Replica struct {
 	ballot  Ballot // our ballot while candidate or leader
 	leader  NodeID // leader we believe in, 0 if unknown
 	timer   int    // election timer, or heartbeat timer while leader
+	backoff int    // election timeout multiplier: 1, doubled per failed election
+	ran     bool   // we started an election and no leader has held since
+	ticks   int    // Tick calls so far
+	steadyB Ballot // ballot of the leader we last heard from (or are)
+	since   int    // ticks when we first heard from steadyB
 
 	// Candidate state.
 	promises map[NodeID]LogPromise
@@ -86,6 +91,9 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 	if cfg.Timing == (LogTiming{}) {
 		cfg.Timing = DefaultLogTiming
 	}
+	if cfg.Timing.ElectionBackoff < 1 {
+		cfg.Timing.ElectionBackoff = DefaultElectionBackoff
+	}
 	rnd, err := store.LoadRound()
 	if err != nil {
 		return nil, err
@@ -108,6 +116,7 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 		store: store, tr: tr, rng: cfg.Rand, t: cfg.Timing, sm: cfg.StateMachine, obs: cfg.Observer,
 		promised: promised, accepted: make(map[uint64]SlotEntry, len(acc)), lastRound: rnd,
 		chosen: make(map[uint64]Entry), pending: make(map[uint64]pendingReq),
+		backoff: 1,
 	}
 	for _, se := range acc {
 		r.accepted[se.Slot] = se
@@ -162,6 +171,7 @@ func (r *Replica) Committed(slot uint64) (Entry, bool) {
 
 // Tick advances the replica's logical clock by one step.
 func (r *Replica) Tick() {
+	r.ticks++
 	r.timer--
 	if r.timer > 0 {
 		return
@@ -169,6 +179,14 @@ func (r *Replica) Tick() {
 	if r.role == leader {
 		r.sendHeartbeats()
 		return
+	}
+	if r.ran {
+		// An election we started produced no leader, whether it timed out
+		// while we were candidate or a rival's higher Prepare cut it short.
+		// If a round trip (with its writes) takes longer than the timeout,
+		// retrying at the same pace gives up on every round before its
+		// promises arrive, so slow down.
+		r.backoff = min(2*r.backoff, r.t.ElectionBackoff)
 	}
 	r.startElection()
 }
@@ -207,8 +225,26 @@ func (r *Replica) broadcast(p Payload) {
 	}
 }
 
+// resetElectionTimer draws the election timeout from [ElectionMin,
+// ElectionMax] scaled by the current backoff.
 func (r *Replica) resetElectionTimer() {
-	r.timer = r.t.ElectionMin + r.rng.IntN(r.t.ElectionMax-r.t.ElectionMin+1)
+	r.timer = r.backoff * r.t.ElectionMin
+	r.timer += r.rng.IntN(r.backoff*(r.t.ElectionMax-r.t.ElectionMin) + 1)
+}
+
+// following notes that the leader at ballot b (possibly us) is up and
+// reachable. Once the same leader has held for a whole backed-off election
+// timeout, rival elections started before it won are over and the election
+// backoff ends, so a later failover is fast again. Resetting on the first
+// heartbeat instead would let a leader deposed by those rivals send
+// everyone back to colliding at the short timeout.
+func (r *Replica) following(b Ballot) {
+	switch {
+	case b != r.steadyB:
+		r.steadyB, r.since = b, r.ticks
+	case r.ticks-r.since >= r.backoff*r.t.ElectionMax:
+		r.backoff, r.ran = 1, false
+	}
 }
 
 func (r *Replica) observe(b Ballot) {
@@ -245,6 +281,7 @@ func (r *Replica) yield(b Ballot) {
 
 func (r *Replica) startElection() {
 	rnd := max(r.lastRound, r.maxSeen) + 1
+	r.ran = true
 	r.resetElectionTimer()
 	if err := r.store.SaveRound(rnd); err != nil {
 		return
@@ -327,6 +364,7 @@ func (r *Replica) becomeLeader() {
 	}
 	r.role = leader
 	r.leader = r.id
+	r.following(r.ballot)
 	r.obs.BecameLeader(r.ballot)
 	r.promises = nil
 	r.proposals = make(map[uint64]Entry)
@@ -397,6 +435,7 @@ func (r *Replica) onAccept(from NodeID, m LogAccept) {
 	if from != r.id {
 		r.yield(m.Ballot)
 		r.leader = from
+		r.following(m.Ballot)
 		r.resetElectionTimer()
 	}
 	if !r.replyFirst {
@@ -433,6 +472,7 @@ func (r *Replica) onNack(m LogNack) {
 // dropped Accept or Accepted only delays progress.
 func (r *Replica) sendHeartbeats() {
 	r.timer = r.t.HeartbeatEvery
+	r.following(r.ballot)
 	for _, to := range r.peers {
 		if to != r.id {
 			r.send(to, Heartbeat{Ballot: r.ballot, Commit: r.commit})
@@ -457,6 +497,7 @@ func (r *Replica) onHeartbeat(from NodeID, m Heartbeat) {
 	r.yield(m.Ballot)
 	r.leader = from
 	r.leaderCommit = max(r.leaderCommit, m.Commit)
+	r.following(m.Ballot)
 	r.resetElectionTimer()
 	// An entry we accepted in the leader's own ballot at a slot the leader
 	// reports committed is the chosen one: a leader proposes only one entry
