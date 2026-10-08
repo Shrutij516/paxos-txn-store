@@ -53,6 +53,9 @@ type worldOpts struct {
 	Chaos        chaos
 	Server       Config // timing and broken modes; Shard/ShardNodes filled in
 	Observe      bool   // attach a recording Observer to every server
+	// NoCheckQuorum turns off CheckQuorum on every replica (see
+	// paxos.ReplicaConfig.NoCheckQuorum).
+	NoCheckQuorum bool
 }
 
 type node struct {
@@ -179,7 +182,8 @@ func (w *world) start(id paxos.NodeID) {
 	sm.noLockCheck = w.opts.Server.ReleaseLocksAtPrepare
 	rep, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: shardNodes(sh), StateMachine: sm,
-		Rand: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
+		Rand:          rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
+		NoCheckQuorum: w.opts.NoCheckQuorum,
 	}, w.stores[id], gapNet{w})
 	if err != nil {
 		panic(err)

@@ -175,6 +175,11 @@ type ReplicaConfig struct {
 	StateMachine StateMachine
 	// Observer receives the replica's events; nil means none.
 	Observer Observer
+	// NoCheckQuorum keeps a leader leading even when it no longer hears
+	// from a majority. For directed tests that cut a new leader off on
+	// purpose and need it to keep answering clients; never set it
+	// otherwise. Safety does not depend on CheckQuorum either way.
+	NoCheckQuorum bool
 }
 
 // Observer receives a Replica's events so the layer above can turn them

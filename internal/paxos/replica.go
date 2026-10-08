@@ -83,6 +83,7 @@ type Replica struct {
 	ignorePromised bool
 	replyFirst     bool // reply to Prepare and Accept before persisting
 	noSticky       bool // no PreVote, and Prepares are not refused while a leader is live
+	noCheckQuorum  bool // ReplicaConfig.NoCheckQuorum
 
 	// Takeover counters, read only by tests through export_test.go.
 	statNoops     int // gaps filled with a no-op
@@ -126,7 +127,7 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 		store: store, tr: tr, rng: cfg.Rand, t: cfg.Timing, sm: cfg.StateMachine, obs: cfg.Observer,
 		promised: promised, accepted: make(map[uint64]SlotEntry, len(acc)), lastRound: rnd,
 		chosen: make(map[uint64]Entry), pending: make(map[uint64]pendingReq),
-		backoff: 1,
+		backoff: 1, noCheckQuorum: cfg.NoCheckQuorum,
 	}
 	for _, se := range acc {
 		r.accepted[se.Slot] = se
@@ -182,7 +183,7 @@ func (r *Replica) Committed(slot uint64) (Entry, bool) {
 // Tick advances the replica's logical clock by one step.
 func (r *Replica) Tick() {
 	r.ticks++
-	if r.role == leader && !r.haveQuorum() {
+	if r.role == leader && !r.noCheckQuorum && !r.haveQuorum() {
 		r.stepDown()
 	}
 	r.timer--
