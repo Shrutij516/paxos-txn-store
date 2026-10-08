@@ -10,7 +10,8 @@ import (
 type role int
 
 const (
-	follower role = iota
+	follower     role = iota
+	precandidate      // asking for pre-votes; no ballot raised yet
 	candidate
 	leader
 )
@@ -51,11 +52,19 @@ type Replica struct {
 	ticks   int    // Tick calls so far
 	steadyB Ballot // ballot of the leader we last heard from (or are)
 	since   int    // ticks when we first heard from steadyB
+	heard   int    // ticks when we last heard from the leader
+
+	// Pre-candidate state.
+	preBallot  Ballot
+	preGrants  map[NodeID]bool
+	preRefused bool // a peer refused because it hears a live leader
 
 	// Candidate state.
 	promises map[NodeID]LogPromise
 
 	// Leader state.
+	acks      map[NodeID]int // ticks of each peer's last ack (CheckQuorum)
+	cqWindow  int            // ticks without a majority of acks before stepping down
 	nextSlot  uint64
 	proposals map[uint64]Entry
 	votes     map[uint64]map[NodeID]struct{}
@@ -73,6 +82,7 @@ type Replica struct {
 	skipPrepare    bool
 	ignorePromised bool
 	replyFirst     bool // reply to Prepare and Accept before persisting
+	noSticky       bool // no PreVote, and Prepares are not refused while a leader is live
 
 	// Takeover counters, read only by tests through export_test.go.
 	statNoops     int // gaps filled with a no-op
@@ -172,6 +182,9 @@ func (r *Replica) Committed(slot uint64) (Entry, bool) {
 // Tick advances the replica's logical clock by one step.
 func (r *Replica) Tick() {
 	r.ticks++
+	if r.role == leader && !r.haveQuorum() {
+		r.stepDown()
+	}
 	r.timer--
 	if r.timer > 0 {
 		return
@@ -180,15 +193,17 @@ func (r *Replica) Tick() {
 		r.sendHeartbeats()
 		return
 	}
-	if r.ran {
+	if r.ran && (r.role != precandidate || !r.preRefused) {
 		// An election we started produced no leader, whether it timed out
 		// while we were candidate or a rival's higher Prepare cut it short.
 		// If a round trip (with its writes) takes longer than the timeout,
 		// retrying at the same pace gives up on every round before its
-		// promises arrive, so slow down.
+		// promises arrive, so slow down. A pre-vote refused by a peer that
+		// still hears a leader is not that case: retrying at the same pace
+		// is right, since that leader may have just failed.
 		r.backoff = min(2*r.backoff, r.t.ElectionBackoff)
 	}
-	r.startElection()
+	r.campaign()
 }
 
 // Handle processes one incoming message.
@@ -206,6 +221,14 @@ func (r *Replica) Handle(m Message) {
 		r.onNack(b)
 	case Heartbeat:
 		r.onHeartbeat(m.From, b)
+	case HeartbeatAck:
+		if r.role == leader && b.Ballot == r.ballot {
+			r.acks[m.From] = r.ticks
+		}
+	case PreVote:
+		r.onPreVote(m.From, b)
+	case PreVoteReply:
+		r.onPreVoteReply(m.From, b)
 	case CatchupRequest:
 		r.onCatchupRequest(m.From, b)
 	case CatchupReply:
@@ -239,6 +262,7 @@ func (r *Replica) resetElectionTimer() {
 // heartbeat instead would let a leader deposed by those rivals send
 // everyone back to colliding at the short timeout.
 func (r *Replica) following(b Ballot) {
+	r.heard = r.ticks
 	switch {
 	case b != r.steadyB:
 		r.steadyB, r.since = b, r.ticks
@@ -265,8 +289,14 @@ func (r *Replica) savePromised(b Ballot) bool {
 	return true
 }
 
-// yield steps down if someone else holds a higher ballot than ours.
+// yield steps down if someone else holds a higher ballot than ours. A
+// pre-candidate has raised no ballot, so it yields to anyone.
 func (r *Replica) yield(b Ballot) {
+	if r.role == precandidate {
+		r.role = follower
+		r.preGrants = nil
+		return
+	}
 	if r.role != follower && r.ballot.Less(b) {
 		if r.role == leader {
 			r.obs.SteppedDown(b)
@@ -278,10 +308,93 @@ func (r *Replica) yield(b Ballot) {
 }
 
 // ---- Election ----
+//
+// None of PreVote, stickiness or CheckQuorum is needed for safety. They
+// only decide when a replica runs Prepare or stops leading; any replica may
+// run Prepare at any time and the ballot rules alone keep the log safe.
+
+// leaderAlive reports whether this replica leads, or heard from a leader
+// within the minimum election timeout.
+func (r *Replica) leaderAlive() bool {
+	return r.role == leader || (r.leader != 0 && r.ticks-r.heard < r.t.ElectionMin)
+}
+
+// campaign starts an election after the timer ran out: first a round of
+// pre-votes, which raises no ballot and persists nothing, then, with a
+// majority of grants, a real Prepare. A replica cut off from the leader
+// but not from the others can no longer depose it, and one cut off from
+// a majority stops raising ballots that would depose the leader when it
+// returns.
+func (r *Replica) campaign() {
+	r.ran = true
+	r.leader = 0
+	if r.noSticky || r.skipPrepare {
+		r.startElection()
+		return
+	}
+	r.resetElectionTimer()
+	r.role = precandidate
+	r.preBallot = Ballot{Round: max(r.lastRound, r.maxSeen) + 1, Node: r.id}
+	r.preGrants = map[NodeID]bool{r.id: true}
+	r.preRefused = false
+	if len(r.preGrants) >= r.quorum {
+		r.startElection()
+		return
+	}
+	for _, to := range r.peers {
+		if to != r.id {
+			r.send(to, PreVote{Ballot: r.preBallot})
+		}
+	}
+}
+
+// onPreVote answers without changing any state: no promise, no write, no
+// timer reset.
+func (r *Replica) onPreVote(from NodeID, m PreVote) {
+	r.send(from, PreVoteReply{Ballot: m.Ballot, Granted: r.noSticky || !r.leaderAlive(), Promised: r.promised})
+}
+
+func (r *Replica) onPreVoteReply(from NodeID, m PreVoteReply) {
+	if r.role != precandidate || m.Ballot != r.preBallot {
+		return
+	}
+	r.observe(m.Promised)
+	if !m.Granted {
+		r.preRefused = true
+		return
+	}
+	r.preGrants[from] = true
+	if len(r.preGrants) >= r.quorum {
+		r.startElection()
+	}
+}
+
+// haveQuorum is CheckQuorum: a leader that has not heard from a majority
+// (itself included) within cqWindow ticks no longer counts as leading.
+func (r *Replica) haveQuorum() bool {
+	n := 1
+	for _, p := range r.peers {
+		if p != r.id && r.ticks-r.acks[p] <= r.cqWindow {
+			n++
+		}
+	}
+	return n >= r.quorum
+}
+
+// stepDown gives up leadership after CheckQuorum fails. The timer becomes
+// an election timer again.
+func (r *Replica) stepDown() {
+	r.obs.SteppedDown(r.ballot)
+	r.role = follower
+	r.leader = 0
+	r.proposals, r.votes, r.acks = nil, nil, nil
+	r.resetElectionTimer()
+}
 
 func (r *Replica) startElection() {
 	rnd := max(r.lastRound, r.maxSeen) + 1
 	r.ran = true
+	r.preGrants = nil
 	r.resetElectionTimer()
 	if err := r.store.SaveRound(rnd); err != nil {
 		return
@@ -299,6 +412,9 @@ func (r *Replica) startElection() {
 }
 
 func (r *Replica) onPrepare(from NodeID, m LogPrepare) {
+	if from != r.id && !r.noSticky && r.leaderAlive() {
+		return // stickiness: a live leader is not deposed
+	}
 	r.observe(m.Ballot)
 	if m.Ballot.Less(r.promised) {
 		r.send(from, LogNack{Ballot: m.Ballot, Promised: r.promised})
@@ -361,6 +477,11 @@ func (r *Replica) becomeLeader() {
 	}
 	for s := range r.chosen {
 		top = max(top, s)
+	}
+	r.cqWindow = r.backoff * r.t.ElectionMax
+	r.acks = make(map[NodeID]int, len(r.peers))
+	for _, p := range r.peers {
+		r.acks[p] = r.ticks
 	}
 	r.role = leader
 	r.leader = r.id
@@ -447,6 +568,7 @@ func (r *Replica) onAccepted(from NodeID, m LogAccepted) {
 	if r.role != leader || m.Ballot != r.ballot {
 		return
 	}
+	r.acks[from] = r.ticks
 	v, ok := r.votes[m.Slot]
 	if !ok {
 		return
@@ -499,6 +621,7 @@ func (r *Replica) onHeartbeat(from NodeID, m Heartbeat) {
 	r.leaderCommit = max(r.leaderCommit, m.Commit)
 	r.following(m.Ballot)
 	r.resetElectionTimer()
+	r.send(from, HeartbeatAck{Ballot: m.Ballot})
 	// An entry we accepted in the leader's own ballot at a slot the leader
 	// reports committed is the chosen one: a leader proposes only one entry
 	// per slot per ballot.

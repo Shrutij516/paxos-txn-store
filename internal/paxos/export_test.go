@@ -33,3 +33,7 @@ func (r *Replica) TakeoverStats() (noops, recovered, contested int) {
 // ReplyBeforePersist makes the replica send Promise and Accepted replies
 // before writing the state they vouch for.
 func (r *Replica) ReplyBeforePersist() { r.replyFirst = true }
+
+// DisableLeaderStickiness turns off PreVote and the refusal of Prepares
+// while a leader is live, as before Phase 8b.
+func (r *Replica) DisableLeaderStickiness() { r.noSticky = true }

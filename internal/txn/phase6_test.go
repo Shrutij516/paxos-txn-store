@@ -121,9 +121,12 @@ func runRetryAtNewLeader(seed uint64, broken bool) error {
 		Server: Config{ReplyAbortUnlogged: broken}})
 	tc := w.cli[0]
 	tc.plan = func(*client) ([]string, string) { return []string{a, b}, b }
-	if _, ok := w.runUntil(2000, func() bool { return w.leader(sh) != nil }); !ok {
+	if _, ok := w.runUntil(2000, w.leadersUp); !ok {
 		return fmt.Errorf("no leader for shard %d", sh)
 	}
+	// Let any duel between the first candidates end, so the leader does
+	// not change while T reads (that would abort T for another reason).
+	w.run(100, false)
 	tc.hold, tc.ops, tc.think = true, 1, 1
 	if _, ok := w.runUntil(2000, func() bool { return tc.phase == phHeld }); !ok {
 		return fmt.Errorf("T never finished its reads")

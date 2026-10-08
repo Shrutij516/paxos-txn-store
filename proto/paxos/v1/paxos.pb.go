@@ -796,6 +796,157 @@ func (x *Heartbeat) GetCommit() uint64 {
 	return 0
 }
 
+// PreVote asks whether the receiver would vote for a candidate at ballot.
+// Answering changes no state on the receiver.
+type PreVote struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ballot        *Ballot                `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVote) Reset() {
+	*x = PreVote{}
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVote) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVote) ProtoMessage() {}
+
+func (x *PreVote) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVote.ProtoReflect.Descriptor instead.
+func (*PreVote) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *PreVote) GetBallot() *Ballot {
+	if x != nil {
+		return x.Ballot
+	}
+	return nil
+}
+
+type PreVoteReply struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ballot        *Ballot                `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
+	Granted       bool                   `protobuf:"varint,2,opt,name=granted,proto3" json:"granted,omitempty"`
+	Promised      *Ballot                `protobuf:"bytes,3,opt,name=promised,proto3" json:"promised,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVoteReply) Reset() {
+	*x = PreVoteReply{}
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVoteReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVoteReply) ProtoMessage() {}
+
+func (x *PreVoteReply) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVoteReply.ProtoReflect.Descriptor instead.
+func (*PreVoteReply) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PreVoteReply) GetBallot() *Ballot {
+	if x != nil {
+		return x.Ballot
+	}
+	return nil
+}
+
+func (x *PreVoteReply) GetGranted() bool {
+	if x != nil {
+		return x.Granted
+	}
+	return false
+}
+
+func (x *PreVoteReply) GetPromised() *Ballot {
+	if x != nil {
+		return x.Promised
+	}
+	return nil
+}
+
+// HeartbeatAck tells the leader that a follower accepted its heartbeat.
+type HeartbeatAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ballot        *Ballot                `protobuf:"bytes,1,opt,name=ballot,proto3" json:"ballot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatAck) Reset() {
+	*x = HeartbeatAck{}
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatAck) ProtoMessage() {}
+
+func (x *HeartbeatAck) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatAck.ProtoReflect.Descriptor instead.
+func (*HeartbeatAck) Descriptor() ([]byte, []int) {
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *HeartbeatAck) GetBallot() *Ballot {
+	if x != nil {
+		return x.Ballot
+	}
+	return nil
+}
+
 type CatchupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	From          uint64                 `protobuf:"varint,1,opt,name=from,proto3" json:"from,omitempty"`
@@ -805,7 +956,7 @@ type CatchupRequest struct {
 
 func (x *CatchupRequest) Reset() {
 	*x = CatchupRequest{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[14]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -817,7 +968,7 @@ func (x *CatchupRequest) String() string {
 func (*CatchupRequest) ProtoMessage() {}
 
 func (x *CatchupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[14]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -830,7 +981,7 @@ func (x *CatchupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatchupRequest.ProtoReflect.Descriptor instead.
 func (*CatchupRequest) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{14}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CatchupRequest) GetFrom() uint64 {
@@ -849,7 +1000,7 @@ type CatchupReply struct {
 
 func (x *CatchupReply) Reset() {
 	*x = CatchupReply{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[15]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -861,7 +1012,7 @@ func (x *CatchupReply) String() string {
 func (*CatchupReply) ProtoMessage() {}
 
 func (x *CatchupReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[15]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -874,7 +1025,7 @@ func (x *CatchupReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatchupReply.ProtoReflect.Descriptor instead.
 func (*CatchupReply) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{15}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *CatchupReply) GetEntries() []*SlotEntry {
@@ -895,7 +1046,7 @@ type ClientRequest struct {
 
 func (x *ClientRequest) Reset() {
 	*x = ClientRequest{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[16]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -907,7 +1058,7 @@ func (x *ClientRequest) String() string {
 func (*ClientRequest) ProtoMessage() {}
 
 func (x *ClientRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[16]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -920,7 +1071,7 @@ func (x *ClientRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientRequest.ProtoReflect.Descriptor instead.
 func (*ClientRequest) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{16}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ClientRequest) GetClientId() uint64 {
@@ -957,7 +1108,7 @@ type ClientReply struct {
 
 func (x *ClientReply) Reset() {
 	*x = ClientReply{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[17]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -969,7 +1120,7 @@ func (x *ClientReply) String() string {
 func (*ClientReply) ProtoMessage() {}
 
 func (x *ClientReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[17]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -982,7 +1133,7 @@ func (x *ClientReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientReply.ProtoReflect.Descriptor instead.
 func (*ClientReply) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{17}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ClientReply) GetClientId() uint64 {
@@ -1055,6 +1206,9 @@ type Envelope struct {
 	//	*Envelope_Decision
 	//	*Envelope_QueryOutcome
 	//	*Envelope_WoundReq
+	//	*Envelope_PreVote
+	//	*Envelope_PreVoteReply
+	//	*Envelope_HeartbeatAck
 	Body          isEnvelope_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1062,7 +1216,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[18]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1074,7 +1228,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[18]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1087,7 +1241,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{18}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Envelope) GetFrom() int32 {
@@ -1305,6 +1459,33 @@ func (x *Envelope) GetWoundReq() *v1.WoundReq {
 	return nil
 }
 
+func (x *Envelope) GetPreVote() *PreVote {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_PreVote); ok {
+			return x.PreVote
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetPreVoteReply() *PreVoteReply {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_PreVoteReply); ok {
+			return x.PreVoteReply
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetHeartbeatAck() *HeartbeatAck {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_HeartbeatAck); ok {
+			return x.HeartbeatAck
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Body interface {
 	isEnvelope_Body()
 }
@@ -1389,6 +1570,18 @@ type Envelope_WoundReq struct {
 	WoundReq *v1.WoundReq `protobuf:"bytes,34,opt,name=wound_req,json=woundReq,proto3,oneof"`
 }
 
+type Envelope_PreVote struct {
+	PreVote *PreVote `protobuf:"bytes,35,opt,name=pre_vote,json=preVote,proto3,oneof"`
+}
+
+type Envelope_PreVoteReply struct {
+	PreVoteReply *PreVoteReply `protobuf:"bytes,36,opt,name=pre_vote_reply,json=preVoteReply,proto3,oneof"`
+}
+
+type Envelope_HeartbeatAck struct {
+	HeartbeatAck *HeartbeatAck `protobuf:"bytes,37,opt,name=heartbeat_ack,json=heartbeatAck,proto3,oneof"`
+}
+
 func (*Envelope_Prepare) isEnvelope_Body() {}
 
 func (*Envelope_Promise) isEnvelope_Body() {}
@@ -1429,6 +1622,12 @@ func (*Envelope_QueryOutcome) isEnvelope_Body() {}
 
 func (*Envelope_WoundReq) isEnvelope_Body() {}
 
+func (*Envelope_PreVote) isEnvelope_Body() {}
+
+func (*Envelope_PreVoteReply) isEnvelope_Body() {}
+
+func (*Envelope_HeartbeatAck) isEnvelope_Body() {}
+
 type SendAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1437,7 +1636,7 @@ type SendAck struct {
 
 func (x *SendAck) Reset() {
 	*x = SendAck{}
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[19]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1449,7 +1648,7 @@ func (x *SendAck) String() string {
 func (*SendAck) ProtoMessage() {}
 
 func (x *SendAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[19]
+	mi := &file_proto_paxos_v1_paxos_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1462,7 +1661,7 @@ func (x *SendAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendAck.ProtoReflect.Descriptor instead.
 func (*SendAck) Descriptor() ([]byte, []int) {
-	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{19}
+	return file_proto_paxos_v1_paxos_proto_rawDescGZIP(), []int{22}
 }
 
 var File_proto_paxos_v1_paxos_proto protoreflect.FileDescriptor
@@ -1518,7 +1717,15 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\bpromised\x18\x02 \x01(\v2\x10.paxos.v1.BallotR\bpromised\"M\n" +
 	"\tHeartbeat\x12(\n" +
 	"\x06ballot\x18\x01 \x01(\v2\x10.paxos.v1.BallotR\x06ballot\x12\x16\n" +
-	"\x06commit\x18\x02 \x01(\x04R\x06commit\"$\n" +
+	"\x06commit\x18\x02 \x01(\x04R\x06commit\"3\n" +
+	"\aPreVote\x12(\n" +
+	"\x06ballot\x18\x01 \x01(\v2\x10.paxos.v1.BallotR\x06ballot\"\x80\x01\n" +
+	"\fPreVoteReply\x12(\n" +
+	"\x06ballot\x18\x01 \x01(\v2\x10.paxos.v1.BallotR\x06ballot\x12\x18\n" +
+	"\agranted\x18\x02 \x01(\bR\agranted\x12,\n" +
+	"\bpromised\x18\x03 \x01(\v2\x10.paxos.v1.BallotR\bpromised\"8\n" +
+	"\fHeartbeatAck\x12(\n" +
+	"\x06ballot\x18\x01 \x01(\v2\x10.paxos.v1.BallotR\x06ballot\"$\n" +
 	"\x0eCatchupRequest\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\x04R\x04from\"=\n" +
 	"\fCatchupReply\x12-\n" +
@@ -1532,7 +1739,7 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x0e\n" +
 	"\x02ok\x18\x03 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06result\x18\x04 \x01(\fR\x06result\x12\x16\n" +
-	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\xe1\t\n" +
+	"\x06leader\x18\x05 \x01(\x05R\x06leader\"\x90\v\n" +
 	"\bEnvelope\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\x05R\x02to\x12\x14\n" +
@@ -1562,7 +1769,10 @@ const file_proto_paxos_v1_paxos_proto_rawDesc = "" +
 	"\x04vote\x18\x1f \x01(\v2\f.txn.v1.VoteH\x00R\x04vote\x12.\n" +
 	"\bdecision\x18  \x01(\v2\x10.txn.v1.DecisionH\x00R\bdecision\x12;\n" +
 	"\rquery_outcome\x18! \x01(\v2\x14.txn.v1.QueryOutcomeH\x00R\fqueryOutcome\x12/\n" +
-	"\twound_req\x18\" \x01(\v2\x10.txn.v1.WoundReqH\x00R\bwoundReq\x1a8\n" +
+	"\twound_req\x18\" \x01(\v2\x10.txn.v1.WoundReqH\x00R\bwoundReq\x12.\n" +
+	"\bpre_vote\x18# \x01(\v2\x11.paxos.v1.PreVoteH\x00R\apreVote\x12>\n" +
+	"\x0epre_vote_reply\x18$ \x01(\v2\x16.paxos.v1.PreVoteReplyH\x00R\fpreVoteReply\x12=\n" +
+	"\rheartbeat_ack\x18% \x01(\v2\x16.paxos.v1.HeartbeatAckH\x00R\fheartbeatAck\x1a8\n" +
 	"\n" +
 	"TraceEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
@@ -1584,7 +1794,7 @@ func file_proto_paxos_v1_paxos_proto_rawDescGZIP() []byte {
 	return file_proto_paxos_v1_paxos_proto_rawDescData
 }
 
-var file_proto_paxos_v1_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_proto_paxos_v1_paxos_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_proto_paxos_v1_paxos_proto_goTypes = []any{
 	(*Ballot)(nil),          // 0: paxos.v1.Ballot
 	(*Entry)(nil),           // 1: paxos.v1.Entry
@@ -1600,18 +1810,21 @@ var file_proto_paxos_v1_paxos_proto_goTypes = []any{
 	(*LogAccepted)(nil),     // 11: paxos.v1.LogAccepted
 	(*LogNack)(nil),         // 12: paxos.v1.LogNack
 	(*Heartbeat)(nil),       // 13: paxos.v1.Heartbeat
-	(*CatchupRequest)(nil),  // 14: paxos.v1.CatchupRequest
-	(*CatchupReply)(nil),    // 15: paxos.v1.CatchupReply
-	(*ClientRequest)(nil),   // 16: paxos.v1.ClientRequest
-	(*ClientReply)(nil),     // 17: paxos.v1.ClientReply
-	(*Envelope)(nil),        // 18: paxos.v1.Envelope
-	(*SendAck)(nil),         // 19: paxos.v1.SendAck
-	nil,                     // 20: paxos.v1.Envelope.TraceEntry
-	(*v1.PrepareReq)(nil),   // 21: txn.v1.PrepareReq
-	(*v1.Vote)(nil),         // 22: txn.v1.Vote
-	(*v1.Decision)(nil),     // 23: txn.v1.Decision
-	(*v1.QueryOutcome)(nil), // 24: txn.v1.QueryOutcome
-	(*v1.WoundReq)(nil),     // 25: txn.v1.WoundReq
+	(*PreVote)(nil),         // 14: paxos.v1.PreVote
+	(*PreVoteReply)(nil),    // 15: paxos.v1.PreVoteReply
+	(*HeartbeatAck)(nil),    // 16: paxos.v1.HeartbeatAck
+	(*CatchupRequest)(nil),  // 17: paxos.v1.CatchupRequest
+	(*CatchupReply)(nil),    // 18: paxos.v1.CatchupReply
+	(*ClientRequest)(nil),   // 19: paxos.v1.ClientRequest
+	(*ClientReply)(nil),     // 20: paxos.v1.ClientReply
+	(*Envelope)(nil),        // 21: paxos.v1.Envelope
+	(*SendAck)(nil),         // 22: paxos.v1.SendAck
+	nil,                     // 23: paxos.v1.Envelope.TraceEntry
+	(*v1.PrepareReq)(nil),   // 24: txn.v1.PrepareReq
+	(*v1.Vote)(nil),         // 25: txn.v1.Vote
+	(*v1.Decision)(nil),     // 26: txn.v1.Decision
+	(*v1.QueryOutcome)(nil), // 27: txn.v1.QueryOutcome
+	(*v1.WoundReq)(nil),     // 28: txn.v1.WoundReq
 }
 var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	0,  // 0: paxos.v1.SlotEntry.ballot:type_name -> paxos.v1.Ballot
@@ -1633,35 +1846,42 @@ var file_proto_paxos_v1_paxos_proto_depIdxs = []int32{
 	0,  // 16: paxos.v1.LogNack.ballot:type_name -> paxos.v1.Ballot
 	0,  // 17: paxos.v1.LogNack.promised:type_name -> paxos.v1.Ballot
 	0,  // 18: paxos.v1.Heartbeat.ballot:type_name -> paxos.v1.Ballot
-	2,  // 19: paxos.v1.CatchupReply.entries:type_name -> paxos.v1.SlotEntry
-	20, // 20: paxos.v1.Envelope.trace:type_name -> paxos.v1.Envelope.TraceEntry
-	3,  // 21: paxos.v1.Envelope.prepare:type_name -> paxos.v1.Prepare
-	4,  // 22: paxos.v1.Envelope.promise:type_name -> paxos.v1.Promise
-	5,  // 23: paxos.v1.Envelope.accept:type_name -> paxos.v1.Accept
-	6,  // 24: paxos.v1.Envelope.accepted:type_name -> paxos.v1.Accepted
-	7,  // 25: paxos.v1.Envelope.nack:type_name -> paxos.v1.Nack
-	8,  // 26: paxos.v1.Envelope.log_prepare:type_name -> paxos.v1.LogPrepare
-	9,  // 27: paxos.v1.Envelope.log_promise:type_name -> paxos.v1.LogPromise
-	10, // 28: paxos.v1.Envelope.log_accept:type_name -> paxos.v1.LogAccept
-	11, // 29: paxos.v1.Envelope.log_accepted:type_name -> paxos.v1.LogAccepted
-	12, // 30: paxos.v1.Envelope.log_nack:type_name -> paxos.v1.LogNack
-	13, // 31: paxos.v1.Envelope.heartbeat:type_name -> paxos.v1.Heartbeat
-	14, // 32: paxos.v1.Envelope.catchup_request:type_name -> paxos.v1.CatchupRequest
-	15, // 33: paxos.v1.Envelope.catchup_reply:type_name -> paxos.v1.CatchupReply
-	16, // 34: paxos.v1.Envelope.client_request:type_name -> paxos.v1.ClientRequest
-	17, // 35: paxos.v1.Envelope.client_reply:type_name -> paxos.v1.ClientReply
-	21, // 36: paxos.v1.Envelope.prepare_req:type_name -> txn.v1.PrepareReq
-	22, // 37: paxos.v1.Envelope.vote:type_name -> txn.v1.Vote
-	23, // 38: paxos.v1.Envelope.decision:type_name -> txn.v1.Decision
-	24, // 39: paxos.v1.Envelope.query_outcome:type_name -> txn.v1.QueryOutcome
-	25, // 40: paxos.v1.Envelope.wound_req:type_name -> txn.v1.WoundReq
-	18, // 41: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
-	19, // 42: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
-	42, // [42:43] is the sub-list for method output_type
-	41, // [41:42] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	0,  // 19: paxos.v1.PreVote.ballot:type_name -> paxos.v1.Ballot
+	0,  // 20: paxos.v1.PreVoteReply.ballot:type_name -> paxos.v1.Ballot
+	0,  // 21: paxos.v1.PreVoteReply.promised:type_name -> paxos.v1.Ballot
+	0,  // 22: paxos.v1.HeartbeatAck.ballot:type_name -> paxos.v1.Ballot
+	2,  // 23: paxos.v1.CatchupReply.entries:type_name -> paxos.v1.SlotEntry
+	23, // 24: paxos.v1.Envelope.trace:type_name -> paxos.v1.Envelope.TraceEntry
+	3,  // 25: paxos.v1.Envelope.prepare:type_name -> paxos.v1.Prepare
+	4,  // 26: paxos.v1.Envelope.promise:type_name -> paxos.v1.Promise
+	5,  // 27: paxos.v1.Envelope.accept:type_name -> paxos.v1.Accept
+	6,  // 28: paxos.v1.Envelope.accepted:type_name -> paxos.v1.Accepted
+	7,  // 29: paxos.v1.Envelope.nack:type_name -> paxos.v1.Nack
+	8,  // 30: paxos.v1.Envelope.log_prepare:type_name -> paxos.v1.LogPrepare
+	9,  // 31: paxos.v1.Envelope.log_promise:type_name -> paxos.v1.LogPromise
+	10, // 32: paxos.v1.Envelope.log_accept:type_name -> paxos.v1.LogAccept
+	11, // 33: paxos.v1.Envelope.log_accepted:type_name -> paxos.v1.LogAccepted
+	12, // 34: paxos.v1.Envelope.log_nack:type_name -> paxos.v1.LogNack
+	13, // 35: paxos.v1.Envelope.heartbeat:type_name -> paxos.v1.Heartbeat
+	17, // 36: paxos.v1.Envelope.catchup_request:type_name -> paxos.v1.CatchupRequest
+	18, // 37: paxos.v1.Envelope.catchup_reply:type_name -> paxos.v1.CatchupReply
+	19, // 38: paxos.v1.Envelope.client_request:type_name -> paxos.v1.ClientRequest
+	20, // 39: paxos.v1.Envelope.client_reply:type_name -> paxos.v1.ClientReply
+	24, // 40: paxos.v1.Envelope.prepare_req:type_name -> txn.v1.PrepareReq
+	25, // 41: paxos.v1.Envelope.vote:type_name -> txn.v1.Vote
+	26, // 42: paxos.v1.Envelope.decision:type_name -> txn.v1.Decision
+	27, // 43: paxos.v1.Envelope.query_outcome:type_name -> txn.v1.QueryOutcome
+	28, // 44: paxos.v1.Envelope.wound_req:type_name -> txn.v1.WoundReq
+	14, // 45: paxos.v1.Envelope.pre_vote:type_name -> paxos.v1.PreVote
+	15, // 46: paxos.v1.Envelope.pre_vote_reply:type_name -> paxos.v1.PreVoteReply
+	16, // 47: paxos.v1.Envelope.heartbeat_ack:type_name -> paxos.v1.HeartbeatAck
+	21, // 48: paxos.v1.Peer.Send:input_type -> paxos.v1.Envelope
+	22, // 49: paxos.v1.Peer.Send:output_type -> paxos.v1.SendAck
+	49, // [49:50] is the sub-list for method output_type
+	48, // [48:49] is the sub-list for method input_type
+	48, // [48:48] is the sub-list for extension type_name
+	48, // [48:48] is the sub-list for extension extendee
+	0,  // [0:48] is the sub-list for field type_name
 }
 
 func init() { file_proto_paxos_v1_paxos_proto_init() }
@@ -1669,7 +1889,7 @@ func file_proto_paxos_v1_paxos_proto_init() {
 	if File_proto_paxos_v1_paxos_proto != nil {
 		return
 	}
-	file_proto_paxos_v1_paxos_proto_msgTypes[18].OneofWrappers = []any{
+	file_proto_paxos_v1_paxos_proto_msgTypes[21].OneofWrappers = []any{
 		(*Envelope_Prepare)(nil),
 		(*Envelope_Promise)(nil),
 		(*Envelope_Accept)(nil),
@@ -1690,6 +1910,9 @@ func file_proto_paxos_v1_paxos_proto_init() {
 		(*Envelope_Decision)(nil),
 		(*Envelope_QueryOutcome)(nil),
 		(*Envelope_WoundReq)(nil),
+		(*Envelope_PreVote)(nil),
+		(*Envelope_PreVoteReply)(nil),
+		(*Envelope_HeartbeatAck)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1697,7 +1920,7 @@ func file_proto_paxos_v1_paxos_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_paxos_v1_paxos_proto_rawDesc), len(file_proto_paxos_v1_paxos_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

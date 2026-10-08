@@ -58,6 +58,10 @@ type mpOpts struct {
 	// Observe attaches a recording paxos.Observer to every replica.
 	Observe bool
 
+	// NoStickiness turns off PreVote and the refusal of Prepares while a
+	// leader is live (Phase 8b), to compare against.
+	NoStickiness bool
+
 	// Broken modes for the negative tests.
 	ReplyBeforePersist bool
 	SkipPrepare        bool
@@ -187,6 +191,16 @@ func (g gapNet) Send(m paxos.Message) {
 	c.net.Send(m)
 }
 
+// elections counts BecameLeader events over every replica incarnation (it
+// needs Observe).
+func (c *mpCluster) elections() int {
+	n := 0
+	for _, o := range c.observers {
+		n += o.elections
+	}
+	return n
+}
+
 // takeoverStats sums TakeoverStats over every replica incarnation.
 func (c *mpCluster) takeoverStats() (noops, recovered, contested int) {
 	for _, r := range c.allReps {
@@ -278,6 +292,9 @@ func (c *mpCluster) start(id paxos.NodeID) {
 	}
 	if c.opts.IgnorePromised {
 		r.IgnorePromisedValues()
+	}
+	if c.opts.NoStickiness {
+		r.DisableLeaderStickiness()
 	}
 	c.reps[id] = r
 	c.allReps = append(c.allReps, r)

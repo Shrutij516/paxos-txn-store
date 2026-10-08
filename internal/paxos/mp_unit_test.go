@@ -79,6 +79,20 @@ func newTestReplica(t *testing.T, id paxos.NodeID, st paxos.LogStorage, tr paxos
 	return r
 }
 
+// campaign ticks r until its election timer runs out and grants its
+// pre-vote from replica 2, so the next messages it sends are its Prepares.
+func campaign(t *testing.T, r *paxos.Replica, tr *outbox) {
+	t.Helper()
+	for range 100 {
+		r.Tick()
+		if pv := bodies[paxos.PreVote](tr.take()); len(pv) > 0 {
+			r.Handle(paxos.Message{From: 2, To: r.ID(), Body: paxos.PreVoteReply{Ballot: pv[0].Ballot, Granted: true}})
+			return
+		}
+	}
+	t.Fatal("no pre-vote within 100 ticks")
+}
+
 func bodies[T any](ms []paxos.Message) []T {
 	var out []T
 	for _, m := range ms {
@@ -98,7 +112,7 @@ func TestReplicaTakeoverFillsGapsWithNoops(t *testing.T) {
 	st := storage.NewMemory()
 	_ = st.SaveRound(5)
 	r := newTestReplica(t, 1, st, tr)
-	r.Tick()
+	campaign(t, r, tr)
 	prep := bodies[paxos.LogPrepare](tr.take())
 	if len(prep) != 3 || prep[0] != (paxos.LogPrepare{Ballot: b(6, 1), Commit: 0}) {
 		t.Fatalf("want LogPrepare (6,1) x3, got %v", prep)
@@ -141,7 +155,7 @@ func TestReplicaTakeoverFillsGapsWithNoops(t *testing.T) {
 func TestReplicaCommitApplyAndReply(t *testing.T) {
 	tr := &outbox{}
 	r := newTestReplica(t, 1, storage.NewMemory(), tr)
-	r.Tick()
+	campaign(t, r, tr)
 	tr.take()
 	for _, from := range []paxos.NodeID{1, 2} {
 		r.Handle(paxos.Message{From: from, To: 1, Body: paxos.LogPromise{Ballot: b(1, 1)}})
@@ -225,7 +239,7 @@ func TestReplicaFollowerLearnsCommitAndCatchesUp(t *testing.T) {
 func TestReplicaStepsDown(t *testing.T) {
 	tr := &outbox{}
 	r := newTestReplica(t, 1, storage.NewMemory(), tr)
-	r.Tick()
+	campaign(t, r, tr)
 	for _, from := range []paxos.NodeID{1, 2} {
 		r.Handle(paxos.Message{From: from, To: 1, Body: paxos.LogPromise{Ballot: b(1, 1)}})
 	}
@@ -237,7 +251,7 @@ func TestReplicaStepsDown(t *testing.T) {
 		t.Fatal("still leader after Nack with higher ballot")
 	}
 	// Next election outranks what the Nack revealed.
-	r.Tick()
+	campaign(t, r, tr)
 	if p := bodies[paxos.LogPrepare](tr.take()); len(p) == 0 || p[len(p)-1].Ballot != b(4, 1) {
 		t.Fatalf("want Prepare (4,1), got %v", p)
 	}
@@ -261,6 +275,7 @@ func TestReplicaStorageFailures(t *testing.T) {
 	st := &flakyLog{Memory: storage.NewMemory(), failPromised: true, failAccepted: true, failRound: true}
 	r := newTestReplica(t, 1, st, tr)
 	r.Tick()
+	tr.take() // the pre-votes: they need no write
 	r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.LogPrepare{Ballot: b(1, 2)}})
 	r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.LogAccept{Ballot: b(1, 2), Slot: 1}})
 	r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.Heartbeat{Ballot: b(1, 2)}})
@@ -372,7 +387,8 @@ func TestReplicaElectionBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// ticksToPrepare ticks until the replica sends a Prepare, feeding it a
+	// ticksToPrepare ticks until the replica starts an election (sends its
+	// pre-votes; nobody grants them here, so each one fails), feeding it a
 	// heartbeat from leader 2 at ballot hb on each of the first beats ticks.
 	ticksToPrepare := func(hb paxos.Ballot, beats int) int {
 		for n := 1; n <= 1000; n++ {
@@ -380,7 +396,7 @@ func TestReplicaElectionBackoff(t *testing.T) {
 				r.Handle(paxos.Message{From: 2, To: 1, Body: paxos.Heartbeat{Ballot: hb}})
 			}
 			r.Tick()
-			if len(bodies[paxos.LogPrepare](tr.take())) > 0 {
+			if len(bodies[paxos.PreVote](tr.take())) > 0 { // an election starts with its pre-vote
 				return n
 			}
 		}
@@ -411,5 +427,45 @@ func TestReplicaElectionBackoff(t *testing.T) {
 	// its failure doubles the next one.
 	if a, c := ticksToPrepare(paxos.Ballot{}, 0), ticksToPrepare(paxos.Ballot{}, 0); a != 10 || c != 20 {
 		t.Fatalf("elections %d and %d ticks apart after the backoff ended, want 10 and 20", a, c)
+	}
+}
+
+// A pre-vote that times out unanswered backs off like any failed election
+// (the round may be too slow), but one refused by a peer that still hears
+// a leader does not: that leader may just have failed.
+func TestReplicaRefusedPreVoteDoesNotBackOff(t *testing.T) {
+	tr := &outbox{}
+	r, err := paxos.NewReplica(paxos.ReplicaConfig{
+		ID: 1, Peers: peers3, Rand: rand.New(rand.NewPCG(1, 2)), StateMachine: kv.New(),
+		Timing: paxos.LogTiming{HeartbeatEvery: 2, ElectionMin: 10, ElectionMax: 10, CatchupBatch: 2, ElectionBackoff: 4},
+	}, storage.NewMemory(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// next ticks until the next pre-vote, answering the previous one with
+	// reply (nil: no answer).
+	next := func(reply *paxos.PreVoteReply) int {
+		for n := 1; n <= 1000; n++ {
+			r.Tick()
+			if pv := bodies[paxos.PreVote](tr.take()); len(pv) > 0 {
+				if reply != nil {
+					rp := *reply
+					rp.Ballot = pv[0].Ballot
+					r.Handle(paxos.Message{From: 2, To: 1, Body: rp})
+				}
+				return n
+			}
+		}
+		t.Fatal("no pre-vote within 1000 ticks")
+		return 0
+	}
+	refuse := &paxos.PreVoteReply{Granted: false}
+	if got := []int{next(refuse), next(refuse), next(refuse)}; !slices.Equal(got, []int{10, 10, 10}) {
+		t.Fatalf("ticks between refused pre-votes %v, want [10 10 10]", got)
+	}
+	// Each gap is the timeout drawn when the previous pre-vote went out:
+	// the first one follows the last refusal, then they double.
+	if got := []int{next(nil), next(nil), next(nil), next(nil)}; !slices.Equal(got, []int{10, 10, 20, 40}) {
+		t.Fatalf("ticks between unanswered pre-votes %v, want [10 10 20 40]", got)
 	}
 }

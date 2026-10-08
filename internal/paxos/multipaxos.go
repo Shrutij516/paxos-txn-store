@@ -90,6 +90,24 @@ type Heartbeat struct {
 	Commit uint64
 }
 
+// PreVote asks whether the receiver would vote for a candidate at Ballot
+// if it ran a real election now. Answering changes no state on the
+// receiver: nothing is promised or persisted.
+type PreVote struct{ Ballot Ballot }
+
+// PreVoteReply answers a PreVote for Ballot. Granted is false while the
+// receiver hears from a live leader. Promised is the receiver's promise,
+// so a candidate that goes ahead picks a ballot above it.
+type PreVoteReply struct {
+	Ballot   Ballot
+	Granted  bool
+	Promised Ballot
+}
+
+// HeartbeatAck tells the leader at Ballot that a follower accepted its
+// heartbeat. Leaders use it for CheckQuorum.
+type HeartbeatAck struct{ Ballot Ballot }
+
 // CatchupRequest asks for committed entries starting at From.
 type CatchupRequest struct{ From uint64 }
 
@@ -120,6 +138,9 @@ func (LogAccept) isPayload()      {}
 func (LogAccepted) isPayload()    {}
 func (LogNack) isPayload()        {}
 func (Heartbeat) isPayload()      {}
+func (PreVote) isPayload()        {}
+func (PreVoteReply) isPayload()   {}
+func (HeartbeatAck) isPayload()   {}
 func (CatchupRequest) isPayload() {}
 func (CatchupReply) isPayload()   {}
 func (ClientRequest) isPayload()  {}

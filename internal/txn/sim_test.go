@@ -340,6 +340,18 @@ func (w *world) leader(sh ShardID) *node {
 	return best
 }
 
+// leadersUp reports whether every shard has a leader whose server has
+// taken over (directed tests wait for it before starting clients, so
+// their timing does not depend on how long the first elections take).
+func (w *world) leadersUp() bool {
+	for sh := ShardID(0); int(sh) < w.opts.Shards; sh++ {
+		if l := w.leader(sh); l == nil || !l.srv.Leading() {
+			return false
+		}
+	}
+	return true
+}
+
 // canonical returns, per shard, the live replica that has applied the most.
 // Paxos log safety (tested elsewhere) makes its state the shard's state.
 func (w *world) canonical() map[ShardID]*SM {

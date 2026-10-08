@@ -415,3 +415,120 @@ func TestMPObserver(t *testing.T) {
 	}
 	t.Logf("observers saw %d elections, %d proposals, %d applies", elections, proposed, applied)
 }
+
+// rejoin elects a stable leader in a 5-node cluster, cuts one follower off
+// for 400 steps (long enough for 10 or more election timeouts) and lets it
+// back in for 400 more. It returns the elections from the cut to the end
+// and whether the original leader still leads at its original ballot.
+func rejoin(t *testing.T, seed uint64, noSticky bool) (int, bool) {
+	t.Helper()
+	c := stable(t, seed, mpOpts{N: 5, Clients: 3, OpsPerClient: 100, Keys: 2, Faults: transport.Faults{MaxDelay: 2},
+		Observe: true, NoStickiness: noSticky}, 3)
+	old := c.leader()
+	ballot := old.Ballot()
+	before := c.elections()
+	var x paxos.NodeID
+	for _, id := range c.ids {
+		if id != old.ID() {
+			x = id
+			break
+		}
+	}
+	var rest []paxos.NodeID
+	for _, id := range c.ids {
+		if id != x {
+			rest = append(rest, id)
+		}
+	}
+	c.net.Partition([]paxos.NodeID{x}, rest)
+	c.run(400, false)
+	c.net.Heal()
+	c.run(400, false)
+	if err := c.checkSafety(); err != nil {
+		t.Fatalf("seed=%d: %v", seed, err)
+	}
+	l := c.leader()
+	return c.elections() - before, l == old && l.Ballot() == ballot
+}
+
+// A follower cut off from everyone and then let back in must not depose a
+// stable leader: with PreVote it never raises its ballot while alone, and
+// stickiness makes the others refuse it while they hear the leader.
+func TestMPRejoinDoesNotDepose(t *testing.T) {
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
+		if n, kept := rejoin(t, seed, false); n != 0 || !kept {
+			t.Fatalf("seed=%d: %d elections after a follower rejoined (leader kept: %v), want 0", seed, n, kept)
+		}
+	}
+}
+
+// Negative: without PreVote and stickiness the same rejoin deposes the
+// leader.
+func TestMPRejoinDeposesWithoutStickiness(t *testing.T) {
+	deposed, n := 0, numSeeds(200)
+	for seed := uint64(1); seed <= n; seed++ {
+		if e, kept := rejoin(t, seed, true); e > 0 || !kept {
+			deposed++
+		}
+	}
+	t.Logf("without stickiness the rejoining follower deposed the leader in %d of %d seeds", deposed, n)
+	if deposed < int(n)*9/10 {
+		t.Fatalf("leader deposed in only %d of %d seeds; want at least 90%%", deposed, n)
+	}
+}
+
+// CheckQuorum: a leader cut off from every other replica steps down within
+// the bound, and the majority elects a new leader.
+func TestMPCheckQuorum(t *testing.T) {
+	const bound = 2*40 + 10 // two election timeouts (ElectionMax) plus slack
+	worst := 0
+	for seed := uint64(1); seed <= numSeeds(200); seed++ {
+		c := stable(t, seed, mpOpts{N: 5, Clients: 3, OpsPerClient: 100, Keys: 2, Faults: transport.Faults{MaxDelay: 2}}, 3)
+		old := c.leader()
+		var rest []paxos.NodeID
+		for _, id := range c.ids {
+			if id != old.ID() {
+				rest = append(rest, id)
+			}
+		}
+		c.net.Partition([]paxos.NodeID{old.ID()}, rest)
+		used, ok := c.runUntil(bound, func() bool { return !old.IsLeader() })
+		if !ok {
+			t.Fatalf("seed=%d: leader %d cut off from the majority still leads after %d steps", seed, old.ID(), bound)
+		}
+		worst = max(worst, used)
+		if _, ok := c.runUntil(1000, func() bool { l := c.leader(); return l != nil && l.ID() != old.ID() }); !ok {
+			t.Fatalf("seed=%d: the majority elected no new leader", seed)
+		}
+		if err := c.checkSafety(); err != nil {
+			t.Fatalf("seed=%d: %v", seed, err)
+		}
+	}
+	t.Logf("worst steps for a cut-off leader to step down: %d (bound %d)", worst, bound)
+}
+
+// Elections with and without PreVote and stickiness, over the random chaos
+// schedules (crashes, partitions, slow nodes) and the all-slow schedule of
+// TestMPSlowNodesElectLeader. Stickiness must not add elections.
+func TestMPStickinessElectionCounts(t *testing.T) {
+	count := func(noSticky bool) (chaos, slow int) {
+		for seed := uint64(1); seed <= numSeeds(200); seed++ {
+			c, _ := runMP(seed, func(o *mpOpts) { o.Observe, o.NoStickiness = true, noSticky })
+			chaos += c.elections()
+			s := newMPCluster(seed, mpOpts{N: []int{3, 5}[seed%2], Clients: 2, OpsPerClient: 3, Keys: 2, Observe: true,
+				NoStickiness: noSticky, Faults: transport.Faults{MaxDelay: 2}, Slow: transport.Slow{Persist: 12, Handle: 12}})
+			if _, ok := s.runUntil(3000, s.clientsDone); !ok {
+				t.Fatalf("seed=%d (no stickiness %v): slow clients not done", seed, noSticky)
+			}
+			slow += s.elections()
+		}
+		return
+	}
+	onChaos, onSlow := count(false)
+	offChaos, offSlow := count(true)
+	t.Logf("elections over %d seeds: chaos schedules %d with stickiness, %d without; all-slow %d with, %d without",
+		numSeeds(200), onChaos, offChaos, onSlow, offSlow)
+	if onChaos > offChaos || onSlow > offSlow {
+		t.Fatal("stickiness added elections")
+	}
+}

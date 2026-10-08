@@ -185,6 +185,8 @@ They vary a lot between runs on a shared machine: another full run gave 26 to 59
 
 The election backoff (DECISIONS.md entry 35) leaves these numbers alone, since elections in this test succeed at the first try. Measured back to back on one machine, 3 iterations each, failover per kill was 270 to 466 ms before and 238 to 356 ms after at the 10 ms tick, and 466 to 773 ms before and 481 to 706 ms after at a 20 ms tick (election timeout 400 to 800 ms); throughput was 58 and 66, and 60 and 57, committed transactions per second.
 
+Leader stickiness (DECISIONS.md entry 37) adds a pre-vote round before each election. Measured back to back on one machine at the 10 ms tick, 9 iterations each, failover per kill was 213 to 1002 ms before and 207 to 690 ms after; one full run at a 20 ms tick gave 525 to 852 ms. Both are within the run-to-run noise above.
+
 ### The in-doubt wait and failover
 
 `-in-doubt-wait` sets how long a shard leader holding a prepared transaction waits for the coordinator's decision before asking the coordinator shard for it. Normally the decision arrives within milliseconds and the wait never expires. It matters when the coordinator shard's leader dies between collecting votes and telling the participants: the participants keep the transaction's locks for an election plus up to the in-doubt wait plus one round trip. Any transaction that needs one of those keys waits that long, or is wounded and retried. A participant whose leader changes starts the wait again under the new leader.

@@ -13,7 +13,7 @@ import (
 )
 
 // numKinds is the number of Paxos message types; build covers each one.
-const numKinds = 15
+const numKinds = 18
 
 // build makes a message of the given kind from fuzz inputs.
 func build(kind uint8, a, b uint64, n int32, data []byte, flag bool, count uint8) paxos.Message {
@@ -55,6 +55,12 @@ func build(kind uint8, a, b uint64, n int32, data []byte, flag bool, count uint8
 		body = paxos.CatchupReply{Entries: slots}
 	case 13:
 		body = paxos.ClientRequest{ClientID: a, Seq: b, Cmd: val}
+	case 15:
+		body = paxos.PreVote{Ballot: bal}
+	case 16:
+		body = paxos.PreVoteReply{Ballot: bal, Granted: flag, Promised: bal2}
+	case 17:
+		body = paxos.HeartbeatAck{Ballot: bal}
 	default:
 		body = paxos.ClientReply{ClientID: a, Seq: b, OK: flag, Result: val, Leader: paxos.NodeID(n)}
 	}

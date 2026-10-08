@@ -87,6 +87,13 @@ func ToProto(m paxos.Message) (*paxosv1.Envelope, error) {
 			Ballot: ballotToProto(b.Ballot), Promised: ballotToProto(b.Promised)}}
 	case paxos.Heartbeat:
 		env.Body = &paxosv1.Envelope_Heartbeat{Heartbeat: &paxosv1.Heartbeat{Ballot: ballotToProto(b.Ballot), Commit: b.Commit}}
+	case paxos.PreVote:
+		env.Body = &paxosv1.Envelope_PreVote{PreVote: &paxosv1.PreVote{Ballot: ballotToProto(b.Ballot)}}
+	case paxos.PreVoteReply:
+		env.Body = &paxosv1.Envelope_PreVoteReply{PreVoteReply: &paxosv1.PreVoteReply{
+			Ballot: ballotToProto(b.Ballot), Granted: b.Granted, Promised: ballotToProto(b.Promised)}}
+	case paxos.HeartbeatAck:
+		env.Body = &paxosv1.Envelope_HeartbeatAck{HeartbeatAck: &paxosv1.HeartbeatAck{Ballot: ballotToProto(b.Ballot)}}
 	case paxos.CatchupRequest:
 		env.Body = &paxosv1.Envelope_CatchupRequest{CatchupRequest: &paxosv1.CatchupRequest{From: b.From}}
 	case paxos.CatchupReply:
@@ -137,6 +144,13 @@ func FromProto(env *paxosv1.Envelope) (paxos.Message, error) {
 		m.Body = paxos.LogNack{Ballot: ballotFromProto(b.LogNack.GetBallot()), Promised: ballotFromProto(b.LogNack.GetPromised())}
 	case *paxosv1.Envelope_Heartbeat:
 		m.Body = paxos.Heartbeat{Ballot: ballotFromProto(b.Heartbeat.GetBallot()), Commit: b.Heartbeat.GetCommit()}
+	case *paxosv1.Envelope_PreVote:
+		m.Body = paxos.PreVote{Ballot: ballotFromProto(b.PreVote.GetBallot())}
+	case *paxosv1.Envelope_PreVoteReply:
+		p := b.PreVoteReply
+		m.Body = paxos.PreVoteReply{Ballot: ballotFromProto(p.GetBallot()), Granted: p.GetGranted(), Promised: ballotFromProto(p.GetPromised())}
+	case *paxosv1.Envelope_HeartbeatAck:
+		m.Body = paxos.HeartbeatAck{Ballot: ballotFromProto(b.HeartbeatAck.GetBallot())}
 	case *paxosv1.Envelope_CatchupRequest:
 		m.Body = paxos.CatchupRequest{From: b.CatchupRequest.GetFrom()}
 	case *paxosv1.Envelope_CatchupReply:
