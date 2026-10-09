@@ -7,7 +7,7 @@
 # its CA as a build secret: --secret id=ca,src=/path/to/ca.pem.
 # The base images are written out in the FROM lines (not ARGs) so
 # Dependabot can bump them (.github/dependabot.yml).
-FROM mirror.gcr.io/library/golang:1.26.9 AS build
+FROM mirror.gcr.io/library/golang:1.27.2 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=secret,id=ca,required=false \
