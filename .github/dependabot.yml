@@ -1,5 +1,9 @@
 # Dependency and toolchain bumps arrive as pull requests, so they run
 # through CI (including govulncheck and chaos) before they reach main.
+#
+# Minor and patch updates are grouped into one pull request per entry
+# below. Major updates are left out of the groups, so each one arrives as
+# its own pull request and can be reviewed (and its changelog read) alone.
 version: 2
 updates:
   # Go modules, including the go directive in go.mod.
@@ -7,21 +11,37 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      gomod:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Actions used by the workflows in .github/workflows.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Base images in the Dockerfile (Go builder, distroless runtime).
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Images of the local stack (Prometheus, Grafana, Jaeger).
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly
+    groups:
+      docker-compose:
+        patterns: ["*"]
+        update-types: [minor, patch]
