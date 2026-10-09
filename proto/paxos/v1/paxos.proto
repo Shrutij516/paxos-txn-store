@@ -86,6 +86,23 @@ message Heartbeat {
   uint64 commit = 2;
 }
 
+// PreVote asks whether the receiver would vote for a candidate at ballot.
+// Answering changes no state on the receiver.
+message PreVote {
+  Ballot ballot = 1;
+}
+
+message PreVoteReply {
+  Ballot ballot = 1;
+  bool granted = 2;
+  Ballot promised = 3;
+}
+
+// HeartbeatAck tells the leader that a follower accepted its heartbeat.
+message HeartbeatAck {
+  Ballot ballot = 1;
+}
+
 message CatchupRequest {
   uint64 from = 1;
 }
@@ -141,6 +158,9 @@ message Envelope {
     txn.v1.Decision decision = 32;
     txn.v1.QueryOutcome query_outcome = 33;
     txn.v1.WoundReq wound_req = 34;
+    PreVote pre_vote = 35;
+    PreVoteReply pre_vote_reply = 36;
+    HeartbeatAck heartbeat_ack = 37;
   }
 }
 

@@ -57,6 +57,9 @@ func TestLeaseNeverExpiresPreparedLock(t *testing.T) {
 			w.net.Partition(others(coord), shardNodes(coord)) // the vote never arrives
 		}
 	}
+	if _, ok := w.runUntil(2000, w.leadersUp); !ok {
+		t.Fatal("no leader on some shard")
+	}
 	p.ops, p.think = 1, 1
 	if _, ok := w.runUntil(2000, func() bool { return pid != 0 }); !ok {
 		t.Fatal("P never prepared on the participant shard")

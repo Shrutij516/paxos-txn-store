@@ -1,0 +1,27 @@
+name: vulncheck
+
+# Runs govulncheck on main every day, so a new advisory against the code
+# already merged shows up as a failed scheduled run here instead of
+# surprising an unrelated pull request. The ci workflow still runs the
+# same check, blocking, on every push and pull request. Scheduled runs
+# always use the default branch.
+on:
+  schedule:
+    - cron: "41 5 * * *" # 05:41 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: scripts/govulncheck.sh

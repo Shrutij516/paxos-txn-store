@@ -1,0 +1,27 @@
+# Dependency and toolchain bumps arrive as pull requests, so they run
+# through CI (including govulncheck and chaos) before they reach main.
+version: 2
+updates:
+  # Go modules, including the go directive in go.mod.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Actions used by the workflows in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Base images in the Dockerfile (Go builder, distroless runtime).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Images of the local stack (Prometheus, Grafana, Jaeger).
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly

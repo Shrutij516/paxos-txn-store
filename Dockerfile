@@ -5,10 +5,9 @@
 # Base images come from mirror.gcr.io (Google's cache of Docker Hub) to
 # avoid Docker Hub rate limits in CI. Behind a TLS-intercepting proxy, pass
 # its CA as a build secret: --secret id=ca,src=/path/to/ca.pem.
-ARG GO_IMAGE=mirror.gcr.io/library/golang:1.26.8
-ARG RUN_IMAGE=gcr.io/distroless/static-debian12:nonroot
-
-FROM ${GO_IMAGE} AS build
+# The base images are written out in the FROM lines (not ARGs) so
+# Dependabot can bump them (.github/dependabot.yml).
+FROM mirror.gcr.io/library/golang:1.26.9 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=secret,id=ca,required=false \
@@ -20,7 +19,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags="-s -w" -o /out/paxosd ./cmd/paxosd \
     && mkdir -p /out/data
 
-FROM ${RUN_IMAGE}
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/paxosd /paxosd
 # The data directory belongs to the nonroot user (65532) so a fresh named
 # volume mounted there is writable.

@@ -53,6 +53,9 @@ type worldOpts struct {
 	Chaos        chaos
 	Server       Config // timing and broken modes; Shard/ShardNodes filled in
 	Observe      bool   // attach a recording Observer to every server
+	// NoCheckQuorum turns off CheckQuorum on every replica (see
+	// paxos.ReplicaConfig.NoCheckQuorum).
+	NoCheckQuorum bool
 }
 
 type node struct {
@@ -179,7 +182,8 @@ func (w *world) start(id paxos.NodeID) {
 	sm.noLockCheck = w.opts.Server.ReleaseLocksAtPrepare
 	rep, err := paxos.NewReplica(paxos.ReplicaConfig{
 		ID: id, Peers: shardNodes(sh), StateMachine: sm,
-		Rand: rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
+		Rand:          rand.New(rand.NewPCG(w.rng.Uint64(), uint64(id))),
+		NoCheckQuorum: w.opts.NoCheckQuorum,
 	}, w.stores[id], gapNet{w})
 	if err != nil {
 		panic(err)
@@ -338,6 +342,18 @@ func (w *world) leader(sh ShardID) *node {
 		}
 	}
 	return best
+}
+
+// leadersUp reports whether every shard has a leader whose server has
+// taken over (directed tests wait for it before starting clients, so
+// their timing does not depend on how long the first elections take).
+func (w *world) leadersUp() bool {
+	for sh := ShardID(0); int(sh) < w.opts.Shards; sh++ {
+		if l := w.leader(sh); l == nil || !l.srv.Leading() {
+			return false
+		}
+	}
+	return true
 }
 
 // canonical returns, per shard, the live replica that has applied the most.
