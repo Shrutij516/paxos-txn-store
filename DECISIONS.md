@@ -281,6 +281,26 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Sticky directed tests:** two directed transaction tests depended on how fast the first elections ran. They now wait for every shard to have a settled leader before starting.
   - **One directed test runs without CheckQuorum:** the one-phase retry test cuts a new leader off on purpose and needs it to keep answering the client's retried commit. With CheckQuorum that leader stepped down first in about two thirds of the seeds, and the broken mode was caught in only 353 of 1000. `ReplicaConfig.NoCheckQuorum` turns it off for that test alone, which again catches the broken mode in 1000 of 1000 seeds and passes 1000 of 1000 in the correct mode. Leader liveness is tested separately (`TestMPCheckQuorum`).
 
+## 38. Go version pinning and runner pinning
+
+- **What:**
+  - **Go version:** the `go` directive in `go.mod` (now 1.26.10) is the one source of truth. Every `actions/setup-go` step reads it with `go-version-file: go.mod`, and the Dockerfile's builder is the same patch release pinned by digest (`golang:1.26.10@sha256:…`). No other Go version string appears in `.github/` or the Dockerfile.
+  - **Go line upgrades are deliberate:** `.github/dependabot.yml` ignores semver-minor and semver-major updates of `library/golang`, so Dependabot only proposes patch releases of the current line (1.26.x). Moving to 1.27 is a separate change to `go.mod` and the Dockerfile together.
+  - **Runners:** every job runs on `ubuntu-24.04` instead of `ubuntu-latest`.
+- **Why:**
+  - **The scheduled govulncheck failed four nights in a row** (2026-10-24 to 27) on GO-2026-6809 (CVE-2026-111943, stdlib `crypto/x509`, `Certificate.Verify` does not distrust compromised intermediate certificates), fixed in go1.26.10 and go1.27.3. `go.mod` said 1.26.9. 1.26.10 is the lowest 1.26 patch that fixes it, and it was the only finding.
+  - **The image and CI had drifted apart:** Dependabot's PR #26 moved the Dockerfile builder to golang 1.27.2 while `go.mod`, and so every CI job, stayed on 1.26.9. The image was built with a toolchain CI never tested, and 1.27.2 is itself affected by GO-2026-6809. A digest pin also makes the builder reproducible: a re-pushed tag cannot change the image under us.
+  - **`ubuntu-latest` moves on GitHub's schedule:** when it is re-pointed to a new Ubuntu release, preinstalled tools (Docker, `tc`, jq) change under every workflow at once with no commit in this repository. Pinning makes the switch a reviewed change.
+- **Rejected:**
+  - **Moving to Go 1.27.3:** it also fixes GO-2026-6809, but a new Go line can change compiler, runtime and scheduler behavior, which matters for the timing-sensitive race and chaos suites. That belongs in its own change, not a vulnerability fix.
+  - **A `toolchain` line in `go.mod`, or a `go-version:` literal in the workflows:** two places to keep in step instead of one.
+  - **Allowing GO-2026-6809 in `scripts/govulncheck.sh`:** a fix exists, so there is nothing to wait for.
+  - **A tag-only builder image (no digest):** tags are mutable, and Dependabot updates a tag-plus-digest `FROM` line just as well.
+- **Tradeoff:**
+  - **Patch releases are not automatic:** a new Go patch needs both the Dependabot Dockerfile PR and a `go.mod` bump, and the image and CI disagree until both land. The patch PRs that Dependabot still opens are the reminder.
+  - **Go line upgrades need someone to start them:** Dependabot never proposes them, so the repository can fall behind a supported release if nobody does.
+  - **Ubuntu 24.04 will be retired eventually:** GitHub will deprecate the image, and the workflows need a manual bump before then.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.

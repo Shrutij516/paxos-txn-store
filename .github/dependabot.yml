@@ -27,10 +27,15 @@ updates:
         update-types: [minor, patch]
 
   # Base images in the Dockerfile (Go builder, distroless runtime).
+  # The Go builder only gets patch bumps: moving to a new Go line is a
+  # deliberate change made together with go.mod (DECISIONS.md entry 38).
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "library/golang"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       docker:
         patterns: ["*"]
