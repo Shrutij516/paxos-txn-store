@@ -318,6 +318,45 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **The proof is indirect:** the edges no longer read as "a precedes b". The pairwise oracle and the equivalence test stand in for that, and they are only kept in tests.
   - **The txn-ends-before-it-begins rejection is new:** the old checker silently skipped such self-edges.
 
+## 40. AWS bootstrap: S3 native state locking, OIDC via GitHub environment
+
+- **What:** `deploy/terraform/bootstrap/` is applied once by hand with local state (docs/aws.md). It creates 10 resources:
+  - **State bucket:** `paxos-txn-store-tfstate-<account id>`, with the account ID taken from `aws_caller_identity`. Versioning, SSE-S3 (AES256), all four public access blocks, BucketOwnerEnforced, a policy that denies any request not made over TLS, old versions expiring after 90 days, and `prevent_destroy`.
+  - **GitHub OIDC provider:** audience `sts.amazonaws.com`.
+  - **Deploy role `paxos-txn-store-deploy`:** 1-hour sessions. It trusts only the token subject `repo:Shrutij516/paxos-txn-store:environment:aws` with audience `sts.amazonaws.com`, and has one inline permissions policy (6,637 characters, under the 10,240 limit for inline role policies).
+  - **Locking:** the cluster stack will keep its state under `cluster/` in the bucket and lock it with `use_lockfile = true` (S3 conditional writes). There is no DynamoDB table.
+  - **What the deploy role may do:**
+    - **EC2:** it may create VPCs, subnets, internet gateways, route tables, security groups and instances only with `Project=paxos-txn-store` in the create request. It may change, re-tag or delete them only if they already carry that tag. It may launch only Amazon-owned AMIs, only into our tagged subnets and security groups, and only t3/t3a micro to medium (`allowed_instance_types`).
+    - **State bucket:** get and put under `cluster/`, and delete only `cluster/*.tflock`.
+    - **IAM:** only roles and instance profiles named `paxos-txn-store-node*`, with `AmazonSSMManagedInstanceCore` as the only policy it may attach (no inline policies), and `iam:PassRole` for those roles to `ec2.amazonaws.com` only. The prefix is `-node*` rather than `-*` because the deploy role is itself `paxos-txn-store-deploy` and must not be able to edit its own permissions.
+    - **SSM:** read AWS's public AMI parameters, and `SendCommand` with `AWS-RunShellScript` to tagged instances only.
+  - **Where it uses `*`:**
+    - **`Resource "*"`, read-only, in two statements:**
+      - `Ec2Read` (`ec2:Describe*`): EC2 Describe calls have no resource-level permissions. The action wildcard covers the many Describe calls the provider makes to refresh state, and all of them are read-only.
+      - `SsmReadCommandStatus` (`GetCommandInvocation`, `ListCommands`, `ListCommandInvocations`, `DescribeInstanceInformation`): these have no resource-level permissions either.
+    - **Resource-type wildcards in our account and region, without a tag condition:**
+      - `volume/*` and `network-interface/*` for `RunInstances`: the provider does not always tag the root volume at launch, and these are created only as part of a launch that the tagged-instance, network and AMI statements allow.
+      - `security-group-rule/*` for authorize, revoke and modify: a new rule has no tags, and the same call still needs its security group to pass the tagged statement.
+      - `image/*`: limited to `ec2:Owner = amazon`.
+    - **`s3:ListBucket` on the state bucket without a prefix condition:** the backend lists the bucket (for example under `env:/`) to find workspaces.
+    - **Name-prefix wildcards:** `role/paxos-txn-store-node*`, `instance-profile/paxos-txn-store-node*` and the state key `cluster/*`.
+  - **A check that runs without AWS:** `tests/policy.tftest.hcl` (`terraform test`) renders the policies and fails if a new statement uses `Resource "*"`, if a `*` statement is not read-only, if `iam:PutRolePolicy` appears, if the trust condition is anything but the exact aud and sub above, or if the policy grows past the inline limit.
+- **Why:**
+  - **Locking:** Terraform 1.10 added S3-native locking (experimental in 1.10, generally available in 1.11) and deprecated the DynamoDB lock table, so the table would be one more resource and one more set of permissions with nothing gained. The cluster stack should require Terraform 1.11 or later for that reason.
+  - **No stored keys:** OIDC gives every workflow run 1-hour credentials and leaves nothing to leak or rotate.
+  - **Why an environment:** binding the trust to an environment means a job gets the role only if it declares `environment: aws`. That environment carries the branch rule (only `main`), can require a reviewer, and holds the role ARN as a variable. A workflow on another branch, a pull request or a fork gets a different subject and is refused.
+  - **SSE-S3, not SSE-KMS:** who may read the state is decided by IAM and the bucket policy. An AWS managed KMS key adds no access control on top of that, and a customer managed key costs $1/month of the $15 budget plus request charges.
+- **Rejected:**
+  - **DynamoDB locking:** it is deprecated for the S3 backend, adds a table and its IAM permissions, and the extra request costs buy nothing over a lock file in the same bucket.
+  - **Long-lived access keys** for a CI user stored as GitHub secrets: a secret that can leak through logs or a compromised action, has to be rotated by hand, and stays valid until someone notices.
+  - **A branch-based OIDC subject** (`repo:…:ref:refs/heads/main`): it cannot require a reviewer and cannot hold the variables. GitHub also puts the environment, not the ref, in the subject of any job that uses an environment, so a deploy job with an approval gate would not match it at all.
+- **Tradeoff:**
+  - **Local bootstrap state:** the bootstrap has no remote state, so its `terraform.tfstate` lives on one laptop and must be backed up by hand (docs/aws.md). Losing it means re-importing 10 resources.
+  - **Security lives in GitHub settings:** the environment's branch rule and reviewers are part of the security boundary, but they are set in the repository's settings, not in code. A misconfigured environment (no branch rule) would let any branch deploy, which is why docs/aws.md makes that step mandatory.
+  - **Unverified until the first cluster apply:** nothing here can be run against AWS. The tag-on-create conditions assume the provider tags every one of these resources in its create call. `iam:PassRole` with `iam:PassedToService` is assumed to cover `AddRoleToInstanceProfile`. The first apply of the cluster stack will show any AccessDenied, and the fix belongs in this policy, not in a broader one.
+  - **Untagged default resources:** the default security group, route table and network ACL that AWS creates with a VPC are untagged, so the cluster stack cannot adopt them (for example with `aws_default_security_group`) without widening this policy.
+  - **Narrow by design:** a new kind of resource in the cluster stack (a load balancer, an Elastic IP, an EBS volume of its own) needs a bootstrap change and a re-apply by the operator first.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.

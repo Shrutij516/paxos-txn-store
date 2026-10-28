@@ -6,3 +6,8 @@ coverage-pkg.out
 covdata/
 chaos-out/
 bin/
+# Terraform: state and plans stay local (the bootstrap state is backed up
+# by hand, docs/aws.md); .terraform.lock.hcl is committed.
+*.tfstate*
+*.tfplan
+.terraform/
