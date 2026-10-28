@@ -9,7 +9,7 @@
 # Dependabot can bump them (.github/dependabot.yml). The builder is pinned
 # by digest to the Go patch release in go.mod's go directive; the two move
 # together (DECISIONS.md entry 38).
-FROM mirror.gcr.io/library/golang:1.26.10@sha256:750c2fbc7cf8514249eaec73844b5ea96e32760b31adde66e1c93ac2fedc8166 AS build
+FROM mirror.gcr.io/library/golang:1.26.10@sha256:c141012f2b79382f9cb7438104ae0cd324cc548c1a605f393ef7402b87a1bd8b AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=secret,id=ca,required=false \
