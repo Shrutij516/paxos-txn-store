@@ -37,23 +37,7 @@ jobs:
           docker pull -q mirror.gcr.io/nicolaka/netshoot:v0.14
 
       - name: chaos run (${{ env.DURATION }})
-        run: |
-          # TEMPORARY diagnostics (Phase 9-pre-b): the 20m run kills the
-          # runner after the faults end. Print memory, disk and the top
-          # processes by RSS every 15 s; remove once that is fixed.
-          sample() {
-            while true; do
-              echo "=== sampler $(date -u +%H:%M:%S)"
-              free -m
-              df -h /
-              ps -eo pid,rss,etime,comm --sort=-rss | head -n 6
-              sleep 15
-            done
-          }
-          sample &
-          sampler=$!
-          trap 'kill "$sampler" 2>/dev/null || true' EXIT
-          ./bin/chaos -duration "$DURATION" -loadgen ./bin/loadgen -out chaos-out
+        run: ./bin/chaos -duration "$DURATION" -loadgen ./bin/loadgen -out chaos-out
 
       - name: report
         if: always()
