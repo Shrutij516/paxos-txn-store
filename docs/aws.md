@@ -3,7 +3,7 @@
 The AWS deployment has two Terraform stacks in `deploy/terraform/`:
 
 - `bootstrap/`: applied once, by hand, from an operator's machine, with local state. It creates the S3 bucket that holds the cluster stack's state, the GitHub OIDC provider, and the IAM role GitHub Actions assumes to deploy.
-- the cluster stack (a later phase): the VPC and nodes. It is applied by GitHub Actions as that role, with its state in the bucket.
+- `cluster/`: the VPC and the three nodes. It is applied as that role (by GitHub Actions in the `aws` environment, in a later phase), with its state in the bucket. See [Cluster stack](#cluster-stack) below.
 
 Why it is split this way, and what the deploy role may do, is in DECISIONS.md entry 40.
 
@@ -99,3 +99,98 @@ terraform apply destroy.tfplan
 Finally, delete the GitHub environment `aws` (**Settings → Environments → aws → Delete**) and the backed-up state file.
 
 To remove only GitHub's access and keep the state bucket, delete the environment. No job can then get the role's subject. To also revoke the role, remove the role, its policy and the OIDC provider with `terraform destroy -target=aws_iam_role_policy.deploy -target=aws_iam_role.deploy -target=aws_iam_openid_connect_provider.github`.
+
+## Cluster stack
+
+`deploy/terraform/cluster/` creates the following, all tagged `Project=paxos-txn-store`:
+
+- **Network:** one VPC (10.0.0.0/16), three public subnets 10.0.N.0/24 in zones `use1-az1`, `use1-az2` and `use1-az4`, an internet gateway and one route table.
+- **Security group:** one, shared by the three nodes.
+- **IAM:** the node role and instance profile `paxos-txn-store-node`.
+- **Nodes:** three t3.small instances at 10.0.1.10, 10.0.2.10 and 10.0.3.10. Each has an encrypted gp3 root disk and an encrypted gp3 data disk mounted at `/data`.
+
+Every node runs paxosd from `ghcr.io/shrutij516/paxos-txn-store@<image_digest>`. It uses the same flags as its service in `deploy/compose.yaml` and the unchanged `deploy/cluster.json`. The names `node1` to `node3` and `jaeger` resolve to the fixed IPs.
+
+Node 1 also runs Prometheus, Grafana and Jaeger, with the local stack's configs and image tags:
+- Their UIs listen on 127.0.0.1 only.
+- Jaeger's OTLP port, 4317, listens on the private IP so the other nodes can send traces.
+
+Why it is built this way is in DECISIONS.md entry 41.
+
+### Before the first apply: deploy-role gaps
+
+The cluster stack was checked against `deploy/terraform/bootstrap/deploy_policy.tf`, one API call at a time (table below). These calls are missing or unconfirmed. Fix the blocking ones in the bootstrap and re-apply it before the first cluster apply.
+
+| # | Call | Needed for | Status |
+|---|---|---|---|
+| G1 | `ec2:AttachInternetGateway`, `ec2:DetachInternetGateway` on `internet-gateway/*` | attaching the IGW (create), detaching it (destroy) | **Blocking.** `Ec2UseTaggedVpc` allows them on `vpc/*` only, and both calls also authorize the gateway. Fix: add both actions to `Ec2ManageTagged`. |
+| G2 | `iam:PassRole` while calling `iam:AddRoleToInstanceProfile` | putting the node role into the instance profile | **Unverified, may block.** `IamPassNodeRoleToEc2` requires `iam:PassedToService = ec2.amazonaws.com`, and that key may be absent for this call. If the apply fails here, add a statement that allows `iam:PassRole` on `role/paxos-txn-store-node*` without the service condition. |
+| G3 | `ec2:ModifyInstanceCreditSpecification` | only when `credit_specification` changes after create (the create passes it to `RunInstances`) | Not needed now. |
+| G4 | `ec2:CreateTags` and `ec2:DeleteTags` on existing `security-group-rule/*` and `volume/*` | only when their tags change after create (for example a new default tag) | Not needed now. `Ec2ManageTagged` does not list those resource types. |
+| G5 | `ec2:CreateRoute` with the internet gateway as target | the route table's default route | Unverified: if EC2 also authorizes the gateway resource for this call, it needs `internet-gateway/*` with the same tag condition. |
+| G6 | KMS use of the `aws/ebs` key | encrypted volumes at launch | Expected to be covered by the AWS managed key's own policy, which allows EBS use by any principal in the account. Unverified. |
+
+### Deploy role fit, call by call
+
+All `ec2:Describe*` reads are allowed by `Ec2Read`, and all S3 backend calls by `StateBucketList`, `StateObjects` and `StateLockRelease`.
+
+| Resource | Create | Read | Destroy | Statements |
+|---|---|---|---|---|
+| backend | `ListBucket`; `GetObject`, `PutObject` on `cluster/terraform.tfstate` and `.tflock`; `DeleteObject` on `.tflock` | same | same | StateBucketList, StateObjects, StateLockRelease |
+| `data.aws_availability_zones` | — | `DescribeAvailabilityZones` | — | Ec2Read |
+| `data.aws_ssm_parameter` | — | `ssm:GetParameter` on `/aws/service/ami-amazon-linux-latest/…` | — | SsmPublicAmiParameters |
+| `aws_vpc` | `CreateVpc` + tags, `ModifyVpcAttribute` (DNS) | `DescribeVpcs`, `DescribeVpcAttribute`, `DescribeRouteTables`, `DescribeNetworkAcls`, `DescribeSecurityGroups` | `DeleteVpc` | Ec2CreateTagged, Ec2TagOnCreate, Ec2ManageTagged |
+| `aws_subnet` ×3 | `CreateSubnet` + tags (subnet and VPC) | `DescribeSubnets` | `DeleteSubnet` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged |
+| `aws_internet_gateway` | `CreateInternetGateway` + tags, `AttachInternetGateway` | `DescribeInternetGateways` | `DetachInternetGateway`, `DeleteInternetGateway` | Ec2CreateTagged, Ec2TagOnCreate, Ec2UseTaggedVpc (VPC side only), **G1** |
+| `aws_route_table` | `CreateRouteTable` + tags, `CreateRoute` | `DescribeRouteTables` | `DeleteRoute`, `DeleteRouteTable` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged, **G5** |
+| `aws_route_table_association` ×3 | `AssociateRouteTable` | `DescribeRouteTables` | `DisassociateRouteTable` | Ec2ManageTagged |
+| `aws_security_group` | `CreateSecurityGroup` + tags, `RevokeSecurityGroupEgress` (default allow-all rule) | `DescribeSecurityGroups` | `DeleteSecurityGroup` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged, Ec2SecurityGroupRules |
+| `aws_vpc_security_group_*_rule` ×7 | `AuthorizeSecurityGroupIngress`/`Egress` + tags | `DescribeSecurityGroupRules` | `RevokeSecurityGroupIngress`/`Egress` | Ec2ManageTagged (group), Ec2SecurityGroupRules (rule), Ec2TagOnCreate, **G4** |
+| `aws_iam_role` | `CreateRole`, `TagRole` | `GetRole`, `ListRolePolicies`, `ListAttachedRolePolicies` | `ListInstanceProfilesForRole`, `DeleteRole` | IamNodeRole |
+| `aws_iam_role_policy_attachment` | `AttachRolePolicy` (AmazonSSMManagedInstanceCore) | `ListAttachedRolePolicies` | `DetachRolePolicy` | IamNodeRoleSsmPolicyOnly, IamNodeRole |
+| `aws_iam_instance_profile` | `CreateInstanceProfile`, `TagInstanceProfile`, `AddRoleToInstanceProfile` (+`PassRole`) | `GetInstanceProfile` | `RemoveRoleFromInstanceProfile`, `DeleteInstanceProfile` | IamNodeInstanceProfile, IamPassNodeRoleToEc2, **G2** |
+| `aws_instance` ×3 | `RunInstances` (instance, subnet, security group, image, volumes, network interface) + tags, `iam:PassRole` | `DescribeInstances`, `DescribeInstanceAttribute`, `DescribeVolumes`, `DescribeInstanceCreditSpecifications` | `TerminateInstances` | Ec2RunTaggedInstances, Ec2RunInTaggedNetwork, Ec2RunAmazonImages, Ec2RunLaunchParts, Ec2TagOnCreate, IamPassNodeRoleToEc2, **G3**, **G6** |
+
+### Steps
+
+Prerequisites:
+- The bootstrap gaps above are fixed.
+- You have an image digest from the release workflow, for example from `docker buildx imagetools inspect ghcr.io/shrutij516/paxos-txn-store:<commit sha>`.
+
+The cluster stack is meant to be applied by a workflow in the `aws` environment, which is a later phase. Running it by hand as an administrator works the same way:
+
+```sh
+cd deploy/terraform/cluster
+terraform init -backend-config="bucket=paxos-txn-store-tfstate-289112219115"
+terraform test                                   # offline: 4 passed
+terraform plan -var image_digest=sha256:<digest> -out=cluster.tfplan
+terraform apply cluster.tfplan
+terraform output                                 # IDs, AZs, IPs, SSM port-forward commands
+```
+
+The plan should create 23 resources:
+- **Network (10):** the VPC, 3 subnets, the internet gateway, the route table and 3 route table associations, plus the security group.
+- **Security group rules (7):** 3 ingress (7001, 9100 and 4317 from the group itself) and 4 egress (the same three ports to the group, and 443 to anywhere).
+- **IAM (3):** the role, its policy attachment and the instance profile.
+- **Nodes (3):** the instances.
+
+**Grafana and Jaeger** are reachable only by SSM port forwarding, with the commands in `terraform output`. You need the AWS CLI and the Session Manager plugin. Grafana's anonymous viewer is on, as in the local stack; its admin login is still `admin`/`admin`, reachable only through the tunnel.
+
+**Rolling out a new image** does not replace the node: run `paxosd-run sha256:<digest>` on each node over SSM. `user_data` and the AMI are ignored after the first apply.
+
+**Cost while running** (us-east-1, on-demand):
+
+| Item | Per hour |
+|---|---|
+| 3 × t3.small | $0.0624 |
+| 54 GB of gp3 | $0.0059 |
+| 3 public IPv4 addresses | $0.015 |
+| **Total** | **about $0.083** |
+
+That is about $2.00 a day, or $61 a month if left running, which is far over the $15 budget. Apply it for a session, then destroy it:
+
+```sh
+terraform destroy -var image_digest=sha256:<digest>
+```
+
+Traffic between AZs ($0.01/GB each way) adds to this under load.
