@@ -1,7 +1,9 @@
 package txn
 
 import (
+	"cmp"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 )
@@ -215,24 +217,29 @@ func checkHistory(h *History, realTime bool) error {
 			}
 		}
 	}
-	if realTime {
-		ids := sortedTxns(h.Txns)
-		for _, a := range ids {
-			ta := h.Txns[a]
-			if ta.End < 0 {
-				continue
-			}
-			for _, b := range ids {
-				if a != b && h.Txns[b].Begin > ta.End {
-					add(a, b) // a finished before b started
-				}
-			}
-		}
-	}
-	// Kahn's algorithm; anything left over sits on a cycle.
+	// Kahn's algorithm below; anything left over sits on a cycle.
 	nodes := map[ID]bool{0: true}
 	for id := range h.Txns {
 		nodes[id] = true
+	}
+	if realTime {
+		// a precedes b in real time when b.Begin > a.End. Adding that edge
+		// for every pair is O(N^2); instead, a chain of barrier nodes
+		// stands for points in time. Every End adds a new barrier after
+		// the previous one, with an edge from the txn that ended, and
+		// every Begin gets an edge from the latest barrier. So a reaches
+		// b through barriers exactly when a's End comes before b's Begin
+		// in the event order, and Begins sort before Ends at equal times
+		// to keep the comparison strict. Barriers take IDs above every
+		// real txn, and the chain itself is acyclic, so every cycle still
+		// passes through a real txn.
+		virt, err := addRealTimeBarriers(h, add)
+		if err != nil {
+			return err
+		}
+		for _, v := range virt {
+			nodes[v] = true
+		}
 	}
 	indeg := map[ID]int{}
 	for _, a := range sortedTxns(edges) {
@@ -260,7 +267,7 @@ func checkHistory(h *History, realTime bool) error {
 	if seen != len(nodes) {
 		var stuck []ID
 		for _, id := range sortedTxns(nodes) {
-			if indeg[id] > 0 {
+			if _, isTxn := h.Txns[id]; indeg[id] > 0 && (isTxn || id == 0) {
 				stuck = append(stuck, id)
 			}
 		}
@@ -271,6 +278,61 @@ func checkHistory(h *History, realTime bool) error {
 		return fmt.Errorf("%s: dependency cycle among %d txns, e.g. %v", kind, len(stuck), stuck[:min(len(stuck), 4)])
 	}
 	return nil
+}
+
+// addRealTimeBarriers adds the real-time order of h's txns to the graph
+// through barrier nodes (see checkHistory) and returns the barrier IDs.
+func addRealTimeBarriers(h *History, add func(a, b ID)) ([]ID, error) {
+	type event struct {
+		at  int64
+		end bool // Begins sort before Ends at equal times
+		id  ID
+	}
+	var events []event
+	var maxID ID
+	for id, t := range h.Txns {
+		maxID = max(maxID, id)
+		events = append(events, event{t.Begin, false, id})
+		if t.End >= 0 {
+			if t.End < t.Begin {
+				return nil, fmt.Errorf("history: txn %d ends (%d) before it begins (%d)", id, t.End, t.Begin)
+			}
+			events = append(events, event{t.End, true, id})
+		}
+	}
+	slices.SortFunc(events, func(x, y event) int {
+		switch {
+		case x.at != y.at:
+			return cmp.Compare(x.at, y.at)
+		case x.end != y.end:
+			if x.end {
+				return 1
+			}
+			return -1
+		}
+		return cmp.Compare(x.id, y.id)
+	})
+	if maxID > math.MaxUint64-ID(len(events)) {
+		return nil, fmt.Errorf("history: txn IDs up to %d leave no room for real-time barrier nodes", maxID)
+	}
+	var virt []ID
+	var cur ID // latest barrier; 0 means none yet
+	for _, e := range events {
+		if !e.end {
+			if cur != 0 {
+				add(cur, e.id)
+			}
+			continue
+		}
+		v := maxID + 1 + ID(len(virt))
+		virt = append(virt, v)
+		if cur != 0 {
+			add(cur, v)
+		}
+		add(e.id, v)
+		cur = v
+	}
+	return virt, nil
 }
 
 func sortedShards[V any](m map[ShardID]V) []ShardID {
