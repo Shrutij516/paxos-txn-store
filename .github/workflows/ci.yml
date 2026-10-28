@@ -16,7 +16,7 @@ permissions:
 # seed suites run once without -race and also feed the coverage gate.
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -35,7 +35,7 @@ jobs:
   # The public SDK must not depend on this module's internal packages,
   # which programs outside the module cannot import.
   sdk-deps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -50,7 +50,7 @@ jobs:
   # standard library, has a known vulnerability (scripts/govulncheck.sh, see
   # DECISIONS.md entry 34). vulncheck.yml runs the same check on main daily.
   govulncheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -64,7 +64,7 @@ jobs:
   # Regenerates the protobuf code with pinned tools and fails if the
   # committed files differ from what the .proto files produce.
   proto:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PROTOC_VERSION: "29.3"
       PROTOC_GEN_GO_VERSION: v1.36.12
@@ -88,7 +88,7 @@ jobs:
         run: make proto-check
 
   race-short:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -100,7 +100,7 @@ jobs:
         run: go test -race -short ./...
 
   full:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 

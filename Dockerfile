@@ -6,8 +6,10 @@
 # avoid Docker Hub rate limits in CI. Behind a TLS-intercepting proxy, pass
 # its CA as a build secret: --secret id=ca,src=/path/to/ca.pem.
 # The base images are written out in the FROM lines (not ARGs) so
-# Dependabot can bump them (.github/dependabot.yml).
-FROM mirror.gcr.io/library/golang:1.27.2 AS build
+# Dependabot can bump them (.github/dependabot.yml). The builder is pinned
+# by digest to the Go patch release in go.mod's go directive; the two move
+# together (DECISIONS.md entry 38).
+FROM mirror.gcr.io/library/golang:1.26.10@sha256:750c2fbc7cf8514249eaec73844b5ea96e32760b31adde66e1c93ac2fedc8166 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=secret,id=ca,required=false \

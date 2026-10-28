@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   chaos:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 50
     env:
       DURATION: ${{ github.event_name == 'schedule' && '20m' || inputs.duration || '2m' }}
