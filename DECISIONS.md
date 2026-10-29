@@ -436,6 +436,28 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **What the leftover check can trust:** the tagging API can list resources for a while after they are deleted, so only EC2's own view (non-terminated instances, the VPC) fails the destroy; other ARNs are warnings.
   - **Bootstrap changes are manual:** policy changes (G1, G2, `tag:GetResources`) only take effect when the operator re-applies the bootstrap, which is a manual step outside any workflow (docs/aws.md).
 
+## 43. Peer connections reconnect within about a second (capped gRPC backoff)
+
+- **What:** every peer connection in `internal/grpcnet` is dialed with `grpc.WithConnectParams`:
+  - **Reconnect backoff:** base delay 100 ms, multiplier 1.6, jitter 0.2, and a cap of 1 s.
+  - **Connect timeout:** a single connection attempt may take at most 5 s (`MinConnectTimeout`), instead of 20 s.
+  - **Readiness:** `/readyz` now names every shard that is not ready, not only the first.
+  - **Test:** `TestMultiProcessRejoin` (real processes, skipped under `-short`) kills the node leading the most shards. After 60 s and after 180 s down, the restarted node must be ready within 5 s.
+- **Why:** a restarted replica learns each shard's leader only from that leader's heartbeats and Accepts, which travel over the leader's own outbound connection to it. The default gRPC backoff grows to 120 s while a peer is down, so the leader could reach the returning node up to two minutes late. Until then the node stayed not ready, and was useless for its shards (incident I4).
+  - **The cap:** 1 s bounds that wait to about a second.
+  - **The 100 ms base:** short outages, such as a chaos kill held for a few seconds, are bridged even faster.
+  - **The 5 s connect timeout:** on a peer whose host has vanished without answering, a hanging attempt cannot hold the connection for 20 s. Within a region a TCP connect takes milliseconds.
+  - **Measured locally** (three processes, no load, `-tick 10ms`): ready after 0.61 s (60 s down) and 1.01 s (180 s down), against 10.9 s and 115.9 s before.
+- **Rejected:**
+  - **Resetting the backoff when a message arrives from that peer** (`ClientConn.ResetConnectBackoff` from the receive path): it reacts at once, but it couples the server's receive path to the client side of the transport and uses an experimental API. With a 1 s cap it would save at most a second.
+  - **Keepalives:** they detect a dead connection that still looks healthy. Here the connection was already known to be down and was waiting out its backoff.
+  - **Waiting for the connection to be ready (`WaitForReady`):** RPCs would block instead of failing fast. The transport drops messages to an unreachable peer on purpose and Paxos retransmits.
+  - **Learning the leader from the restarted node's own messages** (for example, refusals that name the leader): a protocol change, for a delay that is a transport setting.
+- **Tradeoff:**
+  - **Steady connection attempts:** a peer that stays down now gets about one connection attempt per second from each other node, instead of one every two minutes. That is a TCP SYN and a refusal, negligible at three nodes, but it grows with cluster size.
+  - **Log noise:** gRPC logs connection failures at its own (quiet by default) log level, so nothing new appears in the logs.
+  - **Test time:** the rejoin test adds about 3 minutes to the full suite (its two downtimes run in parallel).
+
 ## Incidents
 
 Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.
@@ -485,6 +507,35 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Evidence:** CloudTrail's `AssumeRoleWithWebIdentity` event for the refused call recorded the token's subject. The two IDs match the fields `owner.id` and `id` of `https://api.github.com/repos/Shrutij516/paxos-txn-store`.
 - **Fix:** entry 40, update for Phase 8c-3b. The trust policy builds the subject from the repository name plus the variables `github_owner_id` and `github_repo_id`, still with `StringEquals` and no wildcards. The offline test asserts the exact string and fails on the old format. The IDs also protect against a renamed or deleted repository whose name someone else registers.
 - **Lesson:** the offline tests checked the trust policy against our own idea of the token, not against a real one. Formats owned by another service can change, so the first real run is the test that counts. CloudTrail records the claims of every refused web-identity call, which makes a mismatch quick to diagnose. When adapting, keep an exact match instead of loosening it to a pattern.
+
+### I4. A restarted node stayed not ready for up to two and a half minutes
+
+- **Symptom:** in the first AWS run (docs/aws.md, results), after each leader-kill test the restarted paxosd answered `/readyz` 503 `shard 2: no known leader` for a long time, while node1 led shard 2 the whole time.
+  - node3, down about 3 minutes, took 146 s to become ready.
+  - node2, down about 1 minute, took 32 s.
+
+  Failover itself was fast (under 0.35 s); only the rejoin was slow.
+- **Root cause:** gRPC's default reconnect backoff on the surviving leaders' peer connections.
+  - **How a returning node learns leaders:** a replica learns its shard's leader only from the leader's heartbeats and Accepts (`internal/paxos/replica.go`). Those reach a peer only over the leader's outbound gRPC connection to it (`internal/grpcnet`, one connection per peer pair).
+  - **The backoff:** while the peer was down, that connection retried with gRPC's default exponential backoff (1 s base, ×1.6, jitter 0.2, at most 120 s). After three minutes down, the next attempt could be up to two minutes away. A restart did not wake it, so the returning node heard nothing from that leader until the timer fired.
+  - **Why one shard but not another:** each surviving node's connection has its own backoff timer, so the returning node learns the shards led by one survivor at a different moment than those led by the other. The old `/readyz` named only the first shard still missing a leader.
+- **Evidence:**
+  - **Hypothesis from AWS:** first proposed from the AWS timings and not yet proven.
+  - **Reproduced** with `TestMultiProcessRejoin` (three local processes, the node leading the most shards SIGKILLed, then restarted with the same address and data):
+
+    | Downtime | Before the fix | After the fix |
+    |---|---|---|
+    | 60 s | 9.9 s and 10.9 s (two runs) | 0.61 s |
+    | 180 s | 115.9 s (twice) | 1.01 s |
+
+    With a 20 s downtime it took 6.4 s, which lands right at the next step of the backoff schedule (attempts about 1, 2.6, 5.2, 9.3, 15.8 and 26.3 s after the failure).
+  - **Per-leader effect:** with the per-shard `/readyz` message added in the fix, the restarted node visibly learned shards 0 and 2 (led by node2) before shard 1 (led by node1), one survivor at a time.
+  - **Not explained:** in AWS run 2, node1 led both shard 1 and shard 2 after the failover, yet the old message named only shard 2. With one connection per node pair, the two should have become known together. Perhaps shard 1's leadership moved again before the observation; the per-shard message will show it next time.
+- **Fix:** entry 43. The reconnect backoff is capped at 1 s (base 100 ms), the connect timeout is 5 s, and `/readyz` lists every unready shard. `TestMultiProcessRejoin` fails without the cap (10.9 s and 115.9 s against a 5 s bound) and passes with it.
+- **Lesson:**
+  - **Measure recovery, not just failover:** the earlier fault tests measured how fast a new leader took over, never how fast a returning node became useful again. The chaos runs held each kill for at most 8 s, inside the short early steps of the backoff, so they could not see it. Recovery needs its own test at realistic downtimes.
+  - **Library defaults are design decisions:** an untouched gRPC default, tuned for clients of remote services, set this cluster's rejoin time.
+  - **Report all of it:** a readiness check that reports only its first failure hides the pattern.
 
 ## Future work
 
