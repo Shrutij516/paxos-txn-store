@@ -7,6 +7,19 @@ resource "aws_iam_openid_connect_provider" "github" {
 
 # Only jobs of this repository that run in the GitHub environment may assume
 # the role: not other repositories, branches, pull requests or forks.
+#
+# GitHub's sub claim carries the owner's and the repository's immutable
+# numeric IDs next to their names:
+#   repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws
+# Matching it exactly (StringEquals, no wildcards) ties the role to this
+# repository even if it is renamed and its old name is taken by someone
+# else (DECISIONS.md entry 40).
+locals {
+  github_owner = split("/", var.github_repository)[0]
+  github_repo  = split("/", var.github_repository)[1]
+  github_sub   = "repo:${local.github_owner}@${var.github_owner_id}/${local.github_repo}@${var.github_repo_id}:environment:${var.github_environment}"
+}
+
 data "aws_iam_policy_document" "deploy_trust" {
   statement {
     sid     = "GitHubEnvironmentOnly"
@@ -27,7 +40,7 @@ data "aws_iam_policy_document" "deploy_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:environment:${var.github_environment}"]
+      values   = [local.github_sub]
     }
   }
 }

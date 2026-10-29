@@ -61,12 +61,36 @@ Then:
 
 ### The GitHub environment "aws"
 
-The deploy role trusts exactly one OIDC subject: `repo:Shrutij516/paxos-txn-store:environment:aws`. Only a job that declares `environment: aws` gets a token with that subject. The environment's own rules decide which branches may use it and whether someone must approve. Create it before any workflow uses the role:
+The deploy role trusts exactly one OIDC subject: `repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws`. GitHub writes the owner's and the repository's immutable numeric IDs after their names, and the trust policy matches the whole string exactly. Only a job that declares `environment: aws` gets a token with that subject. The environment's own rules decide which branches may use it and whether someone must approve. Create it before any workflow uses the role:
 
 1. In the repository on GitHub, open **Settings → Environments → New environment**. Name it exactly `aws` (lower case) and choose **Configure environment**.
 2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the rule `main`. Do not skip this step. The trust policy only checks the environment, so without this rule a workflow on any branch could deploy.
 3. Recommended: under **Required reviewers**, add yourself and choose **Save protection rules**. Every job in the `aws` environment then waits for your approval: in a deploy that is the plan job and the apply job, each approved separately; in a destroy it is the destroy job.
 4. Add no AWS access keys anywhere, neither as secrets nor as variables. Workflows get 1-hour credentials from `aws-actions/configure-aws-credentials` and `permissions: id-token: write`.
+
+### The owner and repository IDs in the subject
+
+The bootstrap variables `github_owner_id` (default `90023638`) and `github_repo_id` (default `1396843261`) must match what GitHub puts in the token. The IDs never change when the owner or the repository is renamed. If a deploy fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`, compare the trust policy's subject with the token's. There are two ways to read the IDs:
+
+- **From GitHub's public API** (no login needed): the field `owner.id` is the owner ID and `id` is the repository ID.
+
+  ```sh
+  curl -s https://api.github.com/repos/Shrutij516/paxos-txn-store | jq '{owner_id: .owner.id, repo_id: .id}'
+  # { "owner_id": 90023638, "repo_id": 1396843261 }
+  ```
+
+- **From CloudTrail**, which records the subject of every refused `AssumeRoleWithWebIdentity`. Look in us-east-1, the region the workflow calls STS in, and in the last 90 days:
+
+  ```sh
+  aws cloudtrail lookup-events --region us-east-1 --max-results 5 \
+    --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+    --query 'Events[].CloudTrailEvent' --output text \
+    | jq -r '[.eventTime, (.errorCode // "ok"), .userIdentity.userName] | @tsv'
+  ```
+
+  For web-identity calls, CloudTrail puts the token's `sub` in `userIdentity.userName`. Expect `repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws`.
+
+To change them, set the variables (for example `terraform plan -var github_repo_id=<id>`) and re-apply the bootstrap.
 
 ### Repository variables
 
@@ -78,6 +102,17 @@ The workflows read two repository variables (not secrets: neither value is confi
 4. **New repository variable** again: **Name** `TF_STATE_BUCKET`, **Value** the `state_bucket` output (`paxos-txn-store-tfstate-289112219115`). Choose **Add variable**.
 
 The Variables tab should now list exactly these two. If a variable of the same name was added to the `aws` environment earlier (an older version of this page said to), delete it there: environment variables override repository ones.
+
+### Re-applying the bootstrap after the subject fix
+
+The trust policy now expects GitHub's subject with immutable IDs (above). Re-apply as in the next section. The plan must show **`Plan: 0 to add, 1 to change, 0 to destroy.`** The one change is `aws_iam_role.deploy`, updated in place, and only its `assume_role_policy` changes. In that policy only the `sub` condition changes:
+
+```
+"token.actions.githubusercontent.com:sub": "repo:Shrutij516/paxos-txn-store:environment:aws"
+  -> "repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws"
+```
+
+The role's name, description and session length, its permissions policy, the OIDC provider and the bucket must show no change. If the Phase 8c-3 policy change below was never applied, the plan also updates `aws_iam_role_policy.deploy`: 2 to change, still 0 to add or destroy.
 
 ### Re-applying the bootstrap after a policy change
 
