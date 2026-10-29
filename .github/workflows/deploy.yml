@@ -1,0 +1,126 @@
+name: deploy
+
+# Applies deploy/terraform/cluster as the bootstrap's deploy role (docs/aws.md,
+# DECISIONS.md entry 42). Two jobs, both in the "aws" environment, so each
+# waits for approval if the environment requires reviewers: "plan" saves a
+# plan and prints it, "apply" applies exactly that plan and then checks
+# every node over SSM. No AWS keys: credentials come from GitHub OIDC.
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "paxosd image digest (sha256:...). Empty: the image release.yml pushed for the selected commit."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+# Shared with destroy.yml: one Terraform run on the cluster state at a time,
+# and a queued run waits instead of cancelling one in progress.
+concurrency:
+  group: terraform-cluster
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.17.1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    environment: aws
+    timeout-minutes: 20
+    outputs:
+      image_digest: ${{ steps.digest.outputs.digest }}
+    defaults:
+      run:
+        working-directory: deploy/terraform/cluster
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: resolve the image digest
+        id: digest
+        working-directory: .
+        env:
+          INPUT_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          digest=$(scripts/resolve-image-digest.sh "${INPUT_DIGEST:-$GITHUB_SHA}")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image: \`ghcr.io/shrutij516/paxos-txn-store@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: terraform plan
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: terraform plan -var "image_digest=$DIGEST" -out=cluster.tfplan
+
+      - name: show the plan
+        run: |
+          terraform show -no-color cluster.tfplan | tee plan.txt
+          { echo '```'; cat plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cluster-tfplan
+          path: deploy/terraform/cluster/cluster.tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  apply:
+    needs: plan
+    runs-on: ubuntu-24.04
+    environment: aws
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: deploy/terraform/cluster
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-apply-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cluster-tfplan
+          path: deploy/terraform/cluster
+
+      # Exactly the reviewed plan. Terraform refuses it if the state changed
+      # since it was made.
+      - run: terraform apply cluster.tfplan
+
+      - name: smoke check (SSM, paxosd /readyz and image on every node)
+        env:
+          DIGEST: ${{ needs.plan.outputs.image_digest }}
+        run: ../../../scripts/aws-smoke.sh "$DIGEST"
+
+      - name: outputs
+        if: always()
+        run: terraform output

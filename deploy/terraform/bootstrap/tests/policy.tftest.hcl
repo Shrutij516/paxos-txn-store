@@ -98,16 +98,41 @@ run "render" {
   assert {
     condition = join(",", sort([
       for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement : s.Sid if s.Resource == "*"
-    ])) == "Ec2Read,SsmReadCommandStatus"
+    ])) == "Ec2Read,SsmReadCommandStatus,TagsReadForCleanupCheck"
     error_message = "a new statement uses Resource \"*\"; scope it or document it in DECISIONS.md entry 40"
   }
 
   assert {
     condition = alltrue([
       for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement :
-      s.Resource != "*" || alltrue([for a in flatten([s.Action]) : can(regex("^(ec2:Describe|ssm:(Get|List|Describe))", a))])
+      s.Resource != "*" || alltrue([for a in flatten([s.Action]) : can(regex("^(ec2:Describe|ssm:(Get|List|Describe)|tag:Get)", a))])
     ])
     error_message = "statements on Resource \"*\" must be read-only"
+  }
+
+  # iam:PassRole only for the node role, and only to EC2 when a service is
+  # named (StringEqualsIfExists also admits AddRoleToInstanceProfile).
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement :
+      s.Resource == "arn:aws:iam::123456789012:role/paxos-txn-store-node*" &&
+      s.Condition == { StringEqualsIfExists = { "iam:PassedToService" = "ec2.amazonaws.com" } }
+      if contains(flatten([s.Action]), "iam:PassRole")
+    ])
+    error_message = "iam:PassRole must be limited to the node role and to EC2"
+  }
+
+  # The internet gateway is authorized on attach and detach too (gap G1).
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement :
+      contains(s.Resource, "arn:aws:ec2:us-east-1:123456789012:internet-gateway/*")
+      if s.Sid == "Ec2ManageTagged"
+      ]) && anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement :
+      contains(flatten([s.Action]), "ec2:AttachInternetGateway") if s.Sid == "Ec2ManageTagged"
+    ])
+    error_message = "Ec2ManageTagged must allow attaching our tagged internet gateways"
   }
 
   assert {

@@ -3,7 +3,7 @@
 The AWS deployment has two Terraform stacks in `deploy/terraform/`:
 
 - `bootstrap/`: applied once, by hand, from an operator's machine, with local state. It creates the S3 bucket that holds the cluster stack's state, the GitHub OIDC provider, and the IAM role GitHub Actions assumes to deploy.
-- `cluster/`: the VPC and the three nodes. It is applied as that role (by GitHub Actions in the `aws` environment, in a later phase), with its state in the bucket. See [Cluster stack](#cluster-stack) below.
+- `cluster/`: the VPC and the three nodes. It is applied as that role by `.github/workflows/deploy.yml` and removed by `destroy.yml`, both in the `aws` environment, with its state in the bucket. See [Cluster stack](#cluster-stack) below.
 
 Why it is split this way, and what the deploy role may do, is in DECISIONS.md entry 40.
 
@@ -65,12 +65,41 @@ The deploy role trusts exactly one OIDC subject: `repo:Shrutij516/paxos-txn-stor
 
 1. In the repository on GitHub, open **Settings → Environments → New environment**. Name it exactly `aws` (lower case) and choose **Configure environment**.
 2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the rule `main`. Do not skip this step. The trust policy only checks the environment, so without this rule a workflow on any branch could deploy.
-3. Optional but recommended: under **Required reviewers**, add yourself. Every deploy and destroy then waits for your approval.
-4. Under **Environment variables**, add these (they are not secrets):
-   - `AWS_ROLE_ARN` = the `deploy_role_arn` output
-   - `AWS_REGION` = `us-east-1`
-   - `TF_STATE_BUCKET` = the `state_bucket` output
-5. Add no AWS access keys anywhere. Workflows get 1-hour credentials with `aws-actions/configure-aws-credentials` (`role-to-assume: ${{ vars.AWS_ROLE_ARN }}`) and `permissions: id-token: write`.
+3. Recommended: under **Required reviewers**, add yourself and choose **Save protection rules**. Every job in the `aws` environment then waits for your approval: in a deploy that is the plan job and the apply job, each approved separately; in a destroy it is the destroy job.
+4. Add no AWS access keys anywhere, neither as secrets nor as variables. Workflows get 1-hour credentials from `aws-actions/configure-aws-credentials` and `permissions: id-token: write`.
+
+### Repository variables
+
+The workflows read two repository variables (not secrets: neither value is confidential). Get the values with `terraform output` in `deploy/terraform/bootstrap`, then:
+
+1. In the repository on GitHub, open **Settings → Secrets and variables → Actions**.
+2. Choose the **Variables** tab, then **New repository variable**.
+3. **Name** `AWS_DEPLOY_ROLE_ARN`, **Value** the `deploy_role_arn` output (`arn:aws:iam::289112219115:role/paxos-txn-store-deploy`). Choose **Add variable**.
+4. **New repository variable** again: **Name** `TF_STATE_BUCKET`, **Value** the `state_bucket` output (`paxos-txn-store-tfstate-289112219115`). Choose **Add variable**.
+
+The Variables tab should now list exactly these two. If a variable of the same name was added to the `aws` environment earlier (an older version of this page said to), delete it there: environment variables override repository ones.
+
+### Re-applying the bootstrap after a policy change
+
+Phase 8c-3 changed the deploy role's policy, and nothing else. It added the fixes for gaps G1 and G2 (see [Before the first apply](#before-the-first-apply-deploy-role-gaps)) and read access to the tagging API for the destroy workflow. Re-apply it from your Mac before the first deploy:
+
+```sh
+cd deploy/terraform/bootstrap
+git pull                                  # the branch with the change, or main once merged
+terraform init                            # same provider, 6.71.0
+terraform test                            # offline: 1 passed
+terraform plan -out=bootstrap.tfplan
+terraform apply bootstrap.tfplan
+```
+
+The plan must show **`Plan: 0 to add, 1 to change, 0 to destroy.`** The one change is `aws_iam_role_policy.deploy` ("will be updated in-place"), and its `policy` diff should contain exactly these changes:
+
+- **`Ec2ManageTagged`:** gains `ec2:AttachInternetGateway` and `ec2:DetachInternetGateway`.
+- **`Ec2UseTaggedVpc`:** loses those two actions. `Ec2ManageTagged` already covers the VPC side, and now also the gateway.
+- **`IamPassNodeRoleToEc2`:** its condition changes from `StringEquals` to `StringEqualsIfExists` on `iam:PassedToService` = `ec2.amazonaws.com`.
+- **New statement `TagsReadForCleanupCheck`:** `tag:GetResources` on `*`.
+
+The new policy is 6,739 characters, under the 10,240 limit. If the plan changes or replaces the bucket, the OIDC provider or the role itself, stop. (The `#checkov:skip` comments on the bucket are comments and change nothing.)
 
 ### Undoing the bootstrap
 
@@ -119,12 +148,12 @@ Why it is built this way is in DECISIONS.md entry 41.
 
 ### Before the first apply: deploy-role gaps
 
-The cluster stack was checked against `deploy/terraform/bootstrap/deploy_policy.tf`, one API call at a time (table below). These calls are missing or unconfirmed. Fix the blocking ones in the bootstrap and re-apply it before the first cluster apply.
+The cluster stack was checked against `deploy/terraform/bootstrap/deploy_policy.tf`, one API call at a time (table below). G1 and G2 are fixed in the bootstrap since Phase 8c-3; [re-apply it](#re-applying-the-bootstrap-after-a-policy-change) before the first deploy. The rest are not needed yet, or will only be confirmed by the first apply.
 
 | # | Call | Needed for | Status |
 |---|---|---|---|
-| G1 | `ec2:AttachInternetGateway`, `ec2:DetachInternetGateway` on `internet-gateway/*` | attaching the IGW (create), detaching it (destroy) | **Blocking.** `Ec2UseTaggedVpc` allows them on `vpc/*` only, and both calls also authorize the gateway. Fix: add both actions to `Ec2ManageTagged`. |
-| G2 | `iam:PassRole` while calling `iam:AddRoleToInstanceProfile` | putting the node role into the instance profile | **Unverified, may block.** `IamPassNodeRoleToEc2` requires `iam:PassedToService = ec2.amazonaws.com`, and that key may be absent for this call. If the apply fails here, add a statement that allows `iam:PassRole` on `role/paxos-txn-store-node*` without the service condition. |
+| G1 | `ec2:AttachInternetGateway`, `ec2:DetachInternetGateway` on `internet-gateway/*` | attaching the IGW (create), detaching it (destroy) | **Fixed:** both actions are now in `Ec2ManageTagged`, which covers our tagged gateways and VPCs. |
+| G2 | `iam:PassRole` while calling `iam:AddRoleToInstanceProfile` | putting the node role into the instance profile | **Fixed:** the condition is now `StringEqualsIfExists`. It still allows passing the node role only, and only to EC2 when a service is named, and it no longer fails when `AddRoleToInstanceProfile` sends no service. |
 | G3 | `ec2:ModifyInstanceCreditSpecification` | only when `credit_specification` changes after create (the create passes it to `RunInstances`) | Not needed now. |
 | G4 | `ec2:CreateTags` and `ec2:DeleteTags` on existing `security-group-rule/*` and `volume/*` | only when their tags change after create (for example a new default tag) | Not needed now. `Ec2ManageTagged` does not list those resource types. |
 | G5 | `ec2:CreateRoute` with the internet gateway as target | the route table's default route | Unverified: if EC2 also authorizes the gateway resource for this call, it needs `internet-gateway/*` with the same tag condition. |
@@ -141,44 +170,224 @@ All `ec2:Describe*` reads are allowed by `Ec2Read`, and all S3 backend calls by 
 | `data.aws_ssm_parameter` | — | `ssm:GetParameter` on `/aws/service/ami-amazon-linux-latest/…` | — | SsmPublicAmiParameters |
 | `aws_vpc` | `CreateVpc` + tags, `ModifyVpcAttribute` (DNS) | `DescribeVpcs`, `DescribeVpcAttribute`, `DescribeRouteTables`, `DescribeNetworkAcls`, `DescribeSecurityGroups` | `DeleteVpc` | Ec2CreateTagged, Ec2TagOnCreate, Ec2ManageTagged |
 | `aws_subnet` ×3 | `CreateSubnet` + tags (subnet and VPC) | `DescribeSubnets` | `DeleteSubnet` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged |
-| `aws_internet_gateway` | `CreateInternetGateway` + tags, `AttachInternetGateway` | `DescribeInternetGateways` | `DetachInternetGateway`, `DeleteInternetGateway` | Ec2CreateTagged, Ec2TagOnCreate, Ec2UseTaggedVpc (VPC side only), **G1** |
+| `aws_internet_gateway` | `CreateInternetGateway` + tags, `AttachInternetGateway` | `DescribeInternetGateways` | `DetachInternetGateway`, `DeleteInternetGateway` | Ec2CreateTagged, Ec2TagOnCreate, Ec2ManageTagged (gateway and VPC, G1 fixed) |
 | `aws_route_table` | `CreateRouteTable` + tags, `CreateRoute` | `DescribeRouteTables` | `DeleteRoute`, `DeleteRouteTable` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged, **G5** |
 | `aws_route_table_association` ×3 | `AssociateRouteTable` | `DescribeRouteTables` | `DisassociateRouteTable` | Ec2ManageTagged |
 | `aws_security_group` | `CreateSecurityGroup` + tags, `RevokeSecurityGroupEgress` (default allow-all rule) | `DescribeSecurityGroups` | `DeleteSecurityGroup` | Ec2CreateTagged, Ec2UseTaggedVpc, Ec2TagOnCreate, Ec2ManageTagged, Ec2SecurityGroupRules |
 | `aws_vpc_security_group_*_rule` ×7 | `AuthorizeSecurityGroupIngress`/`Egress` + tags | `DescribeSecurityGroupRules` | `RevokeSecurityGroupIngress`/`Egress` | Ec2ManageTagged (group), Ec2SecurityGroupRules (rule), Ec2TagOnCreate, **G4** |
 | `aws_iam_role` | `CreateRole`, `TagRole` | `GetRole`, `ListRolePolicies`, `ListAttachedRolePolicies` | `ListInstanceProfilesForRole`, `DeleteRole` | IamNodeRole |
 | `aws_iam_role_policy_attachment` | `AttachRolePolicy` (AmazonSSMManagedInstanceCore) | `ListAttachedRolePolicies` | `DetachRolePolicy` | IamNodeRoleSsmPolicyOnly, IamNodeRole |
-| `aws_iam_instance_profile` | `CreateInstanceProfile`, `TagInstanceProfile`, `AddRoleToInstanceProfile` (+`PassRole`) | `GetInstanceProfile` | `RemoveRoleFromInstanceProfile`, `DeleteInstanceProfile` | IamNodeInstanceProfile, IamPassNodeRoleToEc2, **G2** |
+| `aws_iam_instance_profile` | `CreateInstanceProfile`, `TagInstanceProfile`, `AddRoleToInstanceProfile` (+`PassRole`) | `GetInstanceProfile` | `RemoveRoleFromInstanceProfile`, `DeleteInstanceProfile` | IamNodeInstanceProfile, IamPassNodeRoleToEc2 (G2 fixed) |
 | `aws_instance` ×3 | `RunInstances` (instance, subnet, security group, image, volumes, network interface) + tags, `iam:PassRole` | `DescribeInstances`, `DescribeInstanceAttribute`, `DescribeVolumes`, `DescribeInstanceCreditSpecifications` | `TerminateInstances` | Ec2RunTaggedInstances, Ec2RunInTaggedNetwork, Ec2RunAmazonImages, Ec2RunLaunchParts, Ec2TagOnCreate, IamPassNodeRoleToEc2, **G3**, **G6** |
 
-### Steps
+The workflows also use, outside Terraform:
 
-Prerequisites:
-- The bootstrap gaps above are fixed.
-- You have an image digest from the release workflow, for example from `docker buildx imagetools inspect ghcr.io/shrutij516/paxos-txn-store:<commit sha>`.
+| Workflow step | Calls | Statements |
+|---|---|---|
+| credentials | `sts:AssumeRoleWithWebIdentity` | the role's trust policy |
+| smoke check | `ssm:DescribeInstanceInformation`, `ssm:GetCommandInvocation`; `ssm:SendCommand` (`AWS-RunShellScript`, tagged instances) | SsmReadCommandStatus, SsmRunShellScriptDocument, SsmRunOnTaggedInstances |
+| leftover check | `tag:GetResources`, `ec2:DescribeInstances`, `ec2:DescribeVpcs` | TagsReadForCleanupCheck, Ec2Read |
 
-The cluster stack is meant to be applied by a workflow in the `aws` environment, which is a later phase. Running it by hand as an administrator works the same way:
+### Deploying
+
+Prerequisites, all done once:
+- The bootstrap is applied, with the [latest policy](#re-applying-the-bootstrap-after-a-policy-change).
+- The [`aws` environment](#the-github-environment-aws) exists.
+- The two [repository variables](#repository-variables) are set.
+
+**Run it:**
+
+1. **Actions → deploy → Run workflow.** Leave **Use workflow from** on `main`, since the environment only admits `main`.
+2. **image_digest:** leave it empty to deploy the image that `release.yml` pushed for the head of `main`. The workflow looks up `ghcr.io/shrutij516/paxos-txn-store:<commit sha>` anonymously and fails if there is none. If `release.yml` has not finished for that commit yet, wait for it. To deploy another build, paste its digest (`sha256:…`); the workflow checks that it exists.
+3. **Run workflow.**
+
+**Approve the plan job:** the run shows **plan: Waiting**. Choose **Review deployments**, tick **aws**, then **Approve and deploy**. The job resolves the digest, runs `terraform plan`, and prints the plan in its log and on the run's summary page.
+
+**Read the plan, then approve the apply job:**
+- The first deploy creates 23 resources (listed below) and changes or destroys nothing.
+- Later deploys usually show no changes. `user_data` and the AMI are ignored after creation.
+
+Then **Review deployments → aws → Approve and deploy** for **apply**. To stop instead, choose **Reject**, or cancel the run. The saved plan expires with its artifact after 1 day.
+
+**What the apply job does:**
+- It applies exactly the saved plan. Terraform refuses it if the state changed in between.
+- It then runs the smoke check (`scripts/aws-smoke.sh`):
+  1. Waits up to 10 minutes for all three nodes to be online in SSM.
+  2. On each node, waits up to 15 minutes for paxosd's `/readyz` to answer 200. That means every shard has a leader and the node is caught up; the first boot has to install Docker and pull images first.
+  3. Checks that the node runs the requested digest.
+- It prints each node's output and a table on the summary page.
+
+A node that runs an older image fails the check: `user_data` only runs on first boot. Roll the new image out with `paxosd-run` (below), then run deploy again to re-check.
+
+A deploy and a destroy never run at the same time: both use the concurrency group `terraform-cluster`, and a second run waits.
+
+The first deploy creates 23 resources:
+- **Network (10):** the VPC, 3 subnets, the internet gateway, the route table, 3 route table associations and the security group.
+- **Security group rules (7):** 3 ingress (7001, 9100 and 4317, from the group itself) and 4 egress (the same three ports to the group, and 443 to anywhere).
+- **IAM (3):** the role, its policy attachment and the instance profile.
+- **Nodes (3):** the instances.
+
+### Reaching the nodes: Session Manager
+
+Install the AWS CLI and the Session Manager plugin on your Mac, once:
+
+```sh
+brew install awscli
+brew install --cask session-manager-plugin
+session-manager-plugin --version     # prints a version when installed correctly
+```
+
+Use your own administrator credentials (`shruti-admin`), not the deploy role. The instance IDs are on the deploy run's summary page under "outputs", or:
+
+```sh
+aws ec2 describe-instances --region us-east-1 \
+  --filters Name=tag:Project,Values=paxos-txn-store Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value, InstanceId, PrivateIpAddress]' --output table
+```
+
+**Grafana** (`node1`), then http://localhost:3000. The anonymous viewer is on; admin is `admin`/`admin`.
+
+```sh
+aws ssm start-session --region us-east-1 --target <node1 instance id> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["3000"],"localPortNumber":["3000"]}'
+```
+
+**Jaeger** (`node1`), then http://localhost:16686:
+
+```sh
+aws ssm start-session --region us-east-1 --target <node1 instance id> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["16686"],"localPortNumber":["16686"]}'
+```
+
+**Prometheus** works the same way with port `9090`. Each session runs until you press Ctrl-C; use one terminal per port.
+
+**A shell on a node:** `aws ssm start-session --region us-east-1 --target <instance id>`. You get `ssm-user`; use `sudo -i` for root. Useful places:
+- `docker ps` and `docker logs paxosd`
+- `/var/log/paxosd-setup.log`, the first-boot log
+- `/etc/paxosd/image-digest`
+
+**Rolling out a new image** keeps the node and its data. One node at a time, wait for `/readyz` before the next:
+
+```sh
+sudo /usr/local/sbin/paxosd-run sha256:<digest>
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/readyz    # wait for 200
+```
+
+### Leader-kill test
+
+The test kills the paxosd that leads the most shards, without warning, and measures how long until every shard has a leader again on the surviving nodes. Use two terminals with a shell on two different nodes (`aws ssm start-session …`, then `sudo -i`).
+
+**1. Find the leaders.** From any node, list who leads each shard:
+
+```sh
+for n in node1 node2 node3; do curl -s http://$n:9100/metrics | grep '^paxos_is_leader{.*} 1$'; done
+# paxos_is_leader{node="2",shard="0"} 1  ...
+```
+
+The victim is the node that appears most often. If that is `node1`, Prometheus, Grafana and Jaeger keep running, since only the paxosd container is killed.
+
+**2. Start the watcher on a surviving node** (terminal A). It prints a timestamp and the leader of each shard every 200 ms:
+
+```sh
+victim=node2   # the node from step 1
+while sleep 0.2; do
+  t=$(date +%s.%3N)
+  for n in node1 node2 node3; do
+    [ "$n" = "$victim" ] && continue
+    curl -s -m 0.5 http://$n:9100/metrics | grep '^paxos_is_leader{.*} 1$' | sed "s/^/$t /"
+  done
+done | tee /tmp/leaders.log
+```
+
+**3. Kill paxosd on the victim** (terminal B, on the victim). The restart policy is turned off first so Docker does not restart it at once; the timestamp is the kill time:
+
+```sh
+docker update --restart=no paxosd
+date +%s.%3N; kill -9 "$(docker inspect -f '{{.State.Pid}}' paxosd)"
+```
+
+**4. Measure.** For each shard the victim led, the recovery time is the first timestamp in `/tmp/leaders.log` where a surviving node leads it, minus the kill time. The clocks agree to about a millisecond (Amazon Time Sync). Example: kill at `…100.250` and `paxos_is_leader{node="3",shard="0"} 1` first at `…101.050` means 0.8 s for shard 0.
+
+Also watch in Grafana:
+- `paxos_leader_elections_total` should rise on the survivors.
+- `txn_in_doubt` should return to 0.
+
+**5. Bring the node back** (terminal B), then wait for it to catch up:
+
+```sh
+docker update --restart=unless-stopped paxosd && docker start paxosd
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/readyz    # 200 when caught up
+```
+
+Stop the watcher with Ctrl-C.
+
+### Destroying
+
+1. **Actions → destroy → Run workflow**, on `main`. **confirm:** type `destroy`, then choose **Run workflow**.
+   - Anything else fails at once, in the `confirm` job, before any approval is asked.
+2. **Review deployments → aws → Approve and deploy** for the **destroy** job. It plans the destroy, prints the plan (23 to destroy), and applies it. Every node's data disk is deleted with it.
+3. The last step, "list what is left" (`scripts/aws-leftovers.sh`), prints everything still tagged `Project=paxos-txn-store`:
+   - The bootstrap's state bucket, deploy role and OIDC provider are expected.
+   - Anything else is a warning, because the tagging API can keep listing deleted resources (terminated instances for up to an hour).
+   - The step fails only if EC2 still shows a non-terminated instance or the VPC.
+
+The bootstrap (state bucket, OIDC provider, deploy role) stays; it costs nothing while idle. To remove it as well, see [Undoing the bootstrap](#undoing-the-bootstrap).
+
+### Is everything deleted?
+
+After a destroy, as `shruti-admin` from your Mac (us-east-1). Every command except the last should print nothing, or `[]`:
+
+```sh
+export AWS_REGION=us-east-1 T=paxos-txn-store
+
+# Instances that are not terminated
+aws ec2 describe-instances --filters Name=tag:Project,Values=$T \
+  Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+  --query 'Reservations[].Instances[].InstanceId' --output text
+
+# EBS volumes (data disks are deleted with their instances)
+aws ec2 describe-volumes --filters Name=tag:Project,Values=$T --query 'Volumes[].VolumeId' --output text
+
+# The VPC (its subnets, route table, gateway and security group go with it).
+# Public IPv4 addresses are released with their instances.
+aws ec2 describe-vpcs --filters Name=tag:Project,Values=$T --query 'Vpcs[].VpcId' --output text
+
+# The node role and instance profile
+aws iam get-role --role-name $T-node 2>&1 | grep -q NoSuchEntity && echo "role: gone"
+aws iam get-instance-profile --instance-profile-name $T-node 2>&1 | grep -q NoSuchEntity && echo "instance profile: gone"
+
+# Everything still tagged: only the bootstrap's state bucket (and, if listed, its deploy role and OIDC provider)
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$T \
+  --query 'ResourceTagMappingList[].ResourceARN' --output text
+```
+
+Then check the bill: **Billing and Cost Management → Bills**, the current month's **EC2** and **VPC** lines (public IPv4 is billed under VPC). They should stop growing within a few hours. The $15 budget alert covers the rest.
+
+### Running Terraform by hand
+
+If a workflow cannot run (for example GitHub is down), the same stack can be applied as `shruti-admin`:
 
 ```sh
 cd deploy/terraform/cluster
 terraform init -backend-config="bucket=paxos-txn-store-tfstate-289112219115"
-terraform test                                   # offline: 4 passed
-terraform plan -var image_digest=sha256:<digest> -out=cluster.tfplan
+terraform plan -var image_digest=$(../../../scripts/resolve-image-digest.sh $(git rev-parse origin/main)) -out=cluster.tfplan
 terraform apply cluster.tfplan
-terraform output                                 # IDs, AZs, IPs, SSM port-forward commands
 ```
 
-The plan should create 23 resources:
-- **Network (10):** the VPC, 3 subnets, the internet gateway, the route table and 3 route table associations, plus the security group.
-- **Security group rules (7):** 3 ingress (7001, 9100 and 4317 from the group itself) and 4 egress (the same three ports to the group, and 443 to anywhere).
-- **IAM (3):** the role, its policy attachment and the instance profile.
-- **Nodes (3):** the instances.
+Both use the same state and the same lock. A hand-run apply while a workflow holds the lock waits or fails; it never overwrites.
 
-**Grafana and Jaeger** are reachable only by SSM port forwarding, with the commands in `terraform output`. You need the AWS CLI and the Session Manager plugin. Grafana's anonymous viewer is on, as in the local stack; its admin login is still `admin`/`admin`, reachable only through the tunnel.
+### Terraform CI
 
-**Rolling out a new image** does not replace the node: run `paxosd-run sha256:<digest>` on each node over SSM. `user_data` and the AMI are ignored after the first apply.
+`.github/workflows/terraform.yml` runs on pull requests that touch `deploy/terraform/`, or the compose, cluster, Prometheus and Grafana files the cluster stack reads. It needs no AWS access, and any finding fails it. For each stack it runs:
+- `terraform fmt -check`, `init -backend=false`, `validate` and `test`
+- tflint (v0.65.0 with the AWS ruleset 0.50.0, from `deploy/terraform/.tflint.hcl`)
+- checkov 3.4.0. Its skips are inline, each with its reason.
 
-**Cost while running** (us-east-1, on-demand):
+### Cost while running
+
+us-east-1, on-demand:
 
 | Item | Per hour |
 |---|---|
@@ -187,10 +396,4 @@ The plan should create 23 resources:
 | 3 public IPv4 addresses | $0.015 |
 | **Total** | **about $0.083** |
 
-That is about $2.00 a day, or $61 a month if left running, which is far over the $15 budget. Apply it for a session, then destroy it:
-
-```sh
-terraform destroy -var image_digest=sha256:<digest>
-```
-
-Traffic between AZs ($0.01/GB each way) adds to this under load.
+That is about $2.00 a day, or $61 a month if left running, which is far over the $15 budget. Deploy for a session, then destroy. Traffic between AZs ($0.01/GB each way) adds to this under load.

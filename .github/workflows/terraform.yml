@@ -1,0 +1,77 @@
+name: terraform
+
+# Offline checks of both Terraform stacks (docs/aws.md): no AWS credentials,
+# no backend. The cluster stack reads deploy/compose.yaml, cluster.json and
+# the Prometheus and Grafana configs, so changes to those run it too.
+on:
+  pull_request:
+    paths:
+      - "deploy/terraform/**"
+      - "deploy/compose.yaml"
+      - "deploy/cluster.json"
+      - "deploy/prometheus/**"
+      - "deploy/grafana/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: 1.17.1
+  TFLINT_VERSION: v0.65.0
+  CHECKOV_VERSION: 3.4.0
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  terraform:
+    name: terraform (${{ matrix.stack }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [bootstrap, cluster]
+    defaults:
+      run:
+        working-directory: deploy/terraform/${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false
+      - run: terraform validate
+      - run: terraform test
+
+  tflint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+      # The AWS ruleset version is pinned in deploy/terraform/.tflint.hcl.
+      - run: tflint --init --config="$PWD/deploy/terraform/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: |
+          for stack in bootstrap cluster; do
+            echo "--- $stack"
+            tflint --chdir="deploy/terraform/$stack" --config="$PWD/deploy/terraform/.tflint.hcl" --format=compact
+          done
+
+  checkov:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install "checkov==$CHECKOV_VERSION"
+      # Skips are inline (#checkov:skip=...) with their reasons.
+      - run: checkov --directory deploy/terraform --framework terraform --skip-download --compact

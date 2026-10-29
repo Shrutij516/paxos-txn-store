@@ -1,0 +1,79 @@
+name: destroy
+
+# Destroys deploy/terraform/cluster (the bootstrap stack stays), then lists
+# whatever still carries Project=paxos-txn-store (docs/aws.md).
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to delete the cluster and its data'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-cluster
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.17.1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+jobs:
+  # Outside the environment, so a mistyped confirmation fails at once
+  # instead of first asking a reviewer.
+  confirm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [[ $CONFIRM != destroy ]]; then
+            echo "::error::confirm must be exactly \"destroy\", got \"$CONFIRM\""
+            exit 1
+          fi
+
+  destroy:
+    needs: confirm
+    runs-on: ubuntu-24.04
+    environment: aws
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: deploy/terraform/cluster
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      # image_digest is required by the stack but unused when destroying.
+      - run: terraform plan -destroy -var "image_digest=sha256:$(printf '0%.0s' {1..64})" -out=destroy.tfplan
+
+      - name: show the plan
+        run: |
+          terraform show -no-color destroy.tfplan | tee plan.txt
+          { echo '```'; cat plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - run: terraform apply destroy.tfplan
+
+      - name: list what is left
+        if: always()
+        working-directory: .
+        run: scripts/aws-leftovers.sh

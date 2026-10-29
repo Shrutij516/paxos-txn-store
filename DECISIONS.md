@@ -356,6 +356,11 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Unverified until the first cluster apply:** nothing here can be run against AWS. The tag-on-create conditions assume the provider tags every one of these resources in its create call. `iam:PassRole` with `iam:PassedToService` is assumed to cover `AddRoleToInstanceProfile`. The first apply of the cluster stack will show any AccessDenied, and the fix belongs in this policy, not in a broader one.
   - **Untagged default resources:** the default security group, route table and network ACL that AWS creates with a VPC are untagged, so the cluster stack cannot adopt them (for example with `aws_default_security_group`) without widening this policy.
   - **Narrow by design:** a new kind of resource in the cluster stack (a load balancer, an Elastic IP, an EBS volume of its own) needs a bootstrap change and a re-apply by the operator first.
+  - **Update (Phase 8c-3):** three changes to the deploy policy, from fitting the cluster stack to it (docs/aws.md):
+    - **Attaching the gateway:** `ec2:AttachInternetGateway` and `ec2:DetachInternetGateway` moved to `Ec2ManageTagged`, because both calls authorize the gateway as well as the VPC (gap G1).
+    - **PassRole condition:** `iam:PassRole` for the node role now uses `StringEqualsIfExists` on `iam:PassedToService` = `ec2.amazonaws.com`. `RunInstances` sends the key and is still held to EC2. `AddRoleToInstanceProfile` checks PassRole without it and would otherwise be refused (gap G2). The resource is still only `role/paxos-txn-store-node*`.
+    - **Tagging API:** `TagsReadForCleanupCheck` (`tag:GetResources` on `*`, read-only; the tagging API has no resource-level permissions) lets `destroy.yml` list what is left.
+    - **Checkov:** the state bucket's four checkov findings (KMS, access logs, replication, event notifications) are skipped inline with reasons.
 
 ## 41. AWS cluster: three t3.small nodes in three AZs, public subnets, SSM, observability on node 1
 
@@ -391,12 +396,42 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Replacing an instance to deploy a new image:** its data disk is deleted with it. `user_data` and the AMI are therefore in `ignore_changes`.
   - **Managing the default security group, network ACL or main route table:** they are untagged and outside the deploy role's policy. Nothing uses them.
 - **Tradeoff:**
-  - **Cost if left running:** about $0.083/h, or $61/month, which is over the $15 budget. The cluster must be destroyed after use, and the destroy workflow is a later phase.
+  - **Cost if left running:** about $0.083/h, or $61/month, which is over the $15 budget. The cluster must be destroyed after use (`destroy.yml`, entry 42).
   - **Data lives on the instances:** the data disks are deleted with them (`delete_on_termination`), so a destroy or a replaced node loses that replica's state. A node that has lost its Paxos promises and accepted values must not rejoin under the same ID, since it could break safety. A replaced node therefore means rebuilding the cluster (destroy and apply), which is acceptable for a demo cluster.
   - **Node 1 is special:** losing it loses the dashboards and traces (Prometheus keeps two days, in the container), not the data. Jaeger's in-memory store is capped only by its 400 MB memory limit.
   - **Each public IP is an address on the internet:** only the security group stands between it and paxosd's ports, and the offline test guards that group.
   - **Grafana's admin login** is the image default; it is reachable only through an SSM tunnel.
   - **Deploy role gaps:** the deploy role is not yet enough for this stack. Gap G1 (attaching the internet gateway) blocks the first apply, G2 is unverified, and others matter only for later changes (docs/aws.md). They are fixed in the bootstrap stack, which this phase does not change.
+  - **Update (Phase 8c-3):** G1 and G2 are fixed in the bootstrap (entry 40).
+
+## 42. Deploying with two approved jobs (plan, then apply), digest resolution and a smoke check
+
+- **What:** three workflows run the cluster stack (docs/aws.md). There are no AWS keys anywhere: credentials come from GitHub OIDC with 1-hour sessions.
+  - **`deploy.yml`** is started by hand and has two jobs, both in the `aws` environment, so each waits for approval:
+    - **`plan`** resolves the image digest, runs `terraform plan -out`, prints the plan in the log and on the summary page, and uploads it as an artifact kept for 1 day.
+    - **`apply`** downloads that file and runs `terraform apply` on it. It then runs `scripts/aws-smoke.sh`, which waits for the three nodes in SSM and, on each node over `SendCommand`, waits for paxosd's `/readyz` and checks the running digest.
+    - **Digest:** an empty `image_digest` input means the image `release.yml` pushed for the commit. `scripts/resolve-image-digest.sh` asks ghcr.io anonymously for `paxos-txn-store:<sha>` and fails if it is missing. A given digest is checked to exist.
+  - **`destroy.yml`** needs the input `confirm` = `destroy`, checked in a job outside the environment. It then plans the destroy, prints it, applies it, and lists what is still tagged `Project=paxos-txn-store` (`scripts/aws-leftovers.sh`).
+  - **Concurrency:** both use the concurrency group `terraform-cluster` without cancelling, so only one Terraform run touches the state at a time and none is killed halfway.
+  - **`terraform.yml`** checks both stacks offline on pull requests: fmt, validate, `terraform test`, tflint and checkov, at pinned versions.
+- **Why:**
+  - **Two jobs, two approvals:** the reviewer approves the plan job and then sees the plan before approving the apply. Applying the saved file means what runs is what was read. Terraform also refuses a saved plan if the state changed in between, so a plan that went stale while waiting cannot apply.
+  - **Digests, not tags:** the cluster stack only accepts a digest (entry 41). Resolving it from the commit SHA in the workflow keeps the common case to one click, and pins what was deployed in the run's summary even if the tag is pushed again later.
+  - **The smoke check:** a successful apply only means the API calls worked. The cluster is useful when every node runs paxosd, has joined its peers and sees a leader for every shard. That is exactly what `/readyz` reports, so checking it on every node from inside the VPC (over SSM, with no inbound port) proves the deploy end to end. Checking the digest catches the case `ignore_changes` creates: a deploy that changes nothing on existing nodes.
+  - **A separate confirm job:** a typo fails at once, instead of first asking a reviewer to approve a run that will fail.
+- **Rejected:**
+  - **One job that plans and applies** (`terraform apply -auto-approve`): nobody sees the plan before it runs.
+  - **Approving only the apply:** the plan job also assumes the deploy role and reads the state, so it belongs behind the same gate.
+  - **Re-planning in the apply job:** the applied plan could differ from the reviewed one.
+  - **Deploying the `:sha` tag directly:** tags are mutable, and the stack rejects them.
+  - **A smoke check from the runner over the network:** it would need a client CIDR open to GitHub's address ranges.
+  - **Rolling out a new image automatically in deploy:** a rolling restart is its own feature, with its own safety rules (one node at a time, waiting for `/readyz`). The smoke check reports a stale image instead, and `paxosd-run` does the rollout.
+- **Tradeoff:**
+  - **Public artifacts:** the saved plan is an artifact of a public repository. It holds resource IDs, private IPs and the account ID (already in the bucket name), and no secrets. It is kept for 1 day.
+  - **Waiting on approvals:** two approvals per deploy is slower, and a run left waiting holds the concurrency group for every later deploy or destroy.
+  - **Smoke check duration:** it can take up to 25 minutes on a first deploy (10 for SSM, 15 for Docker, image pulls and leader election), all within the role's 1-hour session.
+  - **What the leftover check can trust:** the tagging API can list resources for a while after they are deleted, so only EC2's own view (non-terminated instances, the VPC) fails the destroy; other ARNs are warnings.
+  - **Bootstrap changes are manual:** policy changes (G1, G2, `tag:GetResources`) only take effect when the operator re-applies the bootstrap, which is a manual step outside any workflow (docs/aws.md).
 
 ## Future work
 
