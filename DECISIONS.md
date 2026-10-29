@@ -357,6 +357,47 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Untagged default resources:** the default security group, route table and network ACL that AWS creates with a VPC are untagged, so the cluster stack cannot adopt them (for example with `aws_default_security_group`) without widening this policy.
   - **Narrow by design:** a new kind of resource in the cluster stack (a load balancer, an Elastic IP, an EBS volume of its own) needs a bootstrap change and a re-apply by the operator first.
 
+## 41. AWS cluster: three t3.small nodes in three AZs, public subnets, SSM, observability on node 1
+
+- **What:** `deploy/terraform/cluster/` builds the cluster (docs/aws.md):
+  - **Network:** one VPC in us-east-1 with three public subnets in zones `use1-az1`, `use1-az2` and `use1-az4`. The zones are pinned by zone ID and read through `aws_availability_zones`. There is one internet gateway, one route table, and no NAT gateway.
+  - **Nodes:** three t3.small instances, one per zone, at the fixed private IPs 10.0.1.10, 10.0.2.10 and 10.0.3.10. They run Amazon Linux 2023 (the AMI comes from AWS's public SSM parameter), require IMDSv2 with hop limit 1, and use standard CPU credits. Each has an encrypted gp3 root disk and an encrypted gp3 data disk at `/data`.
+  - **Access:** there is no SSH and no key pair; operators use SSM. The node role has only `AmazonSSMManagedInstanceCore`.
+  - **paxosd:** each node runs it in Docker from `ghcr.io/shrutij516/paxos-txn-store@<digest>`. The digest is a required, validated variable and never a tag. The flags are read from the node's service in `deploy/compose.yaml`, and `deploy/cluster.json` is used unchanged; `/etc/hosts` and `--add-host` map its `node1` to `node3` names, and `jaeger`, to the fixed IPs.
+  - **Observability:** node 1 also runs Prometheus, Grafana and Jaeger. They use the local stack's configs and image tags, also read from the repository. The UIs listen on 127.0.0.1 and are reached by SSM port forwarding.
+  - **Security group:** inbound only from itself, on 7001 (paxosd), 9100 (metrics) and 4317 (OTLP to Jaeger), plus optional client CIDRs on 7001 (none by default, and `/0` is rejected). Outbound is the same three ports to itself and 443 to anywhere.
+  - **Offline checks:** `tests/cluster.tftest.hcl` runs with a mocked provider. It fails on:
+    - ingress from `0.0.0.0/0` or `::/0`, or on all protocols
+    - any rule covering port 22
+    - IMDSv1
+    - an unencrypted volume
+    - an instance type outside the bootstrap's allowlist (read from `bootstrap/variables.tf`)
+    - paxosd not started from the digest
+    - nodes that are not in three different zones, or IPs that drift
+- **Why:**
+  - **t3.small (2 GiB):** paxosd used about 0.5 GB under the chaos workload (the nightly run's sampler showed ~500 MB RSS per node). Node 1 adds Prometheus, Grafana and Jaeger, about 0.25 GB each in the same samples, and capped with `--memory` at 400, 300 and 400 MB. With Docker and the OS that does not fit in a t3.micro's 1 GiB, and it does in 2 GiB. t3.small is in the deploy role's `allowed_instance_types`. x86 matches the single-arch amd64 image. Standard credits mean a busy node is throttled instead of billed for surplus credits.
+  - **Three AZs in one region:** each shard has a replica on every node, so one zone can fail and every shard keeps a majority. One region keeps peer latency in the low milliseconds, and the bootstrap role is scoped to us-east-1. The zones are pinned by ID: picking the first three names would move subnets, and replace nodes, if a new zone sorted earlier. `use1-az3` is avoided because it lacks current instance families.
+  - **Public subnets without NAT:** a NAT gateway costs about $0.045/h plus data processing, more than the three nodes together. A public IPv4 address per node costs $0.005/h and gives the same egress to GHCR, SSM and the package repositories. The security group admits nothing from outside, and nothing listens on a public interface: the instance only has its private address, and the public IP is translated by the internet gateway.
+  - **Fixed private IPs:** `deploy/cluster.json` names peers statically, and paxosd has no discovery. Fixed IPs and host aliases let the same file, the same Prometheus config and the same Grafana provisioning run locally and on AWS without templating.
+  - **SSM instead of SSH:** no open port, no key to distribute or rotate, and access is checked by IAM and logged in CloudTrail. Rolling out an image is `paxosd-run <digest>` over SSM `SendCommand`, which the deploy role may run only on instances tagged with this project.
+  - **Observability on node 1:** one more instance for Prometheus, Grafana and Jaeger would add ~$0.02/h and its own disk, for a cluster that exists only while a demo runs. Node 1 has the memory, and the UIs stay off the network.
+- **Rejected:**
+  - **t3.micro:** 1 GiB is too little for node 1.
+  - **t4g/Graviton:** the image is single-arch amd64, and t4g is not in the bootstrap allowlist.
+  - **Private subnets with a NAT gateway, or VPC endpoints for SSM, ECR and S3:** these cost more than the nodes themselves.
+  - **SSH with a key pair:** an open port and a long-lived key.
+  - **Discovery through tags or DNS:** it needs code in paxosd and removes nothing the static config does not already do.
+  - **A separate observability instance:** cost.
+  - **Replacing an instance to deploy a new image:** its data disk is deleted with it. `user_data` and the AMI are therefore in `ignore_changes`.
+  - **Managing the default security group, network ACL or main route table:** they are untagged and outside the deploy role's policy. Nothing uses them.
+- **Tradeoff:**
+  - **Cost if left running:** about $0.083/h, or $61/month, which is over the $15 budget. The cluster must be destroyed after use, and the destroy workflow is a later phase.
+  - **Data lives on the instances:** the data disks are deleted with them (`delete_on_termination`), so a destroy or a replaced node loses that replica's state. A node that has lost its Paxos promises and accepted values must not rejoin under the same ID, since it could break safety. A replaced node therefore means rebuilding the cluster (destroy and apply), which is acceptable for a demo cluster.
+  - **Node 1 is special:** losing it loses the dashboards and traces (Prometheus keeps two days, in the container), not the data. Jaeger's in-memory store is capped only by its 400 MB memory limit.
+  - **Each public IP is an address on the internet:** only the security group stands between it and paxosd's ports, and the offline test guards that group.
+  - **Grafana's admin login** is the image default; it is reachable only through an SSM tunnel.
+  - **Deploy role gaps:** the deploy role is not yet enough for this stack. Gap G1 (attaching the internet gateway) blocks the first apply, G2 is unverified, and others matter only for later changes (docs/aws.md). They are fixed in the bootstrap stack, which this phase does not change.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.

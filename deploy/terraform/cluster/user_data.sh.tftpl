@@ -1,0 +1,101 @@
+#!/bin/bash
+# paxosd node ${node_id}, rendered by deploy/terraform/cluster/instances.tf.
+# cloud-init runs this once, on first boot. Log: /var/log/paxosd-setup.log.
+set -euxo pipefail
+exec > >(tee -a /var/log/paxosd-setup.log) 2>&1
+
+# Names used by deploy/cluster.json and deploy/prometheus/compose.yml.
+cat >> /etc/hosts <<'HOSTS'
+%{ for name, ip in hosts ~}
+${ip} ${name}
+%{ endfor ~}
+HOSTS
+
+# Data disk (/dev/sdf, a udev symlink to the NVMe device): format only if
+# it has no filesystem yet, mount it by label at /data.
+dev=/dev/sdf
+for _ in $(seq 1 60); do [ -e "$dev" ] && break; sleep 2; done
+dev=$(readlink -f "$dev")
+if ! blkid "$dev" >/dev/null; then
+  mkfs.ext4 -q -L paxos-data "$dev"
+fi
+mkdir -p /data
+grep -q '^LABEL=paxos-data ' /etc/fstab || echo 'LABEL=paxos-data /data ext4 defaults,nofail 0 2' >> /etc/fstab
+mountpoint -q /data || mount /data
+chown 65532:65532 /data # the image's nonroot user
+
+# Docker, started only once /data is mounted (also after a reboot).
+dnf install -y docker
+mkdir -p /etc/systemd/system/docker.service.d
+printf '[Unit]\nRequiresMountsFor=/data\n' > /etc/systemd/system/docker.service.d/data.conf
+systemctl daemon-reload
+systemctl enable --now docker
+
+install -d /etc/paxosd
+cat > /etc/paxosd/cluster.json <<'CLUSTER_JSON'
+${cluster_json}
+CLUSTER_JSON
+
+# paxosd-run <sha256 digest>: (re)start paxosd from that image. Also what a
+# deploy runs over SSM to roll out a new image.
+cat > /usr/local/sbin/paxosd-run <<'PAXOSD_RUN'
+#!/bin/bash
+set -euo pipefail
+digest=$1
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "paxosd-run: not a sha256 digest: $digest" >&2; exit 1; }
+image=ghcr.io/shrutij516/paxos-txn-store@$digest
+docker pull "$image"
+docker rm -f paxosd 2>/dev/null || true
+docker run -d --name paxosd --restart unless-stopped \
+  --stop-signal SIGTERM --stop-timeout 15 \
+  --log-opt max-size=50m --log-opt max-file=3 \
+%{ for name, ip in hosts ~}
+  --add-host ${name}:${ip} \
+%{ endfor ~}
+  -p 7001:7001 -p 9100:9100 \
+  -v /etc/paxosd/cluster.json:/etc/paxosd/cluster.json:ro -v /data:/data \
+  --health-cmd "/paxosd -probe http://127.0.0.1:9100/readyz" --health-interval 2s --health-timeout 3s --health-retries 30 \
+  "$image" ${join(" ", paxosd_args)}
+echo "$digest" > /etc/paxosd/image-digest
+PAXOSD_RUN
+chmod 755 /usr/local/sbin/paxosd-run
+/usr/local/sbin/paxosd-run '${trimprefix(image, "ghcr.io/shrutij516/paxos-txn-store@")}'
+%{ if observability ~}
+
+# Node 1: Prometheus, Grafana and Jaeger, with the local stack's configs.
+# UIs listen on 127.0.0.1 only (reach them with SSM port forwarding);
+# Jaeger's OTLP port is on the private IP for the other nodes' traces.
+install -d /etc/paxos-obs/grafana/provisioning/datasources /etc/paxos-obs/grafana/provisioning/dashboards
+cat > /etc/paxos-obs/prometheus.yml <<'PROMETHEUS_YML'
+${prometheus.config}
+PROMETHEUS_YML
+cat > /etc/paxos-obs/grafana/provisioning/datasources/prometheus.yaml <<'GRAFANA_DATASOURCE'
+${grafana.datasource}
+GRAFANA_DATASOURCE
+cat > /etc/paxos-obs/grafana/provisioning/dashboards/paxos.yaml <<'GRAFANA_DASHBOARDS'
+${grafana.dashboards}
+GRAFANA_DASHBOARDS
+cat > /etc/paxos-obs/dashboard.json <<'GRAFANA_DASHBOARD'
+${grafana.dashboard}
+GRAFANA_DASHBOARD
+
+docker network create obs 2>/dev/null || true
+docker run -d --name prometheus --network obs --restart unless-stopped --memory 400m \
+%{ for name, ip in hosts ~}
+  --add-host ${name}:${ip} \
+%{ endfor ~}
+  -p 127.0.0.1:9090:9090 \
+  -v /etc/paxos-obs/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  ${prometheus.image} ${join(" ", prometheus.command)}
+docker run -d --name grafana --network obs --restart unless-stopped --memory 300m \
+%{ for k, v in grafana.environment ~}
+  -e ${k}=${v} \
+%{ endfor ~}
+  -p 127.0.0.1:3000:3000 \
+  -v /etc/paxos-obs/grafana/provisioning:/etc/grafana/provisioning:ro \
+  -v /etc/paxos-obs/dashboard.json:/var/lib/grafana/dashboards/paxos-txn-store.json:ro \
+  ${grafana.image}
+docker run -d --name jaeger --network obs --restart unless-stopped --memory 400m \
+  -p 127.0.0.1:16686:16686 -p ${hosts["node1"]}:4317:4317 \
+  ${jaeger_image}
+%{ endif ~}
