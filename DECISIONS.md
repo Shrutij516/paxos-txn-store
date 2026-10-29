@@ -323,7 +323,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **What:** `deploy/terraform/bootstrap/` is applied once by hand with local state (docs/aws.md). It creates 10 resources:
   - **State bucket:** `paxos-txn-store-tfstate-<account id>`, with the account ID taken from `aws_caller_identity`. Versioning, SSE-S3 (AES256), all four public access blocks, BucketOwnerEnforced, a policy that denies any request not made over TLS, old versions expiring after 90 days, and `prevent_destroy`.
   - **GitHub OIDC provider:** audience `sts.amazonaws.com`.
-  - **Deploy role `paxos-txn-store-deploy`:** 1-hour sessions. It trusts only the token subject `repo:Shrutij516/paxos-txn-store:environment:aws` with audience `sts.amazonaws.com`, and has one inline permissions policy (6,637 characters, under the 10,240 limit for inline role policies).
+  - **Deploy role `paxos-txn-store-deploy`:** 1-hour sessions. It trusts only the token subject `repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws` (see the update below) with audience `sts.amazonaws.com`, and has one inline permissions policy (6,637 characters, under the 10,240 limit for inline role policies).
   - **Locking:** the cluster stack will keep its state under `cluster/` in the bucket and lock it with `use_lockfile = true` (S3 conditional writes). There is no DynamoDB table.
   - **What the deploy role may do:**
     - **EC2:** it may create VPCs, subnets, internet gateways, route tables, security groups and instances only with `Project=paxos-txn-store` in the create request. It may change, re-tag or delete them only if they already carry that tag. It may launch only Amazon-owned AMIs, only into our tagged subnets and security groups, and only t3/t3a micro to medium (`allowed_instance_types`).
@@ -361,6 +361,9 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
     - **PassRole condition:** `iam:PassRole` for the node role now uses `StringEqualsIfExists` on `iam:PassedToService` = `ec2.amazonaws.com`. `RunInstances` sends the key and is still held to EC2. `AddRoleToInstanceProfile` checks PassRole without it and would otherwise be refused (gap G2). The resource is still only `role/paxos-txn-store-node*`.
     - **Tagging API:** `TagsReadForCleanupCheck` (`tag:GetResources` on `*`, read-only; the tagging API has no resource-level permissions) lets `destroy.yml` list what is left.
     - **Checkov:** the state bucket's four checkov findings (KMS, access logs, replication, event notifications) are skipped inline with reasons.
+  - **Update (Phase 8c-3b): the subject carries immutable IDs.** The first deploy was refused (`Not authorized to perform sts:AssumeRoleWithWebIdentity`). CloudTrail showed the token's subject as `repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws`: GitHub now writes the owner's and the repository's numeric IDs after their names. The trust policy now matches that string exactly (`StringEquals`, no wildcards), built from `github_repository` and the new variables `github_owner_id` and `github_repo_id`. The offline test asserts the exact string.
+    - **Why IDs are safer than names:** a name can move. If the repository or the account were renamed, or deleted, someone else could register the old name, and a name-only subject would let their workflows in an environment called `aws` assume the deploy role. The numeric IDs are assigned once and never reused, so a squatter with the same names gets a different subject and is refused. A rename of our own repository keeps working once the name in `github_repository` is updated, and a squatter never matches.
+    - **Rejected:** a `StringLike` pattern such as `repo:Shrutij516*/paxos-txn-store*:environment:aws`. It would accept both formats, but it would also accept a name that merely starts the same way, which reopens what the IDs close.
 
 ## 41. AWS cluster: three t3.small nodes in three AZs, public subnets, SSM, observability on node 1
 
@@ -432,6 +435,56 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Smoke check duration:** it can take up to 25 minutes on a first deploy (10 for SSM, 15 for Docker, image pulls and leader election), all within the role's 1-hour session.
   - **What the leftover check can trust:** the tagging API can list resources for a while after they are deleted, so only EC2's own view (non-terminated instances, the VPC) fails the destroy; other ARNs are warnings.
   - **Bootstrap changes are manual:** policy changes (G1, G2, `tag:GetResources`) only take effect when the operator re-applies the bootstrap, which is a manual step outside any workflow (docs/aws.md).
+
+## Incidents
+
+Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.
+
+### I1. The nightly 20-minute chaos run never passed
+
+- **Symptom:** every scheduled 20-minute chaos run on `main` failed (about 24 minutes in) or was cancelled at the 50-minute job timeout, from the first nightly run in Phase 8a until 2026-10-28. The 2-minute pull-request runs passed. The last log line was `The runner has received a shutdown signal`, about 90 s after the last fault ended, followed by `The operation was canceled`. The `report` and `tear down` steps, both `if: always()`, were skipped with 0 s.
+- **Root cause:** the chaos runner ran out of memory in the strict-serializability checker, so the runner VM itself went down, which is why even the `if: always()` steps never ran. `CheckStrict` added a real-time edge for every pair of committed transactions with `b.Begin > a.End`, which is O(N²) entries in nested Go maps. A 20-minute run commits about 78,000 transactions, which is about 3 billion edges.
+- **Evidence:**
+  - **Timing:** the run history showed no green 20-minute run ever.
+  - **Measurements:** `/usr/bin/time -v` on CI-rate histories, on a 4-vCPU, 15 GB machine without swap:
+
+    | Run length (committed txns) | Peak RSS of the old check |
+    |---|---|
+    | 2 min (7,800) | 1.3 GB (a real 2-minute check path: 1.38 GB) |
+    | 4 min (15,600) | 4.8 GB |
+    | 6 min (23,400) | 11.5 GB |
+    | 8, 10 and 20 min | over 13 GB, killed 65 to 77 s into the check |
+
+    The 65 to 77 s match the time between the end of the faults and the runner's death.
+  - **On the runner:** a temporary sampler in `chaos.yml` (`free`, `df`, top processes every 15 s) was added for the next run. That run already had the fix and passed, with about 2.9 GB in use at the end. The sampler showed that the runner has 16 GB of memory and 3 GB of swap.
+- **Fix:** entry 39. Real-time order now goes through a chain of time-barrier nodes, O(N), with the old pairwise checker kept as a test oracle and 20,000 random histories compared against it. The 20-minute size now needs 112 MB and 0.5 s. Run 40772564912 (20 minutes, 68,772 committed transactions, no violations) was the first green one.
+- **Lesson:** a check that passes on the short run says nothing about the long one. Measure how memory and time grow with the input before relying on a nightly job. When the runner dies, `if: always()` steps do not run, so a failure that leaves no report points at the machine, not the test.
+
+### I2. The scheduled govulncheck was red for four nights
+
+- **Symptom:** `vulncheck.yml` failed on `main` every night from 2026-10-24 to 2026-10-27, on unchanged code.
+- **Root cause:** a new standard-library advisory, GO-2026-6809 (CVE-2026-111943: `crypto/x509` `Certificate.Verify` did not reject known compromised intermediate certificates), fixed in go1.26.10 and go1.27.3. `go.mod`, and so every CI job, was on go1.26.9.
+  - **A second problem found alongside:** Dependabot pull request #26 had moved the Dockerfile's builder to golang 1.27.2. The image was built with a Go line CI never tested, and 1.27.2 was itself affected.
+- **Evidence:**
+  - **The failure:** the failing job's log, read through the GitHub API, said `govulncheck: GO-2026-6809 is reachable`. The advisory's record in golang/vulndb gave the package and the fixed versions. govulncheck could not be re-run in the sandbox, because vuln.go.dev is blocked there.
+  - **The drift:** comparing the Dockerfile's `FROM` line with `go.mod` showed the builder on a different Go line.
+- **Fix:** entry 38.
+  - **One Go version:** `go 1.26.10` in `go.mod` is the single source. Every `setup-go` step reads it, and the Dockerfile builder is the same patch, pinned by digest.
+  - **No automatic Go-line upgrades:** Dependabot ignores minor and major updates of the golang image, so moving to a new Go line is a deliberate change.
+  - **Runners:** pinned to `ubuntu-24.04` in the same change.
+- **Lesson:** a red scheduled run on `main` is an alert, not noise; four nights passed before anyone looked. The Go version must have one source of truth: a version bump that touches only the image, or only `go.mod`, produces something CI never tested.
+
+### I3. The first deploy could not assume the deploy role
+
+- **Symptom:** the first `deploy.yml` run failed at `aws-actions/configure-aws-credentials` with `Not authorized to perform sts:AssumeRoleWithWebIdentity`, before Terraform ran.
+- **Root cause:** GitHub's OIDC token now puts the owner's and the repository's immutable numeric IDs in the subject:
+  - **Sent by GitHub:** `repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws`
+  - **Expected by the trust policy:** exactly `repo:Shrutij516/paxos-txn-store:environment:aws`
+
+  The trust policy used `StringEquals`, so the two never matched.
+- **Evidence:** CloudTrail's `AssumeRoleWithWebIdentity` event for the refused call recorded the token's subject. The two IDs match the fields `owner.id` and `id` of `https://api.github.com/repos/Shrutij516/paxos-txn-store`.
+- **Fix:** entry 40, update for Phase 8c-3b. The trust policy builds the subject from the repository name plus the variables `github_owner_id` and `github_repo_id`, still with `StringEquals` and no wildcards. The offline test asserts the exact string and fails on the old format. The IDs also protect against a renamed or deleted repository whose name someone else registers.
+- **Lesson:** the offline tests checked the trust policy against our own idea of the token, not against a real one. Formats owned by another service can change, so the first real run is the test that counts. CloudTrail records the claims of every refused web-identity call, which makes a mismatch quick to diagnose. When adapting, keep an exact match instead of loosening it to a pattern.
 
 ## Future work
 

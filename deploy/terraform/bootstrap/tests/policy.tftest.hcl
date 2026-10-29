@@ -89,9 +89,9 @@ run "render" {
   assert {
     condition = jsondecode(data.aws_iam_policy_document.deploy_trust.json).Statement[0].Condition.StringEquals == {
       "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-      "token.actions.githubusercontent.com:sub" = "repo:Shrutij516/paxos-txn-store:environment:aws"
+      "token.actions.githubusercontent.com:sub" = "repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws"
     }
-    error_message = "trust must require aud=sts.amazonaws.com and the repo's aws environment as sub, nothing broader"
+    error_message = "trust must require aud=sts.amazonaws.com and exactly repo:Shrutij516@90023638/paxos-txn-store@1396843261:environment:aws as sub (GitHub's subject with immutable owner and repo IDs), nothing broader"
   }
 
   # The only statements allowed to use Resource "*" (DECISIONS.md entry 40).

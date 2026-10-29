@@ -16,6 +16,28 @@ variable "github_repository" {
   default     = "Shrutij516/paxos-txn-store"
 }
 
+variable "github_owner_id" {
+  description = "Immutable numeric ID of the repository owner (api.github.com/repos/<owner>/<name> field owner.id). GitHub puts it in the token's sub claim."
+  type        = string
+  default     = "90023638"
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_owner_id))
+    error_message = "github_owner_id must be the numeric owner ID."
+  }
+}
+
+variable "github_repo_id" {
+  description = "Immutable numeric ID of the repository (api.github.com/repos/<owner>/<name> field id). GitHub puts it in the token's sub claim."
+  type        = string
+  default     = "1396843261"
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repo_id))
+    error_message = "github_repo_id must be the numeric repository ID."
+  }
+}
+
 variable "github_environment" {
   description = "GitHub environment a job must run in to assume the deploy role."
   type        = string
