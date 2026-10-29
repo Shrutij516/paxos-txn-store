@@ -1,6 +1,10 @@
 # The cluster stack's remote state. Locking uses S3 conditional writes
 # (backend "s3" { use_lockfile = true }), so there is no DynamoDB table.
 resource "aws_s3_bucket" "state" {
+  #checkov:skip=CKV_AWS_145:SSE-S3 (AES256) on purpose; a KMS key adds no access control over IAM and the bucket policy here and costs money (DECISIONS.md entry 40)
+  #checkov:skip=CKV_AWS_18:access logs would need a second bucket; the bucket is private, TLS-only and reached by one role, and CloudTrail records its API calls
+  #checkov:skip=CKV_AWS_144:no cross-region replication: versioning covers mistakes, and losing us-east-1 also loses everything this state describes
+  #checkov:skip=CKV2_AWS_62:no event notifications: nothing consumes them; Terraform is the only writer
   bucket = "${var.project}-tfstate-${local.account_id}"
 
   lifecycle {

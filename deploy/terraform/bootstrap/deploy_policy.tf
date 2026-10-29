@@ -43,16 +43,13 @@ data "aws_iam_policy_document" "deploy" {
     }
   }
 
-  # Creating things inside a VPC, or attaching a gateway to it, also needs
-  # the VPC to be one of ours.
+  # Creating things inside a VPC also needs the VPC to be one of ours.
   statement {
     sid = "Ec2UseTaggedVpc"
     actions = [
       "ec2:CreateSubnet",
       "ec2:CreateRouteTable",
       "ec2:CreateSecurityGroup",
-      "ec2:AttachInternetGateway",
-      "ec2:DetachInternetGateway",
     ]
     resources = ["${local.ec2_arn}:vpc/*"]
 
@@ -150,6 +147,9 @@ data "aws_iam_policy_document" "deploy" {
       "ec2:DeleteSubnet",
       "ec2:ModifySubnetAttribute",
       "ec2:DeleteInternetGateway",
+      # Both the gateway and the VPC are authorized, so both must be ours.
+      "ec2:AttachInternetGateway",
+      "ec2:DetachInternetGateway",
       "ec2:DeleteRouteTable",
       "ec2:CreateRoute",
       "ec2:ReplaceRoute",
@@ -276,13 +276,18 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["${local.iam_arn}:instance-profile/${local.node_name}*"]
   }
 
+  # PassRole is checked twice for the node role: by RunInstances, with
+  # iam:PassedToService = ec2.amazonaws.com in the request, and by
+  # AddRoleToInstanceProfile, without that key. StringEqualsIfExists
+  # allows the second and still pins the first (and any other request that
+  # names a service) to EC2. Only the node role's ARN is passable.
   statement {
     sid       = "IamPassNodeRoleToEc2"
     actions   = ["iam:PassRole"]
     resources = ["${local.iam_arn}:role/${local.node_name}*"]
 
     condition {
-      test     = "StringEquals"
+      test     = "StringEqualsIfExists"
       variable = "iam:PassedToService"
       values   = ["ec2.amazonaws.com"]
     }
@@ -314,6 +319,16 @@ data "aws_iam_policy_document" "deploy" {
     sid       = "SsmRunShellScriptDocument"
     actions   = ["ssm:SendCommand"]
     resources = ["arn:${local.partition}:ssm:${local.region}::document/AWS-RunShellScript"]
+  }
+
+  # ---- Cleanup check ----
+
+  # destroy.yml lists whatever still carries Project=<project> afterwards.
+  # The tagging API has no resource-level permissions. Read-only.
+  statement {
+    sid       = "TagsReadForCleanupCheck"
+    actions   = ["tag:GetResources"]
+    resources = ["*"]
   }
 
   # Command status and the managed-instance list have no resource-level
