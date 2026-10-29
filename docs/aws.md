@@ -432,3 +432,38 @@ us-east-1, on-demand:
 | **Total** | **about $0.083** |
 
 That is about $2.00 a day, or $61 a month if left running, which is far over the $15 budget. Deploy for a session, then destroy. Traffic between AZs ($0.01/GB each way) adds to this under load.
+
+## Results: first AWS run
+
+First deploy of the cluster on 2026-10-29:
+- **Runs:** deploy run 40796771306, destroy run 40802488798.
+- **Image:** `sha256:be9ad171938572cfb85e069fc6434107f982ffb851f27ad6e8a002df89d7c0de`.
+- **Setup:** three t3.small nodes, one in each of three AZs in us-east-1. **No client load**: the cluster was idle apart from heartbeats.
+
+**Deploy and smoke check:** the apply succeeded and the smoke check passed. All three nodes answered `/readyz` 200 and ran the same image digest.
+
+**Leader failover**, measured with the [leader-kill test](#leader-kill-test):
+
+| Run | Killed (SIGKILL) | Shards it led | New leaders first seen | Failover |
+|---|---|---|---|---|
+| 1 | paxosd on node3 at 1793237516.419 | 1 | node2 leads shard 1 at 1793237516.766 | under 0.35 s |
+| 2 | paxosd on node2 at 1793237894.499 | 0 and 1 | node3 leads shard 0, node1 leads shard 1, both by 1793237894.778 | under 0.28 s for both shards |
+
+How these were measured:
+- **Timestamps:** the kill time is `date +%s.%3N` on the victim, just before `kill -9`. The "first seen" time is the first line of the watcher on a surviving node (node2 in run 1). The watcher polls every node's `paxos_is_leader` every 200 ms; in run 2 it started at 1793237884.867.
+- **Resolution:** about 200 ms. A failover is "under" the measured time: the new leader took over at some point after the previous sample. The node clocks are synchronised by Amazon Time Sync to well under that.
+
+**Rejoin (incident I4):**
+- **Symptom:** after each restart, the restarted node's `/readyz` stayed 503 (`shard 2: no known leader`) for a long time. node1 had led shard 2 throughout.
+  - node3, down about 3 minutes, took **146 s** to become ready.
+  - node2, down about 1 minute, took **32 s**.
+- **Cause:** gRPC's reconnect backoff on the leaders' connections to the restarted node, which grows to 120 s while a peer is down (DECISIONS.md I4).
+- **Fix:** capped at 1 s in Phase 8c-4. Locally, the same 60 s and 180 s downtimes now give about 1 s instead of 11 s and 116 s. Not yet re-measured on AWS.
+
+**Destroy:** all 23 resources were destroyed and the instances terminated. Only the bootstrap's state bucket, deploy role and OIDC provider remain.
+
+**Caveats:**
+- **No load:** with no client load, a new leader has no in-flight transactions to recover. Failover under load was not measured and may well be slower.
+- **Small sample:** two kills, of two different nodes, are not a distribution. They show the order of magnitude, not a percentile.
+- **Resolution:** 200 ms, as above.
+- **Rejoin baseline:** the rejoin times were measured before the fix and depend on when each backoff timer happened to fire, so they vary from run to run.

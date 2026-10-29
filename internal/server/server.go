@@ -21,6 +21,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -304,9 +305,10 @@ func (n *Node) Inspect(sh txn.ShardID, f func(r *paxos.Replica, sm *txn.SM, ts *
 
 // Ready reports whether every shard replica on this node knows its shard's
 // leader (or is it) and has applied everything it knows to be committed.
-// It returns an error naming the first shard that is not, or ctx's error if
-// a shard's event loop did not answer in time.
+// It returns an error naming every shard that is not, or ctx's error if a
+// shard's event loop did not answer in time.
 func (n *Node) Ready(ctx context.Context) error {
+	var notReady []error
 	for _, s := range n.shards {
 		type state struct {
 			leader paxos.NodeID
@@ -320,15 +322,23 @@ func (n *Node) Ready(ctx context.Context) error {
 		case st := <-ch:
 			switch {
 			case st.leader == 0:
-				return fmt.Errorf("shard %d: no known leader", s.id)
+				notReady = append(notReady, fmt.Errorf("shard %d: no known leader", s.id))
 			case st.lag > 0:
-				return fmt.Errorf("shard %d: %d committed slots not applied yet", s.id, st.lag)
+				notReady = append(notReady, fmt.Errorf("shard %d: %d committed slots not applied yet", s.id, st.lag))
 			}
 		case <-ctx.Done():
 			return fmt.Errorf("shard %d: event loop did not answer: %w", s.id, ctx.Err())
 		case <-s.done:
 			return fmt.Errorf("shard %d: %w", s.id, errStopped)
 		}
+	}
+	if len(notReady) > 0 {
+		// One line for /readyz: "shard 1: no known leader; shard 2: ...".
+		msgs := make([]string, len(notReady))
+		for i, err := range notReady {
+			msgs[i] = err.Error()
+		}
+		return errors.New(strings.Join(msgs, "; "))
 	}
 	return nil
 }

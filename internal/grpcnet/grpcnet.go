@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/Shrutij516/paxos-txn-store/internal/paxos"
@@ -19,6 +20,24 @@ import (
 // peer is slow or down its queue fills and new messages are dropped, which
 // Paxos tolerates; the caller never blocks.
 const peerQueue = 1024
+
+// reconnect is how a peer connection retries after it fails. gRPC's
+// default backs off exponentially to 120 s between attempts, so a peer that
+// was down for minutes could wait up to two minutes after it came back
+// before this node reached it again; a restarted replica learns its shards'
+// leaders only from their heartbeats over that connection, so it stayed
+// not ready that long (DECISIONS.md I4). Capping the delay at 1 s bounds
+// that to about a second, for at most one failed TCP connect per second to
+// a peer that is down.
+var reconnect = grpc.ConnectParams{
+	Backoff: backoff.Config{
+		BaseDelay:  100 * time.Millisecond,
+		Multiplier: 1.6,
+		Jitter:     0.2,
+		MaxDelay:   time.Second,
+	},
+	MinConnectTimeout: 5 * time.Second,
+}
 
 // Transport carries messages between nodes over gRPC. A node hosts one
 // replica of every shard, and Send tags each message with the shard it is
@@ -53,7 +72,7 @@ func New(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(shard uint
 		if id == self {
 			continue
 		}
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithConnectParams(reconnect))
 		if err != nil {
 			t.Close()
 			return nil, err
