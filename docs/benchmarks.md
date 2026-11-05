@@ -41,6 +41,8 @@ The three nodes, their nine SQLite files and the load generator all share those 
 
 ## Results
 
+These are the first measurements, before the fix for incident I5. The fix and its before/after runs are in [Leader placement after the I5 fix](#leader-placement-after-the-i5-fix).
+
 Each cell is the mean over 5 runs (min–max). Errors (unknown plus failed) were 0 in every run.
 
 | Profile | Cross-shard | Clients | Committed txn/s | p50 ms | p90 ms | p99 ms | max ms | Abort % | Top abort reasons (per run) |
@@ -78,7 +80,40 @@ What the table says:
   3. Every heartbeat then retransmits every unchosen slot, which refills the queues: congestion collapse.
   4. The leader node sent about 100 RPCs per committed transaction, against about 26 with spread leaders.
 
-Excluding those runs would hide a real behaviour, so they stay in the table.
+Excluding those runs would hide a real behaviour, so they stay in the table. The fix is below.
+
+## Leader placement after the I5 fix
+
+Bounded Accept retransmission (DECISIONS.md entry 45) removed the feedback loop. To measure it without waiting for chance placements, `scripts/bench.sh` now forces placement: `PLACEMENT=concentrated` restarts each run's cluster until one node leads all three shards, and `PLACEMENT=spread` until each node leads one. `PAXOSD_BIN` runs a given binary.
+- **Before:** this branch built with the old resend-everything heartbeat switched back on. It differs from the original only in that, and it exports the new drop counter.
+- **After:** the fix.
+
+Low contention, 32 clients, 10 s warmup and 30 s measured, 5 runs per cell, the same machine on a later day. Cells are means (min–max). Queue drops are `peer_messages_dropped_total{reason="send_queue_full"}` summed over the nodes per run. Errors were 0 and every run settled.
+
+| Cross-shard | Leaders | Build | Committed txn/s | p50 ms | p99 ms | Queue drops |
+|---|---|---|---|---|---|---|
+| 0 | one node | before | 369 (331–410) | 85.4 | 140 | 0 |
+| 0 | one node | **after** | **571** (531–646) | 54.4 | 105 | 0 |
+| 0 | spread | before | 455 (370–507) | 44.4 | 250 | 0 |
+| 0 | spread | **after** | **573** (549–595) | 53.6 | 113 | 0 |
+| 0.5 | one node | before | **37** (35–39) | 876 | 1583 | 58,862 (54,666–63,325) |
+| 0.5 | one node | **after** | **192** (178–231) | 158 | 311 | **0** |
+| 0.5 | spread | before | 86 (63–148) | 48.5 | 1245 | 6,802 (63–11,466) |
+| 0.5 | spread | **after** | **247** (241–261) | 93.2 | 419 | 0 |
+
+What it says:
+- **The collapse is gone.** With one node leading every shard, cross-shard throughput went from 37 to 192/s, p99 from 1.6 s to 311 ms, and drops from about 59,000 a run to none.
+- **Spread leadership was hit too.** On this day the old code also dropped messages and collapsed with spread leaders on cross-shard load (63–148/s). The exact pre-fix commit, fc53199, gave the same: 59, 126 and 59/s over 3 runs. The loop needed any overflowing queue, not one particular placement. The first measurements above caught it only in the concentrated runs, and this machine is noisy from day to day, so compare within a table, not across tables.
+- **Placement still costs something on cross-shard load.** Concentrated leadership reaches 78% of spread (192 vs 247/s), short of a "within 20%" target. Single-shard is at parity (571 vs 573/s). In a concentrated run the leader node used about 1.4 CPU cores and each other node about 0.7. One node is doing every shard's leader work and every coordinator's two-phase commit, on a 4-vCPU machine it shares with the others and the load generator. That is uneven load, not a failure: there are no drops, and latency is bounded.
+- **Leader balancing was not added.** It would close the remaining gap, but it means leader-transfer machinery in the protocol, for a 22% difference on one machine (DECISIONS.md entry 45, Rejected).
+- **Regression test:** `PAXOSD_PLACEMENT=1 go test -run TestMultiProcessConcentratedLeadership ./cmd/paxosd` runs both placements and fails on drops, or on concentrated below 60% of spread. With `PAXOSD_BIN` set to the old build it fails: 47,410 drops, 51%.
+
+Reproduce:
+
+```sh
+PLACEMENT=concentrated RUNS=5 PROFILES=low CLIENTS=32 CROSS="0 0.5" scripts/bench.sh bench-conc
+PLACEMENT=spread       RUNS=5 PROFILES=low CLIENTS=32 CROSS="0 0.5" scripts/bench.sh bench-spread
+```
 
 ## Correctness at speed
 
@@ -103,6 +138,6 @@ Ten histories were checked offline after settling: the first run of every config
 
 - **One machine.** No network latency, a shared CPU and a shared disk; the load generator takes CPU from the nodes. Absolute numbers are machine-specific and are not a multi-machine prediction.
 - **Closed loop.** A fixed number of clients, each waiting for its previous transaction; overload shows as latency, not as dropped requests, and there is no target arrival rate.
-- **Leader placement is uncontrolled** and dominates the high-throughput configs (see above); 5 runs per config sample it only coarsely.
+- **Leader placement** is uncontrolled in the first table, where it dominated the high-throughput configs. `PLACEMENT` controls it (see the section after the I5 fix).
 - **One workload.** Two-account transfers. Read-only and audit mixes, larger transactions and blind writes are not in this matrix (`-read-ratio` and `-audit-percent` exist for them).
 - **Fresh state.** Every run starts with an empty log. Long runs would add the unbounded log and memory growth (DECISIONS.md entry 9), which this does not measure.

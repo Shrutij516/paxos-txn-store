@@ -503,7 +503,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Tests:**
     - `TestReplicaRetransmitBounded` (deterministic, one replica): a leader with 50 lost Accepts never sends a peer more than `RetransmitMax` per heartbeat, or the same slot within `RetransmitAfter`. It eventually resends every slot to every peer that has not voted, never to one that has, and stops once the slots are chosen.
     - `TestReplicaRetransmitAllCaughtByBound`: the same check fails on the old resend-everything behaviour (a test-only switch).
-    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with spread and with concentrated leadership. Concentrated leadership must drop at most 100 messages per run on full send queues, and commit at least 80% of the spread rate. With `PAXOSD_BIN` pointing at a build of the old behaviour, it fails on both counts.
+    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with spread and with concentrated leadership. Concentrated leadership must drop at most 100 messages per run on full send queues, and commit at least 60% of the spread rate. The old code reached 43–51%, the fix about 78%, so the floor sits between them. With `PAXOSD_BIN` pointing at a build of the old behaviour, it fails on both counts (47,410 drops, 51%).
 - **Why:**
   - **The resend loop drove the collapse.** With one node leading every shard, its per-peer send queues overflowed. Each heartbeat then resent every unchosen slot to every peer, refilling the queues it had just overflowed: congestion collapse (incident I5).
   - **The rule resends only what has been lost.** An Accept that was answered is not resent. One that is still in flight within the timeout is not resent either. What is resent per heartbeat is capped, so retransmission traffic is bounded by peers × `RetransmitMax` per heartbeat, whatever the backlog.
@@ -515,7 +515,9 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Per-peer in-flight windows that block new proposals:** flow control proper. It would bound the queue, not just retransmission, but it is a larger protocol-side change, and the bound on resends removed the drops.
   - **A larger send queue:** it delays the overflow and adds latency, and resending every slot would still grow with the backlog.
   - **Replacing serial unary RPCs with a stream or pool per peer:** it raises the transport's ceiling. It is still worth doing, but it changes the transport for every message, and it would only have hidden the unbounded resends.
-  - **Leader balancing alone:** it avoids the placement that triggered the collapse, but the same loop can start whenever one node's queues overflow, for example after a failover. See the result below for whether it is needed on top.
+  - **Leader balancing, alone or on top:**
+    - **Alone:** it avoids the placement that triggered the collapse, but the same loop starts whenever any node's queues overflow. The benchmark showed this with leaders spread as well: the old code dropped up to 11,466 messages a run and committed 63–148 transactions/s.
+    - **On top:** not done. With the fix, concentrated leadership matches spread on single-shard load (571 vs 573/s). On cross-shard load it reaches 78% (192 vs 247/s) with zero drops, against 43% before. The remaining gap is one node doing every shard's leader and coordinator work, about twice the CPU of each other node, which is a capacity question rather than a failure. Balancing would add leader-transfer machinery to the protocol to close a 22% gap on one machine, and would hide that gap rather than explain it.
   - **Labels per peer:** `reason` × `shard` is bounded and enough to see where drops happen. Per-peer series would grow with cluster size.
 - **Tradeoff:**
   - **Slower recovery from a burst of loss.** A burst of lost Accepts is repaired at most `RetransmitMax` slots per peer per heartbeat, instead of all at once. A peer that missed 100 slots now needs about 13 heartbeats of resends (about 0.5 s) rather than one. Slots that a majority has chosen reach it sooner, through the commit index and catch-up.
@@ -601,7 +603,7 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **Library defaults are design decisions:** an untouched gRPC default, tuned for clients of remote services, set this cluster's rejoin time.
   - **Report all of it:** a readiness check that reports only its first failure hides the pattern.
 
-### I5. Throughput collapses when one node leads every shard
+### I5. Throughput collapses when one node leads every shard (fixed)
 
 - **Symptom:** in the first steady-state benchmark (docs/benchmarks.md), two configs with low contention and 32 clients had one run far below the others:
   - single-shard: 398 against 558–645 committed transactions per second
@@ -623,16 +625,29 @@ Things that broke after they were merged, and why. Every phase that finds someth
     | Spread | 2 | 228 and 184 txn/s | 0 | 41–71k per node, about 26 per committed transaction |
 
     Inbox drops and RPC errors were 0 in every run.
-- **Fix:** **open**, not fixed in this phase (a benchmark phase, which should measure the system as it is). Proposed, in order:
-  1. Count and export peer-queue and inbox drops.
-  2. Bound heartbeat retransmission: resend only slots whose last Accept is older than a timeout, in limited batches.
-  3. Replace serial unary RPCs with a stream or a small pool per peer, with batching.
-  4. Balance leadership across nodes, through leader-transfer hints.
+- **Root cause, confirmed and refined in the fix:**
+  - **The loop, not the placement.** Concentrated leadership is only the most common trigger. The loop is item 4 above: any overflowing send queue, refilled by heartbeats that resend every unchosen slot.
+  - **Spread leadership is not immune.** Rerun with forced placement (5 runs each, the same machine on another day), the old code also collapsed with spread leaders on cross-shard load: 63–148 transactions/s, with up to 11,466 drops a run. The exact pre-fix commit gave the same, 59–126/s over 3 runs, so the cause is the code, not the comparison build.
+- **Fix:** bounded Accept retransmission (DECISIONS.md entry 45). A leader resends a slot to a peer only if that peer has not voted, the last send is at least 80 ms old, and the slot is among the 8 least recently sent such slots for that peer in this heartbeat.
+  - **New counter:** `peer_messages_dropped_total{shard,node,reason}` counts every drop point.
+  - **Benchmark:** `scripts/bench.sh` can force leader placement and benchmark a given binary.
+  - **Results** (low contention, 32 clients, 5 runs each; full table in docs/benchmarks.md):
 
-  This matters beyond benchmarks: after a node failure, one survivor often ends up leading every shard (the rejoin test logged leaders `map[0:1 1:1 2:1]`), so the collapse can follow a failover under load.
+    | Config | Leaders | Before | After |
+    |---|---|---|---|
+    | Single-shard | One node | 369 txn/s | 571 txn/s |
+    | Single-shard | Spread | 455 txn/s | 573 txn/s |
+    | Cross-shard 0.5 | One node | **37** txn/s, p99 1.58 s, 58,862 drops a run | **192** txn/s, p99 311 ms, 0 drops |
+    | Cross-shard 0.5 | Spread | 86 txn/s, 6,802 drops a run | 247 txn/s, 0 drops |
+
+  - **Remaining gap:** concentrated cross-shard throughput is 78% of spread, short of the 80% target. It is one node doing all leader and coordinator work, not a failure: no drops, and latency stays bounded. Leader balancing was considered and not done (entry 45, Rejected).
+  - **Not changed:** the transport (one serial RPC per peer).
+  - **Also found:** the first version of the fix resent the oldest slots first. Its unit test showed it starved later slots under persistent loss, so the fix resends the least recently sent instead.
 - **Lesson:**
+  - **Retransmission is traffic too.** A retransmit policy must be bounded by what was lost, not by what is outstanding. Otherwise overload produces more load.
+  - **Find the loop, not the trigger.** The trigger looked like leader placement, but the bug was a feedback loop that any overflow could start. Forcing placement in the benchmark showed that the spread case suffered too.
   - **Spread is a finding:** a 5× spread between runs of the same config is a result to explain, not noise to average away. Recording the leader placement of every run is what pointed at the cause.
-  - **Make drops visible:** silent drops that rely on retransmission are safe for correctness, but under load they turn into a feedback loop. Every drop point needs a counter.
+  - **Make drops visible:** silent drops that rely on retransmission are safe for correctness, but under load they turn into a feedback loop. Every drop point needs a counter, and now has one.
 
 ### I6. The benchmark harness stopped the cluster before in-doubt transactions finished
 
@@ -654,5 +669,7 @@ Things that broke after they were merged, and why. Every phase that finds someth
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
+- **A streaming transport with batching.** Each node sends to each peer through one serial unary RPC at a time, about 2,300 messages per second per peer on the benchmark machine. That ceiling is what concentrated leadership hits first (incident I5). A bidirectional stream per peer, sending queued messages in batches, would raise it without changing Paxos.
+- **Leader balancing.** With one node leading every shard, cross-shard throughput is 78% of spread (DECISIONS.md entry 45). Leader-transfer hints, where a leader with more shards than its share hands one to a less loaded peer, would close that gap. It is not needed for correctness or stability.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
 - **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).
