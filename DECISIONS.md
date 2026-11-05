@@ -458,6 +458,37 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Log noise:** gRPC logs connection failures at its own (quiet by default) log level, so nothing new appears in the logs.
   - **Test time:** the rejoin test adds about 3 minutes to the full suite (its two downtimes run in parallel).
 
+## 44. Steady-state load test: the bank workload with knobs, fresh native clusters, exact latencies
+
+- **What:**
+  - **Benchmark mode in `cmd/loadgen`.** It turns on with any of `-keys`, `-profile low|high` (`-hot-keys`, `-hot-fraction`), `-read-ratio`, `-cross-shard-ratio`, `-warmup`, `-report` or `-metrics-addrs`. It still runs bank transfers between two accounts:
+    - **Accounts:** over `-keys` accounts, opened in batches of 500.
+    - **Key choice:** uniform (`low`), or with `-hot-fraction` (0.9) of picks from the first `-hot-keys` (16) accounts (`high`).
+    - **Mix:** a chosen fraction of read-only transactions, and of transactions whose two accounts are on different shards.
+    - **Reporting:** attempts that start in the first `-warmup` are left out of the measurements. One JSON report per run gives committed transactions per second, latency percentiles, the abort rate, server-side abort reasons (the change in `txn_aborts_total{reason}` over the window, scraped from every node), and error counts (unknown plus failed).
+    - **Unchanged:** with none of these flags, loadgen behaves exactly as before (same draws, one setup transaction), so the chaos runner is unaffected.
+  - **Latency:** exact. Every sample is kept and sorted, and a percentile is the nearest-rank value; there is no histogram.
+    - **Primary latency** is end to end per committed transaction: from the start of `client.Run` (the `Begin` RPC included) to the commit acknowledgement, including earlier aborted attempts and their backoff.
+    - **Attempt latency** is per committed attempt, from its first operation.
+  - **`scripts/bench.sh`** runs a matrix (profile × cross-shard ratio × clients, `RUNS` times each) against a fresh 3-node cluster of native `paxosd` processes per run, with empty data directories. It prints mean, min–max and standard deviation per metric, and flags configs whose runs differ by more than 20% of the mean.
+  - **`cmd/chaos -check-history -check-data`** runs the chaos checkers offline on a run's history and SQLite files, so a benchmark run can be checked like a chaos run.
+- **Why:**
+  - **The old numbers were not a benchmark.** The only throughput figures (about 55–78 transactions/s) came from chaos runs with kills on 12 deliberately contended accounts.
+  - **Keeping the workload checkable.** Keeping the bank workload, instead of a synthetic one, means every benchmark history can be checked with the same strict-serializability, atomicity and conservation checkers, so a fast result is also a correct one.
+  - **Independent runs.** A fresh cluster per run keeps runs independent: no log, memory or replay growth carries over (the log is never compacted, DECISIONS entry 9).
+  - **Native processes.** They match the I4 rejoin setup and avoid Docker networking overhead.
+  - **Exact percentiles** are affordable at these volumes (tens of thousands of samples per run) and avoid bucket error in the tail.
+- **Rejected:**
+  - **A synthetic key-value workload** (blind writes and gets): it is closer to common benchmarks, but the conservation invariant could not be checked and it would not use read-then-write transactions.
+  - **An HDR histogram:** constant memory, but unnecessary at this sample count, and its bucketing hides the exact maximum.
+  - **Reusing one cluster across runs:** faster, but later runs would replay and hold earlier runs' logs.
+  - **The Docker compose stack:** closer to the chaos setup, but Docker is not available in every sandbox, and the bridge network adds overhead that is not the system's.
+  - **Measuring only attempt latency:** it hides the cost of aborts and retries that a caller actually waits for.
+- **Tradeoff:**
+  - **Not a network benchmark:** all three nodes and the load generator share one machine, its CPU and one disk, with loopback networking. The numbers include no network latency, and the load generator competes with the nodes for CPU.
+  - **Fixed client counts:** each config has a fixed number of closed-loop clients, so throughput and latency are measured at that concurrency, not at a target arrival rate. A saturated system shows longer latencies, not dropped requests.
+  - **Incomplete abort reasons:** the server-side reasons count only aborts decided at a shard leader. A transaction wounded while it held only read locks fails at its next read or write, and is counted by the client but not by reason.
+
 ## Incidents
 
 Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.
@@ -536,6 +567,56 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **Measure recovery, not just failover:** the earlier fault tests measured how fast a new leader took over, never how fast a returning node became useful again. The chaos runs held each kill for at most 8 s, inside the short early steps of the backoff, so they could not see it. Recovery needs its own test at realistic downtimes.
   - **Library defaults are design decisions:** an untouched gRPC default, tuned for clients of remote services, set this cluster's rejoin time.
   - **Report all of it:** a readiness check that reports only its first failure hides the pattern.
+
+### I5. Throughput collapses when one node leads every shard
+
+- **Symptom:** in the first steady-state benchmark (docs/benchmarks.md), two configs with low contention and 32 clients had one run far below the others:
+  - single-shard: 398 against 558–645 committed transactions per second
+  - cross-shard: **45** against 173–236 per second, with **no aborts** but a median latency of 678 ms
+
+  In both outlying runs one node led all three shards; in the other runs leadership was spread. Contention-bound configs and the 8-client configs showed no such effect.
+- **Root cause:**
+  1. **Leaders are not balanced:** a shard's leader is whichever node wins its first election, and nothing moves it.
+  2. **One sender per peer:** a node's outbound messages to each peer, for all shards, go through one 1024-message queue drained by **one serial unary RPC at a time** (`internal/grpcnet`, `deliver`). On this machine that is roughly 2,300 RPCs per second per peer.
+  3. **Overflow:** with every leader on one node, all Accepts and two-phase commit messages leave through that node's two queues. The queues overflow, and the excess is silently dropped (`SendTraced`).
+  4. **Retransmission feeds the overflow:** Paxos retransmits a dropped Accept only on the next heartbeat, and each heartbeat resends **every** unchosen slot (`sendHeartbeats`), which refills the queue. Two-phase commit resends every 200 ms. The result is congestion collapse: more traffic per transaction, and latency set by retransmission timers.
+- **Evidence:**
+  - **Placement against throughput:** leadership per run, taken from the "became leader" log lines in all 40 runs, against throughput.
+  - **Drop counters:** a throwaway build with counters on the per-peer queue, both inboxes and RPC errors (not committed), on low / cross-shard 0.5 / 32 clients:
+
+    | Leader placement | Runs | Throughput | Peer-queue drops | RPCs sent |
+    |---|---|---|---|---|
+    | All shards on one node | 2 | 46.9 and 46.2 txn/s | 14,716 and 14,946 on the leader node | ~113–115k by the leader node, about 100 per committed transaction |
+    | Spread | 2 | 228 and 184 txn/s | 0 | 41–71k per node, about 26 per committed transaction |
+
+    Inbox drops and RPC errors were 0 in every run.
+- **Fix:** **open**, not fixed in this phase (a benchmark phase, which should measure the system as it is). Proposed, in order:
+  1. Count and export peer-queue and inbox drops.
+  2. Bound heartbeat retransmission: resend only slots whose last Accept is older than a timeout, in limited batches.
+  3. Replace serial unary RPCs with a stream or a small pool per peer, with batching.
+  4. Balance leadership across nodes, through leader-transfer hints.
+
+  This matters beyond benchmarks: after a node failure, one survivor often ends up leading every shard (the rejoin test logged leaders `map[0:1 1:1 2:1]`), so the collapse can follow a failover under load.
+- **Lesson:**
+  - **Spread is a finding:** a 5× spread between runs of the same config is a result to explain, not noise to average away. Recording the leader placement of every run is what pointed at the cause.
+  - **Make drops visible:** silent drops that rely on retransmission are safe for correctness, but under load they turn into a feedback loop. Every drop point needs a counter.
+
+### I6. The benchmark harness stopped the cluster before in-doubt transactions finished
+
+- **Symptom:** the offline checkers reported two violations on two benchmark histories (low / cross-shard 0.5 / 32 clients, and the all-leaders-on-one-node experiment run):
+  - "atomicity: txn … committed by coordinator shard 0 but unresolved on shard 1"
+  - "bank: final total 1000037, want 1000000"
+- **Root cause:** the first version of `scripts/bench.sh` sent SIGTERM to the nodes as soon as loadgen exited. Cross-shard commits that were decided and logged at the coordinator, but whose commit record was not yet applied at a participant, were cut off mid-flight.
+  - **Not a 2PC failure:** the participant held a durable prepare record for each such transaction.
+  - **The checkers were right:** they assume a quiescent cluster ("nothing left prepared"), which the chaos runner guarantees by settling first and the harness did not.
+- **Evidence:**
+  - **Before the restart:** replaying the logs showed, for the reported transaction, a commit decision and outcome on shard 0, and `prepared = true` on shard 1, with 16 transactions in doubt on shard 1 at shutdown.
+  - **After the restart:** restarting each stopped cluster on its own data directories, the in-doubt participants asked the coordinator for the outcome and applied it within about 1 s. The checkers then passed with no violations on both histories (6,694 and 1,448 committed transactions).
+- **Fix:** `scripts/bench.sh` now waits (`settle`, up to 2 minutes) until every node answers `/readyz` and `txn_in_doubt` is 0 everywhere before stopping the nodes, as `cmd/chaos` does. A run that does not settle is marked `NOT_SETTLED`. A re-run with the fixed script settled every run and its history passed (2,491 committed transactions). The measurements are unaffected, since settling happens after loadgen has written its report.
+- **Lesson:**
+  - **Same preconditions:** a harness that reuses checkers must also reuse their preconditions.
+  - **Check the log before blaming the protocol:** before treating a checker failure as a protocol bug, look at the durable state of the transaction it names. Here the prepare record settled it in one query.
+  - **Free extra evidence:** the restart also exercised the recovery of in-doubt transactions after a full-cluster stop.
 
 ## Future work
 
