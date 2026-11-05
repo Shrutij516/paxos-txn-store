@@ -11,3 +11,6 @@ bin/
 *.tfstate*
 *.tfplan
 .terraform/
+
+# scripts/bench.sh output (docs/benchmarks.md)
+bench-out/

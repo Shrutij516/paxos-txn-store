@@ -25,7 +25,7 @@ The SDK takes a `TracerProvider` in `client.Options` (default: the global one, w
 
 ## Metrics
 
-Labels are only ever bounded (DECISIONS.md entry 29). The store's metrics carry `shard` and `node`, whose values come from the cluster config, so a node has one series per shard; `txn_aborts_total` adds `reason`, from the fixed set below. No label value ever comes from a transaction ID, a key or a client ID. The standard Go runtime and process collectors are registered too (`go_*`, `process_*`); their only labels are `quantile` (the fixed GC duration quantiles) and `version` (on `go_info`). `TestMetricLabels` checks every exported metric after a contended workload: only these label names exist, each value is in its fixed set, and every documented metric is there. `TestCheckLabelsRejects` shows the check refuses a `txn_id`, `key` or `client` label.
+Labels are only ever bounded (DECISIONS.md entry 29). The store's metrics carry `shard` and `node`, whose values come from the cluster config, so a node has one series per shard; `txn_aborts_total` and `peer_messages_dropped_total` add `reason`, each from a fixed set below. No label value ever comes from a transaction ID, a key or a client ID. The standard Go runtime and process collectors are registered too (`go_*`, `process_*`); their only labels are `quantile` (the fixed GC duration quantiles) and `version` (on `go_info`). `TestMetricLabels` checks every exported metric after a contended workload: only these label names exist, each value is in its fixed set, and every documented metric is there. `TestCheckLabelsRejects` shows the check refuses a `txn_id`, `key` or `client` label.
 
 Latency histograms (`paxos_commit_latency_seconds`, `txn_prepare_phase_seconds`, `txn_decide_phase_seconds`, `txn_participant_prepare_seconds`, `storage_fsync_seconds`) share explicit buckets from 50µs to 2s, in seconds: 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2. That covers an fsync on a fast disk (tens of µs) up to a stall of an election timeout or two; slower samples land in `+Inf`. `txn_outcome_query_seconds` adds 5 and 10, since a query only starts after the in-doubt wait and can span an election.
 
@@ -40,6 +40,7 @@ Latency histograms (`paxos_commit_latency_seconds`, `txn_prepare_phase_seconds`,
 | `paxos_commit_latency_seconds` | histogram | At the leader: from proposing a log entry to applying it, which is one round of Accept and Accepted messages plus the fsyncs on a majority. |
 | `paxos_apply_lag_slots` | gauge | Slots known to be committed (by this replica, or by the leader according to its last heartbeat) but not applied here. Non-zero on a follower catching up. |
 | `paxos_log_length_slots` | gauge | Committed log entries (the commit index). The log is never compacted, so this only grows. |
+| `paxos_accepts_in_flight` | gauge | At the leader: the most proposed slots any one peer has not voted for yet, that is the Accepts outstanding to its slowest peer (0 on followers). Under a closed-loop load it stays near the number of requests in flight. A value that keeps growing means Accepts are being lost faster than they are resent (incident I5). |
 
 ### Transactions
 
@@ -77,6 +78,14 @@ Aborts only count transactions whose outcome a shard logged. A transaction the c
 |---|---|---|
 | `storage_fsync_seconds` | histogram | Each durable write of a shard's log (a promise, an accepted entry, a commit batch, a proposer round): one SQLite transaction ending in an fsync, which dominates its time. Paxos waits for it before every reply, so it bounds commit latency. |
 | `shard_loop_queue_depth` | gauge | Events waiting for the shard's event loop, read at scrape time: peer and cross-shard messages in its inbox plus client requests (and `Inspect` calls) waiting to be handed over. Near 0 when the loop keeps up. A sustained rise means the loop, usually its fsyncs, is the bottleneck; past 4096 queued messages new ones are dropped (Paxos and two-phase commit retry). |
+| `peer_messages_dropped_total` | counter | Messages between replicas that were dropped, by `reason`. Paxos and two-phase commit retry them, so drops are safe, but a steady rise means a node cannot keep up with its outbound or inbound traffic (incident I5). The `shard` label is the message's shard; `node` is the node that dropped it. |
+
+| `reason` | Where the message was dropped |
+|---|---|
+| `send_queue_full` | This node's outbound queue to a peer (1024 messages, shared by all shards) was full. |
+| `send_failed` | The RPC to the peer failed: it was down, unreachable or timed out. |
+| `inbox_full` | A message arriving from a peer found the shard's inbox full. |
+| `local_inbox_full` | A cross-shard message to another shard on this node found that shard's inbox full. |
 
 ### Go runtime and process
 

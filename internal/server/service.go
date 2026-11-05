@@ -80,6 +80,7 @@ func (p peerService) Send(_ context.Context, env *paxosv1.Envelope) (*paxosv1.Se
 	select {
 	case p.n.shards[env.GetShard()].inbox <- inMsg{m: m, trace: env.GetTrace()}:
 	default: // overloaded: drop, Paxos and two-phase commit retry
+		p.n.metrics.drop(env.GetShard(), DropInboxFull)
 	}
 	return &paxosv1.SendAck{}, nil
 }

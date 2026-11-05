@@ -86,6 +86,7 @@ type proc struct {
 	maddr  string // its /metrics endpoint
 	dir    string
 	args   []string
+	env    []string // added to the environment of the process
 	log    string
 	cmd    *exec.Cmd
 	exited chan struct{} // closed when the current process has exited
@@ -102,6 +103,9 @@ func (p *proc) start(t *testing.T, bin string) {
 	p.cmd.Stdout, p.cmd.Stderr = f, f
 	if dir := os.Getenv(coverDirEnv); dir != "" {
 		p.cmd.Env = append(os.Environ(), "GOCOVERDIR="+dir)
+	}
+	if p.env != nil {
+		p.cmd.Env = append(append(p.cmd.Env, os.Environ()...), p.env...)
 	}
 	if err := p.cmd.Start(); err != nil {
 		t.Fatal(err)

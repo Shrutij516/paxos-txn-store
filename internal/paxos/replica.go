@@ -68,6 +68,7 @@ type Replica struct {
 	nextSlot  uint64
 	proposals map[uint64]Entry
 	votes     map[uint64]map[NodeID]struct{}
+	sent      map[uint64]map[NodeID]int // ticks of the last Accept sent per slot and peer
 
 	// Learned state, kept in memory and rebuilt by catch-up after restart.
 	chosen  map[uint64]Entry
@@ -84,6 +85,7 @@ type Replica struct {
 	replyFirst     bool // reply to Prepare and Accept before persisting
 	noSticky       bool // no PreVote, and Prepares are not refused while a leader is live
 	noCheckQuorum  bool // ReplicaConfig.NoCheckQuorum
+	retransmitAll  bool // every heartbeat resends every unchosen slot to every peer, as before entry 45
 
 	// Takeover counters, read only by tests through export_test.go.
 	statNoops     int // gaps filled with a no-op
@@ -104,6 +106,12 @@ func NewReplica(cfg ReplicaConfig, store LogStorage, tr Transport) (*Replica, er
 	}
 	if cfg.Timing.ElectionBackoff < 1 {
 		cfg.Timing.ElectionBackoff = DefaultElectionBackoff
+	}
+	if cfg.Timing.RetransmitAfter < 1 {
+		cfg.Timing.RetransmitAfter = 2 * cfg.Timing.HeartbeatEvery
+	}
+	if cfg.Timing.RetransmitMax < 1 {
+		cfg.Timing.RetransmitMax = DefaultRetransmitMax
 	}
 	rnd, err := store.LoadRound()
 	if err != nil {
@@ -168,6 +176,24 @@ func (r *Replica) Leader() NodeID { return r.leader }
 
 // Ballot returns the replica's own ballot as candidate or leader.
 func (r *Replica) Ballot() Ballot { return r.ballot }
+
+// InFlight returns, while this replica leads, the most proposed slots any
+// one other replica has not yet voted for: the Accepts outstanding to its
+// slowest peer. It is 0 otherwise. Under a closed-loop load it stays near
+// the number of requests in flight; a backlog that keeps growing means
+// Accepts are lost faster than they are resent (incident I5).
+func (r *Replica) InFlight() int {
+	if r.role != leader {
+		return 0
+	}
+	most := 0
+	for _, to := range r.peers {
+		if to != r.id {
+			most = max(most, r.unvoted(to))
+		}
+	}
+	return most
+}
 
 // Commit returns the commit index: every slot up to it is known chosen.
 func (r *Replica) Commit() uint64 { return r.commit }
@@ -304,7 +330,7 @@ func (r *Replica) yield(b Ballot) {
 		}
 		r.role = follower
 		r.leader = 0
-		r.promises, r.proposals, r.votes = nil, nil, nil
+		r.promises, r.proposals, r.votes, r.sent = nil, nil, nil, nil
 	}
 }
 
@@ -388,7 +414,7 @@ func (r *Replica) stepDown() {
 	r.obs.SteppedDown(r.ballot)
 	r.role = follower
 	r.leader = 0
-	r.proposals, r.votes, r.acks = nil, nil, nil
+	r.proposals, r.votes, r.sent, r.acks = nil, nil, nil, nil
 	r.resetElectionTimer()
 }
 
@@ -491,6 +517,7 @@ func (r *Replica) becomeLeader() {
 	r.promises = nil
 	r.proposals = make(map[uint64]Entry)
 	r.votes = make(map[uint64]map[NodeID]struct{})
+	r.sent = make(map[uint64]map[NodeID]int)
 	for s := r.commit + 1; s <= top; s++ {
 		e, ok := r.chosen[s]
 		if !ok {
@@ -516,8 +543,12 @@ func (r *Replica) becomeLeader() {
 func (r *Replica) propose(slot uint64, e Entry) {
 	r.proposals[slot] = e
 	r.votes[slot] = make(map[NodeID]struct{})
+	r.sent[slot] = make(map[NodeID]int, len(r.peers))
 	r.obs.Proposed(slot, e)
-	r.broadcast(LogAccept{Ballot: r.ballot, Slot: slot, Entry: e})
+	for _, to := range r.peers {
+		r.sent[slot][to] = r.ticks
+		r.send(to, LogAccept{Ballot: r.ballot, Slot: slot, Entry: e})
+	}
 }
 
 func (r *Replica) onClientRequest(from NodeID, m ClientRequest) {
@@ -579,6 +610,7 @@ func (r *Replica) onAccepted(from NodeID, m LogAccepted) {
 		e := r.proposals[m.Slot]
 		delete(r.votes, m.Slot)
 		delete(r.proposals, m.Slot)
+		delete(r.sent, m.Slot)
 		r.markChosen(m.Slot, e)
 	}
 }
@@ -592,7 +624,18 @@ func (r *Replica) onNack(m LogNack) {
 }
 
 // sendHeartbeats also retransmits Accepts for slots not yet chosen, so a
-// dropped Accept or Accepted only delays progress.
+// dropped Accept or Accepted only delays progress. Retransmission is
+// bounded per peer (DECISIONS.md entry 45): a slot is resent to a peer only
+// if that peer has not voted for it and its last Accept went out at least
+// RetransmitAfter ticks ago, at most RetransmitMax slots per peer per
+// heartbeat, the ones whose last send is oldest first (then lowest slot),
+// so every unvoted slot is resent eventually even if the first few keep
+// being lost: ordering by slot alone would cycle through the lowest few.
+// Resending everything on every heartbeat made an overloaded leader flood
+// its own send queues (incident I5).
+// Which Accepts are resent, and when, never affects safety: the network
+// may drop or duplicate any message, and acceptors and the vote count do
+// not change.
 func (r *Replica) sendHeartbeats() {
 	r.timer = r.t.HeartbeatEvery
 	r.following(r.ballot)
@@ -601,11 +644,44 @@ func (r *Replica) sendHeartbeats() {
 			r.send(to, Heartbeat{Ballot: r.ballot, Commit: r.commit})
 		}
 	}
-	for s := r.commit + 1; s < r.nextSlot; s++ {
-		if e, ok := r.proposals[s]; ok {
-			r.broadcast(LogAccept{Ballot: r.ballot, Slot: s, Entry: e})
+	if r.retransmitAll {
+		for s := r.commit + 1; s < r.nextSlot; s++ {
+			if e, ok := r.proposals[s]; ok {
+				r.broadcast(LogAccept{Ballot: r.ballot, Slot: s, Entry: e})
+			}
+		}
+		return
+	}
+	var due []uint64
+	for _, to := range r.peers {
+		due = due[:0]
+		for s := r.commit + 1; s < r.nextSlot; s++ {
+			if _, ok := r.proposals[s]; !ok {
+				continue
+			}
+			if _, voted := r.votes[s][to]; !voted && r.ticks-r.sent[s][to] >= r.t.RetransmitAfter {
+				due = append(due, s)
+			}
+		}
+		// Stable: equal send times stay in slot order.
+		slices.SortStableFunc(due, func(a, b uint64) int { return r.sent[a][to] - r.sent[b][to] })
+		for _, s := range due[:min(len(due), r.t.RetransmitMax)] {
+			r.sent[s][to] = r.ticks
+			r.send(to, LogAccept{Ballot: r.ballot, Slot: s, Entry: r.proposals[s]})
 		}
 	}
+}
+
+// unvoted counts the slots this leader proposed and peer to has not voted
+// for yet (for tests).
+func (r *Replica) unvoted(to NodeID) int {
+	n := 0
+	for s := range r.proposals {
+		if _, voted := r.votes[s][to]; !voted {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *Replica) onHeartbeat(from NodeID, m Heartbeat) {

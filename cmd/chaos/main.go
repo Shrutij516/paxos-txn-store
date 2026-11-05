@@ -20,6 +20,11 @@
 // their data out, and runs the checkers (internal/chaos.Check) on the
 // history. It writes report.json, faults.json, history.jsonl, loadgen.log
 // and compose.log to -out and exits 1 on any violation.
+//
+// With -check-history and -check-data it injects nothing and only runs the
+// same checkers offline, on a history and copies of the nodes' data
+// directories from an earlier run (a chaos run's artifacts, or a benchmark
+// run of loadgen against native processes, scripts/bench.sh).
 package main
 
 import (
@@ -57,6 +62,7 @@ type config struct {
 	fresh                     bool
 	out                       string
 	seed                      uint64
+	checkHistory, checkData   string
 }
 
 func main() {
@@ -80,9 +86,17 @@ func main() {
 	flag.BoolVar(&c.fresh, "fresh", true, "recreate the cluster with empty volumes first (docker compose down -v, then up --wait); the history must cover every transaction in the logs")
 	flag.StringVar(&c.out, "out", "chaos-out", "output directory")
 	flag.Uint64Var(&c.seed, "seed", uint64(time.Now().UnixNano()), "random seed for the fault schedule")
+	flag.StringVar(&c.checkHistory, "check-history", "", "offline: check this history file instead of running (needs -check-data)")
+	flag.StringVar(&c.checkData, "check-data", "", "offline: the nodes' data directories, comma separated, with their SQLite files")
 	flag.Parse()
 	c.services = strings.Split(services, ",")
 	c.loadgenArgs = strings.Fields(loadgenArgs)
+	if c.checkHistory != "" || c.checkData != "" {
+		if err := checkOnly(c); err != nil {
+			log.Fatalf("chaos: %v", err)
+		}
+		return
+	}
 	if err := run(c); err != nil {
 		log.Fatalf("chaos: %v", err)
 	}
@@ -242,6 +256,41 @@ func run(c config) error {
 			log.Printf("chaos: VIOLATION: %s", v)
 		}
 		return fmt.Errorf("%d violations (see %s)", len(rep.Violations), c.out)
+	}
+	log.Printf("chaos: no violations")
+	return nil
+}
+
+// checkOnly runs the checkers on a saved history and data directories.
+func checkOnly(c config) error {
+	if c.checkHistory == "" || c.checkData == "" {
+		return errors.New("-check-history and -check-data go together")
+	}
+	cl, err := server.LoadCluster(c.cluster)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(c.checkHistory)
+	if err != nil {
+		return err
+	}
+	meta, atts, err := history.Read(f)
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	sms, err := chaos.LoadShards(strings.Split(c.checkData, ","), cl.Shards)
+	if err != nil {
+		return fmt.Errorf("replaying the logs: %w", err)
+	}
+	rep := chaos.Check(meta, atts, sms)
+	log.Printf("chaos: %d attempts, %d committed (%d cross-shard), %d aborted, %d unknown (%d committed), %d failed before commit; %d committed txns checked",
+		rep.Attempts, rep.Committed, rep.CrossShard, rep.Aborted, rep.Unknown, rep.UnknownCommitted, rep.Failed, rep.CheckedTxns)
+	if len(rep.Violations) > 0 {
+		for _, v := range rep.Violations {
+			log.Printf("chaos: VIOLATION: %s", v)
+		}
+		return fmt.Errorf("%d violations", len(rep.Violations))
 	}
 	log.Printf("chaos: no violations")
 	return nil

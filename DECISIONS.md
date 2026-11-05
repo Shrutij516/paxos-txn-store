@@ -458,6 +458,78 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Log noise:** gRPC logs connection failures at its own (quiet by default) log level, so nothing new appears in the logs.
   - **Test time:** the rejoin test adds about 3 minutes to the full suite (its two downtimes run in parallel).
 
+## 44. Steady-state load test: the bank workload with knobs, fresh native clusters, exact latencies
+
+- **What:**
+  - **Benchmark mode in `cmd/loadgen`.** It turns on with any of `-keys`, `-profile low|high` (`-hot-keys`, `-hot-fraction`), `-read-ratio`, `-cross-shard-ratio`, `-warmup`, `-report` or `-metrics-addrs`. It still runs bank transfers between two accounts:
+    - **Accounts:** over `-keys` accounts, opened in batches of 500.
+    - **Key choice:** uniform (`low`), or with `-hot-fraction` (0.9) of picks from the first `-hot-keys` (16) accounts (`high`).
+    - **Mix:** a chosen fraction of read-only transactions, and of transactions whose two accounts are on different shards.
+    - **Reporting:** attempts that start in the first `-warmup` are left out of the measurements. One JSON report per run gives committed transactions per second, latency percentiles, the abort rate, server-side abort reasons (the change in `txn_aborts_total{reason}` over the window, scraped from every node), and error counts (unknown plus failed).
+    - **Unchanged:** with none of these flags, loadgen behaves exactly as before (same draws, one setup transaction), so the chaos runner is unaffected.
+  - **Latency:** exact. Every sample is kept and sorted, and a percentile is the nearest-rank value; there is no histogram.
+    - **Primary latency** is end to end per committed transaction: from the start of `client.Run` (the `Begin` RPC included) to the commit acknowledgement, including earlier aborted attempts and their backoff.
+    - **Attempt latency** is per committed attempt, from its first operation.
+  - **`scripts/bench.sh`** runs a matrix (profile × cross-shard ratio × clients, `RUNS` times each) against a fresh 3-node cluster of native `paxosd` processes per run, with empty data directories. It prints mean, min–max and standard deviation per metric, and flags configs whose runs differ by more than 20% of the mean.
+  - **`cmd/chaos -check-history -check-data`** runs the chaos checkers offline on a run's history and SQLite files, so a benchmark run can be checked like a chaos run.
+- **Why:**
+  - **The old numbers were not a benchmark.** The only throughput figures (about 55–78 transactions/s) came from chaos runs with kills on 12 deliberately contended accounts.
+  - **Keeping the workload checkable.** Keeping the bank workload, instead of a synthetic one, means every benchmark history can be checked with the same strict-serializability, atomicity and conservation checkers, so a fast result is also a correct one.
+  - **Independent runs.** A fresh cluster per run keeps runs independent: no log, memory or replay growth carries over (the log is never compacted, DECISIONS entry 9).
+  - **Native processes.** They match the I4 rejoin setup and avoid Docker networking overhead.
+  - **Exact percentiles** are affordable at these volumes (tens of thousands of samples per run) and avoid bucket error in the tail.
+- **Rejected:**
+  - **A synthetic key-value workload** (blind writes and gets): it is closer to common benchmarks, but the conservation invariant could not be checked and it would not use read-then-write transactions.
+  - **An HDR histogram:** constant memory, but unnecessary at this sample count, and its bucketing hides the exact maximum.
+  - **Reusing one cluster across runs:** faster, but later runs would replay and hold earlier runs' logs.
+  - **The Docker compose stack:** closer to the chaos setup, but Docker is not available in every sandbox, and the bridge network adds overhead that is not the system's.
+  - **Measuring only attempt latency:** it hides the cost of aborts and retries that a caller actually waits for.
+- **Tradeoff:**
+  - **Not a network benchmark:** all three nodes and the load generator share one machine, its CPU and one disk, with loopback networking. The numbers include no network latency, and the load generator competes with the nodes for CPU.
+  - **Fixed client counts:** each config has a fixed number of closed-loop clients, so throughput and latency are measured at that concurrency, not at a target arrival rate. A saturated system shows longer latencies, not dropped requests.
+  - **Incomplete abort reasons:** the server-side reasons count only aborts decided at a shard leader. A transaction wounded while it held only read locks fails at its next read or write, and is counted by the client but not by reason.
+
+## 45. Bounded Accept retransmission, and a counter for every dropped peer message
+
+- **What:**
+  - **Bounded retransmission** (`sendHeartbeats` in `internal/paxos/replica.go`). The leader remembers, per unchosen slot and peer, the tick it last sent that peer the slot's Accept. On each heartbeat it resends an Accept to a peer only if:
+    - the peer has not voted for the slot in the current ballot, and
+    - the last send to that peer was at least `RetransmitAfter` ticks ago (default 2 × `HeartbeatEvery` = 8 ticks, 80 ms), and
+    - the slot is among the `RetransmitMax` (8) such slots per peer whose last send is oldest (ties go to the lower slot).
+
+    The record is per leadership: it is created when a node becomes leader, dropped when it steps down, and an entry goes when its slot is chosen. The heartbeats themselves, catch-up and two-phase commit retries are unchanged.
+  - **A drop counter:** `peer_messages_dropped_total{shard, node, reason}`, with `reason` from a fixed set of four: `send_queue_full`, `send_failed`, `inbox_full`, `local_inbox_full`. That is one series per point where a replica message can be dropped. `internal/grpcnet` reports its two through a hook (`WithDropHook`) and stays free of Prometheus. All series exist at zero from start-up, so a rate query works before the first drop.
+  - **Placement control in the benchmark.** `scripts/bench.sh` takes `PLACEMENT=concentrated|spread`, restarting each run's cluster until the leaders sit as asked, and `PAXOSD_BIN` to benchmark a given binary. It records each run's `send_queue_full` drops.
+  - **Tests:**
+    - `TestReplicaRetransmitBounded` (deterministic, one replica): a leader with 50 lost Accepts never sends a peer more than `RetransmitMax` per heartbeat, or the same slot within `RetransmitAfter`. It eventually resends every slot to every peer that has not voted, never to one that has, and stops once the slots are chosen.
+    - `TestReplicaRetransmitAllCaughtByBound`: the same check fails on the old resend-everything behaviour (a test-only switch).
+    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with concentrated and with spread leadership, 2 runs each, every node at `GOMAXPROCS=1`.
+      - **Pass/fail is deterministic signals only:** no peer message dropped for any reason during the load, and `paxos_accepts_in_flight` never above 128 (sampled every 100 ms).
+      - **Throughput is reported, not checked.** The concentrated/spread ratio depends on the machine.
+      - **Why one core per node:** on a fast host the old code's queues never overflowed (incident I7). With one core, the node leading every shard is the bottleneck on any host.
+      - **Measured:** the fix had 0 drops and at most 46 Accepts in flight. With `PAXOSD_BIN` set to a build of the old behaviour, it failed in all four runs on drops: 17,101 and 18,812 with one node leading, and 2,665 and 543 with spread leaders.
+      - **The in-flight bound is a sanity check only:** the closed loop also kept the old code at 44–68, so it does not separate the two builds; the drop check does.
+    - **A gauge for it:** `paxos_accepts_in_flight{shard,node}`, the most slots any one peer has not voted for, at the leader.
+- **Why:**
+  - **The resend loop drove the collapse.** With one node leading every shard, its per-peer send queues overflowed. Each heartbeat then resent every unchosen slot to every peer, refilling the queues it had just overflowed: congestion collapse (incident I5).
+  - **The rule resends only what has been lost.** An Accept that was answered is not resent. One that is still in flight within the timeout is not resent either. What is resent per heartbeat is capped, so retransmission traffic is bounded by peers × `RetransmitMax` per heartbeat, whatever the backlog.
+  - **Order by last send, not by slot.** The first version took the oldest *slots* first. Its own unit test showed that, with `RetransmitAfter` at two heartbeats, it cycles forever through the lowest 2 × `RetransmitMax` slots and never resends later ones while losses persist. Taking the least recently sent first visits every slot in turn.
+  - **Safety does not depend on any of this.** Which Accepts are resent, and when, cannot affect safety, because the network may already drop, delay or duplicate any message. Acceptors' rules, what they persist, how votes are counted and the one value per slot per ballot are all unchanged. Liveness holds too: every unvoted slot is resent within about ⌈backlog / `RetransmitMax`⌉ × `RetransmitAfter` ticks, and a peer that misses chosen slots still gets them from the heartbeat's commit index and catch-up. The seeded safety suites (1000 seeds), the mutation tests and the multi-process tests all pass unchanged.
+  - **Drops must be visible.** I5 was diagnosed with counters on a throwaway build. Drops are safe but, under load, they are the first sign of a feedback loop, so they belong in the metrics.
+- **Rejected:**
+  - **Resending on NACK only:** a lost Accept produces no NACK, so a timeout is needed anyway.
+  - **Per-peer in-flight windows that block new proposals:** flow control proper. It would bound the queue, not just retransmission, but it is a larger protocol-side change, and the bound on resends removed the drops.
+  - **A larger send queue:** it delays the overflow and adds latency, and resending every slot would still grow with the backlog.
+  - **Replacing serial unary RPCs with a stream or pool per peer:** it raises the transport's ceiling. It is still worth doing, but it changes the transport for every message, and it would only have hidden the unbounded resends.
+  - **Leader balancing, alone or on top:**
+    - **Alone:** it avoids the placement that triggered the collapse, but the same loop starts whenever any node's queues overflow. The benchmark showed this with leaders spread as well: the old code dropped up to 11,466 messages a run and committed 63–148 transactions/s.
+    - **On top:** not done. With the fix, concentrated leadership matches spread on single-shard load (571 vs 573/s). On cross-shard load it reaches 78% (192 vs 247/s) with zero drops, against 43% before. The remaining gap is one node doing every shard's leader and coordinator work, about twice the CPU of each other node, which is a capacity question rather than a failure. Balancing would add leader-transfer machinery to the protocol to close a 22% gap on one machine, and would hide that gap rather than explain it.
+  - **Labels per peer:** `reason` × `shard` is bounded and enough to see where drops happen. Per-peer series would grow with cluster size.
+- **Tradeoff:**
+  - **Slower recovery from a burst of loss.** A burst of lost Accepts is repaired at most `RetransmitMax` slots per peer per heartbeat, instead of all at once. A peer that missed 100 slots now needs about 13 heartbeats of resends (about 0.5 s) rather than one. Slots that a majority has chosen reach it sooner, through the commit index and catch-up.
+  - **More leader state:** one small map per unchosen slot, scanned and sorted per peer at each heartbeat (O(unchosen slots) per peer, as before).
+  - **A higher latency floor after a loss:** a single lost Accept now waits up to `RetransmitAfter` (80 ms) plus a heartbeat (40 ms) rather than one heartbeat. With loss rare, the median is unaffected.
+
 ## Incidents
 
 Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.
@@ -537,8 +609,102 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **Library defaults are design decisions:** an untouched gRPC default, tuned for clients of remote services, set this cluster's rejoin time.
   - **Report all of it:** a readiness check that reports only its first failure hides the pattern.
 
+### I5. Throughput collapses when one node leads every shard (fixed)
+
+- **Symptom:** in the first steady-state benchmark (docs/benchmarks.md), two configs with low contention and 32 clients had one run far below the others:
+  - single-shard: 398 against 558–645 committed transactions per second
+  - cross-shard: **45** against 173–236 per second, with **no aborts** but a median latency of 678 ms
+
+  In both outlying runs one node led all three shards; in the other runs leadership was spread. Contention-bound configs and the 8-client configs showed no such effect.
+- **Root cause:**
+  1. **Leaders are not balanced:** a shard's leader is whichever node wins its first election, and nothing moves it.
+  2. **One sender per peer:** a node's outbound messages to each peer, for all shards, go through one 1024-message queue drained by **one serial unary RPC at a time** (`internal/grpcnet`, `deliver`). On this machine that is roughly 2,300 RPCs per second per peer.
+  3. **Overflow:** with every leader on one node, all Accepts and two-phase commit messages leave through that node's two queues. The queues overflow, and the excess is silently dropped (`SendTraced`).
+  4. **Retransmission feeds the overflow:** Paxos retransmits a dropped Accept only on the next heartbeat, and each heartbeat resends **every** unchosen slot (`sendHeartbeats`), which refills the queue. Two-phase commit resends every 200 ms. The result is congestion collapse: more traffic per transaction, and latency set by retransmission timers.
+- **Evidence:**
+  - **Placement against throughput:** leadership per run, taken from the "became leader" log lines in all 40 runs, against throughput.
+  - **Drop counters:** a throwaway build with counters on the per-peer queue, both inboxes and RPC errors (not committed), on low / cross-shard 0.5 / 32 clients:
+
+    | Leader placement | Runs | Throughput | Peer-queue drops | RPCs sent |
+    |---|---|---|---|---|
+    | All shards on one node | 2 | 46.9 and 46.2 txn/s | 14,716 and 14,946 on the leader node | ~113–115k by the leader node, about 100 per committed transaction |
+    | Spread | 2 | 228 and 184 txn/s | 0 | 41–71k per node, about 26 per committed transaction |
+
+    Inbox drops and RPC errors were 0 in every run.
+- **Root cause, confirmed and refined in the fix:**
+  - **The loop, not the placement.** Concentrated leadership is only the most common trigger. The loop is item 4 above: any overflowing send queue, refilled by heartbeats that resend every unchosen slot.
+  - **Spread leadership is not immune.** Rerun with forced placement on a slow host (session A in docs/benchmarks.md), the old code also collapsed with spread leaders on cross-shard load: 63–148 transactions/s, with up to 11,466 drops a run.
+  - **Host speed decides whether the loop starts.** On a faster host (session B), the old code never overflowed its queues: 222/s with one node leading, 319/s spread, 0 drops. The exact pre-fix commit matched it within 2% in both sessions (219 and 315/s in session B). So the discrepancy with Phase 9a comes from the host, not from the comparison build (incident I7).
+- **Fix:** bounded Accept retransmission (DECISIONS.md entry 45). A leader resends a slot to a peer only if that peer has not voted, the last send is at least 80 ms old, and the slot is among the 8 least recently sent such slots for that peer in this heartbeat.
+  - **New counter:** `peer_messages_dropped_total{shard,node,reason}` counts every drop point.
+  - **Benchmark:** `scripts/bench.sh` can force leader placement and benchmark a given binary.
+  - **Results** (low contention, 32 clients, 5 runs each, before and after in the same session; full tables in docs/benchmarks.md). Session A, the slow host:
+
+    | Config | Leaders | Before | After |
+    |---|---|---|---|
+    | Single-shard | One node | 369 txn/s | 571 txn/s |
+    | Single-shard | Spread | 455 txn/s | 573 txn/s |
+    | Cross-shard 0.5 | One node | **37** txn/s, p99 1.58 s, 58,862 drops a run | **192** txn/s, p99 311 ms, 0 drops |
+    | Cross-shard 0.5 | Spread | 86 txn/s, 6,802 drops a run | 247 txn/s, 0 drops |
+
+    Session B, the faster host, cross-shard 0.5: with one node leading, 222 → **341**/s; spread, 319 → **382**/s; 0 drops throughout. The fix also helps without drops, because the old heartbeat resent every unchosen slot every 40 ms even when nothing was lost.
+  - **Remaining gap, not fixed here:** concentrated cross-shard throughput is 78% of spread on the slow host (192 vs 247/s) and 89% on the faster one (341 vs 382/s), short of the 80% target on the slow host. Two things cause it, and neither is a failure: there are no drops, and latency stays bounded.
+    - **CPU concentration:** in a concentrated run the leader node used about 1.4 CPU cores and each other node about 0.7. It does every shard's leader work and every coordinator's two-phase commit, on a 4-vCPU machine it shares with the other nodes and the load generator.
+    - **One serial RPC stream per peer:** all of that node's outbound traffic to each peer, for all three shards, goes through one unary RPC at a time.
+
+    Leader balancing was considered and not done (entry 45, Rejected); see Future work.
+  - **Not changed:** the transport (one serial RPC per peer).
+  - **Also found:** the first version of the fix resent the oldest slots first. Its unit test showed it starved later slots under persistent loss, so the fix resends the least recently sent instead.
+- **Lesson:**
+  - **Retransmission is traffic too.** A retransmit policy must be bounded by what was lost, not by what is outstanding. Otherwise overload produces more load.
+  - **Find the loop, not the trigger.** The trigger looked like leader placement, but the bug was a feedback loop that any overflow could start. Forcing placement in the benchmark showed that the spread case suffered too.
+  - **Spread is a finding:** a 5× spread between runs of the same config is a result to explain, not noise to average away. Recording the leader placement of every run is what pointed at the cause.
+  - **Make drops visible:** silent drops that rely on retransmission are safe for correctness, but under load they turn into a feedback loop. Every drop point needs a counter, and now has one.
+
+### I6. The benchmark harness stopped the cluster before in-doubt transactions finished
+
+- **Symptom:** the offline checkers reported two violations on two benchmark histories (low / cross-shard 0.5 / 32 clients, and the all-leaders-on-one-node experiment run):
+  - "atomicity: txn … committed by coordinator shard 0 but unresolved on shard 1"
+  - "bank: final total 1000037, want 1000000"
+- **Root cause:** the first version of `scripts/bench.sh` sent SIGTERM to the nodes as soon as loadgen exited. Cross-shard commits that were decided and logged at the coordinator, but whose commit record was not yet applied at a participant, were cut off mid-flight.
+  - **Not a 2PC failure:** the participant held a durable prepare record for each such transaction.
+  - **The checkers were right:** they assume a quiescent cluster ("nothing left prepared"), which the chaos runner guarantees by settling first and the harness did not.
+- **Evidence:**
+  - **Before the restart:** replaying the logs showed, for the reported transaction, a commit decision and outcome on shard 0, and `prepared = true` on shard 1, with 16 transactions in doubt on shard 1 at shutdown.
+  - **After the restart:** restarting each stopped cluster on its own data directories, the in-doubt participants asked the coordinator for the outcome and applied it within about 1 s. The checkers then passed with no violations on both histories (6,694 and 1,448 committed transactions).
+- **Fix:** `scripts/bench.sh` now waits (`settle`, up to 2 minutes) until every node answers `/readyz` and `txn_in_doubt` is 0 everywhere before stopping the nodes, as `cmd/chaos` does. A run that does not settle is marked `NOT_SETTLED`. A re-run with the fixed script settled every run and its history passed (2,491 committed transactions). The measurements are unaffected, since settling happens after loadgen has written its report.
+- **Lesson:**
+  - **Same preconditions:** a harness that reuses checkers must also reuse their preconditions.
+  - **Check the log before blaming the protocol:** before treating a checker failure as a protocol bug, look at the durable state of the transaction it names. Here the prepare record settled it in one query.
+  - **Free extra evidence:** the restart also exercised the recovery of in-doubt transactions after a full-cluster stop.
+
+### I7. The pre-fix baseline changed between sessions: the sandbox host is not stable
+
+- **Symptom:** Phase 9b's "before" runs disagreed with Phase 9a, on the same code.
+  - **Phase 9a:** cross-shard load with spread leaders gave 173–236 transactions/s and no queue overflow.
+  - **Phase 9b, session A (the same day):** the pre-fix code gave 86/s with spread leaders and 6,802 drops a run, and 37/s with one node leading every shard.
+  - **The next session (B):** it gave 315–319/s spread and 219–222/s with one node leading, with no drops.
+  - **The real-process negative test passed:** run against the old build on the session B host, the first version of `TestMultiProcessConcentratedLeadership` saw 0 drops, so it could not catch the old code.
+- **Root cause:** **the host, not the build.**
+  - **The builds behave the same.** The exact pre-fix commit fc53199 and the "before" build (this branch with the old heartbeat switched back on) agreed within 2% in session B (219 vs 222/s with one node leading, 315 vs 319/s spread, 5 interleaved runs each). They also matched in session A.
+  - **The sandbox moves between machines.** The container was restarted between the sessions. Phase 9a recorded a Xeon @ 2.80 GHz; session B ran on a Xeon @ 2.10 GHz that was faster for this workload. Session A's CPU was not recorded, so its host can only be inferred to be slower or more contended.
+  - **The old code's collapse is a threshold effect.** It needs the leader node's send queues to overflow. Whether they do depends on host speed, so the same code collapsed on one host and not on another.
+- **Fix:**
+  - **`scripts/bench.sh`** writes each run's CPU model and core count to `runs/*/machine`. It reports drops as `nan` for a binary without the counter, instead of 0.
+  - **docs/benchmarks.md** keeps the sessions in separate tables and compares builds only within one session. In session B the three builds were interleaved run by run.
+  - **`TestMultiProcessConcentratedLeadership`** runs every node at `GOMAXPROCS=1`, so the node leading every shard is the bottleneck on any host. It gates on drops and Accepts in flight, not throughput. Against the old build it now fails in every run on drops.
+- **Lesson:**
+  - **A benchmark baseline belongs to its machine.** Before comparing against a number from another session, re-measure the baseline in the same session and record the host with every run.
+  - **Make the negative test independent of the machine.** A negative test that depends on the machine being slow can pass vacuously. Make it create its own overload instead.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
+- **A streaming transport with batching.** Each node sends to each peer through one serial unary RPC at a time, about 2,300 messages per second per peer on the benchmark machine. That ceiling is what concentrated leadership hits first (incident I5). A bidirectional stream per peer, sending queued messages in batches, would raise it without changing Paxos.
+- **Leader balancing / leadership transfer.**
+  - **The gap:** with one node leading every shard, cross-shard throughput is 78% of spread (192 vs 247/s; incident I5, entry 45).
+  - **The evidence:** the leader node used about 1.4 CPU cores against about 0.7 for each other node. All of its traffic to each peer shares one serial RPC stream.
+  - **The idea:** a leader holding more shards than its share hands one to a less loaded peer. That needs a transfer protocol: catch the target up, then have it campaign with a hint so the old leader does not refuse it under stickiness.
+  - **Why it waits:** it is not needed for correctness or stability, since there are no drops and latency is bounded.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
 - **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).
