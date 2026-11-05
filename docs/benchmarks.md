@@ -85,10 +85,19 @@ Excluding those runs would hide a real behaviour, so they stay in the table. The
 ## Leader placement after the I5 fix
 
 Bounded Accept retransmission (DECISIONS.md entry 45) removed the feedback loop. To measure it without waiting for chance placements, `scripts/bench.sh` now forces placement: `PLACEMENT=concentrated` restarts each run's cluster until one node leads all three shards, and `PLACEMENT=spread` until each node leads one. `PAXOSD_BIN` runs a given binary.
-- **Before:** this branch built with the old resend-everything heartbeat switched back on. It differs from the original only in that, and it exports the new drop counter.
-- **After:** the fix.
 
-Low contention, 32 clients, 10 s warmup and 30 s measured, 5 runs per cell, the same machine on a later day. Cells are means (min–max). Queue drops are `peer_messages_dropped_total{reason="send_queue_full"}` summed over the nodes per run. Errors were 0 and every run settled.
+**Builds:**
+- **fc53199:** the exact pre-fix commit. It has no drop counter.
+- **before:** this branch built with the old resend-everything heartbeat switched back on. It differs from fc53199 only in that, and it exports the new counters.
+- **after:** the fix.
+
+**Setup:** low contention, 32 clients, 10 s warmup and 30 s measured, 5 runs per cell. Cells are means (min–max). Queue drops are `peer_messages_dropped_total{reason="send_queue_full"}` summed over the nodes per run. Errors were 0 and every run settled.
+
+**The host is not stable between sessions** (DECISIONS.md I7). The sandbox moves between machines. Phase 9a's runs had a Xeon @ 2.80 GHz. Session B below ran on a Xeon @ 2.10 GHz that was faster for this workload. Session A's host was not recorded. The same code gave very different numbers on different hosts, so **compare builds only within one session**. `bench.sh` now writes each run's CPU model to `runs/*/machine`.
+
+### Session A: a slow host, where the old code collapses
+
+Same day as the fix. Before and after ran back to back as one 40-run matrix.
 
 | Cross-shard | Leaders | Build | Committed txn/s | p50 ms | p99 ms | Queue drops |
 |---|---|---|---|---|---|---|
@@ -101,12 +110,41 @@ Low contention, 32 clients, 10 s warmup and 30 s measured, 5 runs per cell, the 
 | 0.5 | spread | before | 86 (63–148) | 48.5 | 1245 | 6,802 (63–11,466) |
 | 0.5 | spread | **after** | **247** (241–261) | 93.2 | 419 | 0 |
 
-What it says:
-- **The collapse is gone.** With one node leading every shard, cross-shard throughput went from 37 to 192/s, p99 from 1.6 s to 311 ms, and drops from about 59,000 a run to none.
-- **Spread leadership was hit too.** On this day the old code also dropped messages and collapsed with spread leaders on cross-shard load (63–148/s). The exact pre-fix commit, fc53199, gave the same: 59, 126 and 59/s over 3 runs. The loop needed any overflowing queue, not one particular placement. The first measurements above caught it only in the concentrated runs, and this machine is noisy from day to day, so compare within a table, not across tables.
-- **Placement still costs something on cross-shard load.** Concentrated leadership reaches 78% of spread (192 vs 247/s), short of a "within 20%" target. Single-shard is at parity (571 vs 573/s). In a concentrated run the leader node used about 1.4 CPU cores and each other node about 0.7. One node is doing every shard's leader work and every coordinator's two-phase commit, on a 4-vCPU machine it shares with the others and the load generator. That is uneven load, not a failure: there are no drops, and latency is bounded.
-- **Leader balancing was not added.** It would close the remaining gap, but it means leader-transfer machinery in the protocol, for a 22% difference on one machine (DECISIONS.md entry 45, Rejected).
-- **Regression test:** `PAXOSD_PLACEMENT=1 go test -run TestMultiProcessConcentratedLeadership ./cmd/paxosd` runs both placements and fails on drops, or on concentrated below 60% of spread. With `PAXOSD_BIN` set to the old build it fails: 47,410 drops, 51%.
+fc53199 on spread leaders, 3 runs in the same session: 59, 126 and 59/s, the same as "before".
+
+### Session B: a faster host (Xeon @ 2.10 GHz), where it does not
+
+The next session, after the sandbox was restarted on another machine. Cross-shard 0.5 only. All three builds were interleaved run by run (fc53199, before and after, each with both placements, then the next repetition), so drift hits every build alike.
+
+| Leaders | Build | Committed txn/s | p50 ms | p99 ms | Queue drops |
+|---|---|---|---|---|---|
+| one node | fc53199 | 219 (182–251) | 141 | 302 | n/a (no counter) |
+| one node | before | 222 (189–257) | 143 | 273 | 0 |
+| one node | **after** | **341** (336–345) | 91.5 | 167 | 0 |
+| spread | fc53199 | 315 (294–334) | 53.5 | 391 | n/a |
+| spread | before | 319 (297–335) | 53.1 | 383 | 0 |
+| spread | **after** | **382** (377–389) | 70.4 | 214 | 0 |
+
+### What the two sessions say
+
+- **The before build is the original.** fc53199 and "before" agree within 2% in both cells of session B, and they matched in session A too. The two builds behave the same.
+- **The Phase 9a discrepancy comes from the host, not from the build.**
+  - In Phase 9a, spread leadership gave 173–236/s with no overflow.
+  - In session A, the same code collapsed even with spread leaders: 86/s, 6,802 drops a run.
+  - In session B it never overflowed: 315–319/s, 0 drops.
+
+  Whether the old code collapses depends on whether the leader node's send queues overflow, and that depends on how fast the host is.
+- **The fix removes the collapse where it happens** (session A): with one node leading every shard, cross-shard throughput went from 37 to 192/s, p99 from 1.6 s to 311 ms, and drops from about 59,000 a run to none.
+- **It also helps where nothing is dropped** (session B): with one node leading, 222 → 341/s (+54%), and with spread leaders 319 → 382/s (+20%). The old heartbeat resent every unchosen slot to every peer every 40 ms, even when nothing had been lost (about 30 slots in flight at a time here), so much of the leader's RPC capacity went to duplicates.
+- **Placement still costs something on cross-shard load.** Concentrated over spread is 78% in session A (192 vs 247/s) and 89% in session B (341 vs 382/s). Single-shard is at parity (571 vs 573/s, session A). There are two causes:
+  - **CPU concentration:** the node leading every shard does all leader and coordinator work. In a session A run it used about 1.4 CPU cores, against about 0.7 for each other node, on a 4-vCPU machine shared with the other nodes and the load generator.
+  - **One serial RPC stream per peer:** all of that node's traffic to each peer goes through one unary RPC at a time.
+
+  That is uneven load, not a failure: there are no drops, and latency is bounded.
+- **Leader balancing was not added** (DECISIONS.md entry 45, Rejected; it is in Future work as leadership transfer).
+- **Regression test:** `PAXOSD_PLACEMENT=1 go test -run TestMultiProcessConcentratedLeadership ./cmd/paxosd`. It passes or fails only on dropped messages and Accepts in flight. Its nodes run at `GOMAXPROCS=1`, so the leader node is the bottleneck on any host. The throughput ratio is reported, not checked. Measured on the session B host:
+  - **The fix:** 0 drops, at most 46 Accepts in flight, ratio 0.77.
+  - **`PAXOSD_BIN` set to the old build:** it fails in every run on drops (17,101 and 18,812 with one node leading; 2,665 and 543 with spread leaders), ratio 0.39.
 
 Reproduce:
 

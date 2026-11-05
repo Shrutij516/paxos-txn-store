@@ -633,11 +633,12 @@ Things that broke after they were merged, and why. Every phase that finds someth
     Inbox drops and RPC errors were 0 in every run.
 - **Root cause, confirmed and refined in the fix:**
   - **The loop, not the placement.** Concentrated leadership is only the most common trigger. The loop is item 4 above: any overflowing send queue, refilled by heartbeats that resend every unchosen slot.
-  - **Spread leadership is not immune.** Rerun with forced placement (5 runs each, the same machine on another day), the old code also collapsed with spread leaders on cross-shard load: 63–148 transactions/s, with up to 11,466 drops a run. The exact pre-fix commit gave the same, 59–126/s over 3 runs, so the cause is the code, not the comparison build.
+  - **Spread leadership is not immune.** Rerun with forced placement on a slow host (session A in docs/benchmarks.md), the old code also collapsed with spread leaders on cross-shard load: 63–148 transactions/s, with up to 11,466 drops a run.
+  - **Host speed decides whether the loop starts.** On a faster host (session B), the old code never overflowed its queues: 222/s with one node leading, 319/s spread, 0 drops. The exact pre-fix commit matched it within 2% in both sessions (219 and 315/s in session B). So the discrepancy with Phase 9a comes from the host, not from the comparison build (incident I7).
 - **Fix:** bounded Accept retransmission (DECISIONS.md entry 45). A leader resends a slot to a peer only if that peer has not voted, the last send is at least 80 ms old, and the slot is among the 8 least recently sent such slots for that peer in this heartbeat.
   - **New counter:** `peer_messages_dropped_total{shard,node,reason}` counts every drop point.
   - **Benchmark:** `scripts/bench.sh` can force leader placement and benchmark a given binary.
-  - **Results** (low contention, 32 clients, 5 runs each; full table in docs/benchmarks.md):
+  - **Results** (low contention, 32 clients, 5 runs each, before and after in the same session; full tables in docs/benchmarks.md). Session A, the slow host:
 
     | Config | Leaders | Before | After |
     |---|---|---|---|
@@ -646,7 +647,8 @@ Things that broke after they were merged, and why. Every phase that finds someth
     | Cross-shard 0.5 | One node | **37** txn/s, p99 1.58 s, 58,862 drops a run | **192** txn/s, p99 311 ms, 0 drops |
     | Cross-shard 0.5 | Spread | 86 txn/s, 6,802 drops a run | 247 txn/s, 0 drops |
 
-  - **Remaining gap, not fixed here:** concentrated cross-shard throughput is 78% of spread (192 vs 247/s), short of the 80% target. Two things cause it, and neither is a failure: there are no drops, and latency stays bounded.
+    Session B, the faster host, cross-shard 0.5: with one node leading, 222 → **341**/s; spread, 319 → **382**/s; 0 drops throughout. The fix also helps without drops, because the old heartbeat resent every unchosen slot every 40 ms even when nothing was lost.
+  - **Remaining gap, not fixed here:** concentrated cross-shard throughput is 78% of spread on the slow host (192 vs 247/s) and 89% on the faster one (341 vs 382/s), short of the 80% target on the slow host. Two things cause it, and neither is a failure: there are no drops, and latency stays bounded.
     - **CPU concentration:** in a concentrated run the leader node used about 1.4 CPU cores and each other node about 0.7. It does every shard's leader work and every coordinator's two-phase commit, on a 4-vCPU machine it shares with the other nodes and the load generator.
     - **One serial RPC stream per peer:** all of that node's outbound traffic to each peer, for all three shards, goes through one unary RPC at a time.
 
@@ -675,6 +677,25 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **Same preconditions:** a harness that reuses checkers must also reuse their preconditions.
   - **Check the log before blaming the protocol:** before treating a checker failure as a protocol bug, look at the durable state of the transaction it names. Here the prepare record settled it in one query.
   - **Free extra evidence:** the restart also exercised the recovery of in-doubt transactions after a full-cluster stop.
+
+### I7. The pre-fix baseline changed between sessions: the sandbox host is not stable
+
+- **Symptom:** Phase 9b's "before" runs disagreed with Phase 9a, on the same code.
+  - **Phase 9a:** cross-shard load with spread leaders gave 173–236 transactions/s and no queue overflow.
+  - **Phase 9b, session A (the same day):** the pre-fix code gave 86/s with spread leaders and 6,802 drops a run, and 37/s with one node leading every shard.
+  - **The next session (B):** it gave 315–319/s spread and 219–222/s with one node leading, with no drops.
+  - **The real-process negative test passed:** run against the old build on the session B host, the first version of `TestMultiProcessConcentratedLeadership` saw 0 drops, so it could not catch the old code.
+- **Root cause:** **the host, not the build.**
+  - **The builds behave the same.** The exact pre-fix commit fc53199 and the "before" build (this branch with the old heartbeat switched back on) agreed within 2% in session B (219 vs 222/s with one node leading, 315 vs 319/s spread, 5 interleaved runs each). They also matched in session A.
+  - **The sandbox moves between machines.** The container was restarted between the sessions. Phase 9a recorded a Xeon @ 2.80 GHz; session B ran on a Xeon @ 2.10 GHz that was faster for this workload. Session A's CPU was not recorded, so its host can only be inferred to be slower or more contended.
+  - **The old code's collapse is a threshold effect.** It needs the leader node's send queues to overflow. Whether they do depends on host speed, so the same code collapsed on one host and not on another.
+- **Fix:**
+  - **`scripts/bench.sh`** writes each run's CPU model and core count to `runs/*/machine`. It reports drops as `nan` for a binary without the counter, instead of 0.
+  - **docs/benchmarks.md** keeps the sessions in separate tables and compares builds only within one session. In session B the three builds were interleaved run by run.
+  - **`TestMultiProcessConcentratedLeadership`** runs every node at `GOMAXPROCS=1`, so the node leading every shard is the bottleneck on any host. It gates on drops and Accepts in flight, not throughput. Against the old build it now fails in every run on drops.
+- **Lesson:**
+  - **A benchmark baseline belongs to its machine.** Before comparing against a number from another session, re-measure the baseline in the same session and record the host with every run.
+  - **Make the negative test independent of the machine.** A negative test that depends on the machine being slow can pass vacuously. Make it create its own overload instead.
 
 ## Future work
 
