@@ -1,0 +1,144 @@
+name: aws-loadtest
+
+# Failover under load on the running AWS cluster (docs/aws.md "Failover
+# under load", DECISIONS.md entry 46). Runs loadgen on node 1 from the
+# image the nodes run, SIGKILLs the node leading the most shards (not node
+# 1) in the middle of the measured window, restarts it 30 s later, and
+# reports failover per shard, throughput and latency before, during and
+# after the kill, and the restarted node's time to ready. Then runs the
+# chaos checkers on the history and every node's SQLite files.
+#
+# Needs a deployed cluster (deploy.yml) whose image was built at Phase 9c or
+# later (it must contain /loadgen), and the bootstrap's loadtest bucket. No
+# AWS keys: credentials come from GitHub OIDC, as in deploy.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Measured seconds (after a 10 s warmup)"
+        required: false
+        default: "120"
+      kill_at:
+        description: "Seconds into the measured window at which the victim is killed"
+        required: false
+        default: "60"
+      down:
+        description: "Seconds the victim stays down before its restart"
+        required: false
+        default: "30"
+      clients:
+        description: "Concurrent loadgen clients"
+        required: false
+        default: "32"
+
+permissions:
+  contents: read
+  id-token: write
+
+# Shared with deploy.yml and destroy.yml: never while the cluster is being
+# changed or torn down.
+concurrency:
+  group: terraform-cluster
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.17.1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  # The restarted node must be ready this soon (incident I4: up to 115 s
+  # before the fix; seconds after it, including catching up under load).
+  REJOIN_BOUND_S: "30"
+
+jobs:
+  failover:
+    runs-on: ubuntu-24.04
+    environment: aws
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: check the inputs
+        env:
+          DURATION: ${{ inputs.duration }}
+          KILL_AT: ${{ inputs.kill_at }}
+          DOWN: ${{ inputs.down }}
+          CLIENTS: ${{ inputs.clients }}
+        run: |
+          for v in DURATION KILL_AT DOWN CLIENTS; do
+            [[ ${!v} =~ ^[0-9]+$ ]] || { echo "$v must be a whole number, got '${!v}'" >&2; exit 1; }
+          done
+          (( KILL_AT > 10 && KILL_AT + DOWN + 20 <= DURATION )) || {
+            echo "need 10 < kill_at and kill_at + down + 20 <= duration (time to see the rejoined cluster)" >&2
+            exit 1
+          }
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: build the checkers
+        run: go build -o "$RUNNER_TEMP/chaos" ./cmd/chaos
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: loadtest-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Only to read the instance IDs and private IPs from the state.
+      - name: terraform init
+        working-directory: deploy/terraform/cluster
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: failover under load
+        working-directory: deploy/terraform/cluster
+        env:
+          DURATION: ${{ inputs.duration }}
+          KILL_AT: ${{ inputs.kill_at }}
+          DOWN: ${{ inputs.down }}
+          CLIENTS: ${{ inputs.clients }}
+          RUN_ID: run-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          export LOADTEST_BUCKET=paxos-txn-store-loadtest-$account
+          ../../../scripts/aws-failover-load.sh run aws "$RUNNER_TEMP/out"
+
+      - name: summary
+        run: scripts/aws-failover-report.py "$RUNNER_TEMP/out" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: check the history (chaos checkers)
+        run: |
+          out=$RUNNER_TEMP/out
+          set +e
+          "$RUNNER_TEMP/chaos" -cluster deploy/cluster.json -check-history "$out/history.jsonl" \
+            -check-data "$out/data/node1,$out/data/node2,$out/data/node3" 2>&1 | tee "$out/check.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          { echo; echo '#### History check'; echo '```'; cat "$out/check.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: rejoin within the bound (incident I4)
+        if: ${{ !cancelled() }}
+        run: |
+          r=$(jq -r '.rejoin_s // "none"' "$RUNNER_TEMP/out/summary.json")
+          if [[ $r == none ]] || ! awk -v r="$r" -v b="$REJOIN_BOUND_S" 'BEGIN {exit !(r <= b)}'; then
+            echo "::error::the restarted node was not ready within $REJOIN_BOUND_S s (rejoin: $r)"
+            echo "**Rejoin: FAILED** ($r s, bound $REJOIN_BOUND_S s)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "**Rejoin: passed** ($r s, bound $REJOIN_BOUND_S s)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: aws-loadtest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          if-no-files-found: warn

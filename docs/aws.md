@@ -2,7 +2,7 @@
 
 The AWS deployment has two Terraform stacks in `deploy/terraform/`:
 
-- `bootstrap/`: applied once, by hand, from an operator's machine, with local state. It creates the S3 bucket that holds the cluster stack's state, the GitHub OIDC provider, and the IAM role GitHub Actions assumes to deploy.
+- `bootstrap/`: applied once, by hand, from an operator's machine, with local state. It creates the S3 bucket that holds the cluster stack's state, the GitHub OIDC provider, the IAM role GitHub Actions assumes to deploy, and a short-lived bucket for the failover-under-load test's outputs.
 - `cluster/`: the VPC and the three nodes. It is applied as that role by `.github/workflows/deploy.yml` and removed by `destroy.yml`, both in the `aws` environment, with its state in the bucket. See [Cluster stack](#cluster-stack) below.
 
 Why it is split this way, and what the deploy role may do, is in DECISIONS.md entry 40.
@@ -13,7 +13,7 @@ Account 289112219115, region us-east-1. Run it as an administrator: the IAM user
 
 ### What it creates
 
-`terraform plan` should end with **`Plan: 10 to add, 0 to change, 0 to destroy.`** These are the 10 resources:
+On a fresh account, `terraform plan` should end with **`Plan: 16 to add, 0 to change, 0 to destroy.`** These are the 16 resources (the last 6 were added in Phase 9c; an existing bootstrap gets them by [re-applying](#re-applying-the-bootstrap-for-the-load-test-bucket-phase-9c)):
 
 | Resource | Name |
 |---|---|
@@ -27,8 +27,14 @@ Account 289112219115, region us-east-1. Run it as an administrator: the IAM user
 | `aws_iam_openid_connect_provider.github` | `token.actions.githubusercontent.com`, audience `sts.amazonaws.com` |
 | `aws_iam_role.deploy` | `paxos-txn-store-deploy`, 1-hour sessions |
 | `aws_iam_role_policy.deploy` | `paxos-txn-store-deploy` (inline permissions) |
+| `aws_s3_bucket.loadtest` | `paxos-txn-store-loadtest-289112219115` (force_destroy: disposable contents) |
+| `aws_s3_bucket_ownership_controls.loadtest` | BucketOwnerEnforced |
+| `aws_s3_bucket_public_access_block.loadtest` | all four blocks on |
+| `aws_s3_bucket_server_side_encryption_configuration.loadtest` | AES256 (SSE-S3) |
+| `aws_s3_bucket_lifecycle_configuration.loadtest` | every object expires after 1 day |
+| `aws_s3_bucket_policy.loadtest` | TLS only; only the node role may write, and only under `runs/` |
 
-The plan also reads 6 data sources: the caller identity (the account ID comes from here and is never written into the code), the partition, the region, and three policy documents (the bucket policy, the role's trust policy and its permissions). It creates no DynamoDB table and no budget; the $15 monthly budget already exists. If the plan wants to change or destroy anything, or shows a count other than 10, stop.
+The plan also reads 7 data sources: the caller identity (the account ID comes from here and is never written into the code), the partition, the region, and four policy documents (the two bucket policies, the role's trust policy and its permissions). It creates no DynamoDB table and no budget; the $15 monthly budget already exists. If the plan wants to change or destroy anything, or shows a count other than 16, stop.
 
 ### Steps (macOS)
 
@@ -47,7 +53,7 @@ aws sts get-caller-identity
 cd deploy/terraform/bootstrap
 terraform init                          # downloads hashicorp/aws 6.71.x, checked against .terraform.lock.hcl
 terraform test                          # offline policy checks: no AWS calls, should say "1 passed"
-terraform plan -out=bootstrap.tfplan    # check the table above: 10 to add
+terraform plan -out=bootstrap.tfplan    # check the table above: 16 to add
 terraform apply bootstrap.tfplan
 terraform output
 ```
@@ -56,7 +62,7 @@ terraform output
 
 Then:
 
-- **Back up the state.** `terraform.tfstate` stays in `deploy/terraform/bootstrap/`, is ignored by git, and is the only record Terraform has of these 10 resources. It holds no secrets. Copy it somewhere private and durable, not into this repository. If it is lost, the resources keep working but have to be re-imported (`terraform import`) before Terraform can change or remove them.
+- **Back up the state.** `terraform.tfstate` stays in `deploy/terraform/bootstrap/`, is ignored by git, and is the only record Terraform has of these 16 resources. It holds no secrets. Copy it somewhere private and durable, not into this repository. If it is lost, the resources keep working but have to be re-imported (`terraform import`) before Terraform can change or remove them.
 - **Commit the lock file if it changed.** `terraform init` on a Mac may add `zh:` checksums to `.terraform.lock.hcl`; commit that change. The checksums already in the file were taken from HashiCorp's signed release for linux and darwin, amd64 and arm64.
 
 ### The GitHub environment "aws"
@@ -136,6 +142,24 @@ The plan must show **`Plan: 0 to add, 1 to change, 0 to destroy.`** The one chan
 
 The new policy is 6,739 characters, under the 10,240 limit. If the plan changes or replaces the bucket, the OIDC provider or the role itself, stop. (The `#checkov:skip` comments on the bucket are comments and change nothing.)
 
+### Re-applying the bootstrap for the load-test bucket (Phase 9c)
+
+Phase 9c adds the bucket that the [failover-under-load workflow](#failover-under-load) uses to move its outputs off the nodes, and lets the deploy role read it. Re-apply as in the previous section (`terraform test` should still say 1 passed). The plan must show **`Plan: 6 to add, 1 to change, 0 to destroy.`**
+
+- **Added:** `aws_s3_bucket.loadtest` (`paxos-txn-store-loadtest-289112219115`), plus its ownership controls, public access block, encryption, lifecycle (expire after 1 day) and bucket policy.
+- **Bucket policy:**
+  - TLS only.
+  - `s3:PutObject` and `s3:AbortMultipartUpload` on `runs/*`, for `Principal: *` narrowed by two conditions: `aws:PrincipalAccount` = this account, and `aws:PrincipalArn` = `arn:aws:iam::289112219115:role/paxos-txn-store-node`. Fixed values of those two keys keep the policy non-public, so Block Public Access accepts it.
+  - The node role is named in a condition because it does not exist yet when the bootstrap is applied, and a principal must exist. The node role itself gets no new IAM policy.
+- **Changed in place:** `aws_iam_role_policy.deploy`. The `policy` diff should only add two statements:
+  - `LoadtestBucketList`: `s3:ListBucket` on the bucket, with `s3:prefix` like `runs/*`.
+  - `LoadtestRead`: `s3:GetObject` on `runs/*`.
+
+  The policy goes from 6,739 to 7,059 characters, under the 10,240 limit.
+- **New output:** `loadtest_bucket`.
+
+If the plan changes or replaces the state bucket, the OIDC provider or the role itself, stop. Nothing in the cluster stack changes: the nodes already reach S3 over their HTTPS egress rule.
+
 ### Undoing the bootstrap
 
 Undo it only after the cluster stack has been destroyed and nothing uses the role. The bucket has `prevent_destroy`, and its versioning keeps every old state, so removing it takes deliberate steps:
@@ -155,8 +179,8 @@ aws s3api delete-objects --bucket "$B" --delete \
 # 2. Allow the bucket to be destroyed: in state_bucket.tf, set
 #    prevent_destroy = false (do not commit this change).
 
-# 3. Destroy all 10 resources.
-terraform plan -destroy -out=destroy.tfplan    # should say: 10 to destroy
+# 3. Destroy all 16 resources (the loadtest bucket is emptied with it).
+terraform plan -destroy -out=destroy.tfplan    # should say: 16 to destroy
 terraform apply destroy.tfplan
 ```
 
@@ -358,6 +382,61 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/readyz    # 200 w
 
 Stop the watcher with Ctrl-C.
 
+### Failover under load
+
+`aws-loadtest.yml` automates the leader-kill test above under steady load (DECISIONS.md entry 46). It runs the benchmark load on node 1, kills the node leading the most shards in the middle of the run, restarts it, and reports:
+- failover time per shard;
+- throughput and latency before, during and after the kill;
+- the restarted node's time to ready;
+- the result of the chaos checkers on the whole history.
+
+**Prerequisites:**
+- The bootstrap is re-applied with the [load-test bucket](#re-applying-the-bootstrap-for-the-load-test-bucket-phase-9c).
+- The cluster runs an image built at Phase 9c or later. The image must contain `/loadgen`; the workflow checks this and stops if it is missing.
+
+**Steps:**
+
+1. **Deploy.** Run **Actions → deploy → Run workflow** on `main` with **image_digest** empty, then approve **plan** and **apply** as in [Deploying](#deploying). Wait until the smoke check is green on all three nodes.
+2. **Run the test.** **Actions → aws-loadtest → Run workflow** on `main`. The defaults are 120 s measured, kill at 60 s, 30 s down and 32 clients. **Run workflow**, then **Review deployments → aws → Approve and deploy**. It takes about 5 minutes.
+3. **Read the results.** They are on the run's summary page:
+   - the failover table, one row per shard the victim led;
+   - the phase table: before, during (the first 10 s after the kill), after (until the victim is ready again) and after rejoin;
+   - the rejoin time, error counts and the checkers' result.
+
+   The job fails if the checkers find a violation, or if the restarted node is not ready within 30 s (`REJOIN_BOUND_S`). That bound is the I4 fix confirmed on real machines: before it, a node down for 180 s needed up to 115 s; after it, a second idle, plus the time to catch up on what was committed while it was down.
+4. **Destroy.** **Actions → destroy → Run workflow**, as in [Destroying](#destroying). Do not leave the cluster running, since it costs about $2 a day.
+
+**What it does,** all over SSM `AWS-RunShellScript` (`scripts/aws-failover-load.sh run aws`):
+1. Reads the instance IDs and private IPs from the cluster state, and the image digest node 1 runs.
+2. **Starts the load on node 1.** loadgen runs in a container from the same digest-pinned image, with `--network host`, against all three nodes' private IPs:
+   - benchmark mode, low contention, cross-shard 0.5, 32 clients, 10,000 accounts;
+   - 10 s warmup, then 120 s measured;
+   - a per-second line of throughput and latency in its log, and a timeline of every transaction.
+
+   A sampler also starts on node 1 (a transient systemd unit). It reads `paxos_is_leader` from every node every 100 ms.
+3. **Chooses and kills the victim.** 60 s into the measured window, it picks the node leading the most shards. If that is node 1, it takes whichever of nodes 2 and 3 leads more (ties go to the lower ID), so loadgen survives. The victim's restart policy is turned off, then its paxosd is `SIGKILL`ed with `docker kill -s KILL`, and the kill time is recorded on the victim.
+4. **Restarts the victim** 30 s later (restart policy back on, `docker start`) and times it until `/readyz` answers 200.
+5. **Settles.** When loadgen ends, it waits until every node is ready with nothing in doubt.
+6. **Moves the outputs.** Node 1 uploads loadgen's history, timeline, report and log and the sampler's output, and every node uploads a copy of its SQLite files. They go to `s3://paxos-txn-store-loadtest-<account>/runs/run-<run id>-<attempt>/`. The runner downloads them.
+7. **Reports and checks.** `scripts/aws-failover-report.py` writes the summary, and `chaos -check-history … -check-data …` checks the history against all three nodes' logs. The job fails if it finds a violation.
+
+**Where results go:**
+- **The run's summary page:** the tables above and the checker output.
+- **The workflow artifact `aws-loadtest-<run id>-<attempt>`,** kept 1 day. It holds:
+  - `summary.md` and `summary.json`;
+  - `events.env` (victim, kill, restart and ready times);
+  - `leaders.txt` (every sample), `timeline.jsonl`, `report.json`, `history.jsonl` and `loadgen.log`;
+  - `data/node1..3/` (the SQLite files) and `check.log`.
+- **The bucket** keeps its copy 1 day.
+
+To keep a result, copy the summary into the [results section](#results-failover-under-load) of this page.
+
+**Caveats:**
+- **loadgen shares node 1's CPU.** It runs on node 1 with node 1's paxosd, Prometheus, Grafana and Jaeger, on 2 vCPUs. Node 1 is never killed, so it is busy throughout: it carries load generation and a survivor's share of the cluster's work.
+- **CPU credits.** The nodes are t3.small with standard credits. A long or repeated run can use up the credit balance and be throttled to the 20% baseline, which shows as a throughput drop unrelated to the kill. Compare runs only when CloudWatch `CPUCreditBalance` is not near 0.
+- **Clocks.** Failover times compare the victim's clock (kill) with node 1's clock (samples). Both use Amazon Time Sync, which keeps them within about a millisecond. The 100 ms sample interval dominates the error.
+- **Tracing is on.** The nodes trace at the deployed `-trace-sample 0.1`, which adds a little to every request.
+
 ### Destroying
 
 1. **Actions → destroy → Run workflow**, on `main`. **confirm:** type `destroy`, then choose **Run workflow**.
@@ -393,7 +472,7 @@ aws ec2 describe-vpcs --filters Name=tag:Project,Values=$T --query 'Vpcs[].VpcId
 aws iam get-role --role-name $T-node 2>&1 | grep -q NoSuchEntity && echo "role: gone"
 aws iam get-instance-profile --instance-profile-name $T-node 2>&1 | grep -q NoSuchEntity && echo "instance profile: gone"
 
-# Everything still tagged: only the bootstrap's state bucket (and, if listed, its deploy role and OIDC provider)
+# Everything still tagged: only the bootstrap's state and load-test buckets (and, if listed, its deploy role and OIDC provider)
 aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$T \
   --query 'ResourceTagMappingList[].ResourceARN' --output text
 ```
@@ -467,3 +546,11 @@ How these were measured:
 - **Small sample:** two kills, of two different nodes, are not a distribution. They show the order of magnitude, not a percentile.
 - **Resolution:** 200 ms, as above.
 - **Rejoin baseline:** the rejoin times were measured before the fix and depend on when each backoff timer happened to fire, so they vary from run to run.
+
+## Results: failover under load
+
+Not run yet. After a run of `aws-loadtest.yml`, record here:
+- the run ID and the image digest;
+- the run's `summary.md`;
+- the checkers' result;
+- any incident.

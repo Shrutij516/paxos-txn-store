@@ -530,6 +530,52 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **More leader state:** one small map per unchosen slot, scanned and sorted per peer at each heartbeat (O(unchosen slots) per peer, as before).
   - **A higher latency floor after a loss:** a single lost Accept now waits up to `RetransmitAfter` (80 ms) plus a heartbeat (40 ms) rather than one heartbeat. With loss rare, the median is unaffected.
 
+## 46. Failover under load on AWS: one manual workflow, orchestrated from the runner over SSM
+
+- **What:**
+  - **`aws-loadtest.yml`** (manual, environment `aws`, the deploy role through OIDC, concurrency group `terraform-cluster` shared with deploy and destroy). It runs the benchmark load against the deployed cluster and SIGKILLs the node leading the most shards in the middle of the measured window. Node 1 is never the victim, because it runs loadgen. The workflow restarts the victim 30 s later and reports:
+    - failover time per shard the victim led;
+    - throughput, p50/p99 and errors before, during (the first 10 s), after (until the victim is ready) and after rejoin;
+    - the victim's time to `/readyz` 200, checked against a 30 s bound (incident I4).
+
+    It then runs the chaos checkers on the history against all three nodes' SQLite logs. Raw outputs are a 1-day artifact.
+  - **The image carries `/loadgen`** next to `/paxosd`: same multi-stage Dockerfile, still distroless and nonroot. It adds 13.0 MB uncompressed (20.5 → 33.5 MB) and about 5.1 MB compressed (8.8 → 13.9 MB, `docker save`). loadgen runs from the digest node 1 runs (`/etc/paxosd/image-digest`), never from a tag.
+  - **`loadgen -timeline`** writes one JSON line per finished transaction: its wall-clock end, end-to-end latency and outcome. A header line gives the wall-clock window. loadgen also prints a summary every second.
+  - **`scripts/aws-failover-load.sh`** holds both halves:
+    - **The orchestration**, run on the runner. It sequences every step and reads the instance IDs and IPs from the cluster state.
+    - **The node steps**, run with `AWS-RunShellScript` on the nodes: start the load and the leader sampler, read the status and the leaders, kill, restart, finish, upload. The script travels inside each command, gzipped and base64-encoded.
+
+    With `run local` the same sequence drives three native processes, for testing.
+
+    **`scripts/aws-failover-report.py`** turns the outputs into the summary.
+  - **A bootstrap bucket for the outputs.** `paxos-txn-store-loadtest-<account>` has objects that expire after 1 day, and is TLS only.
+    - **Bucket policy:** the node role, matched by `aws:PrincipalArn`, may only `PutObject` under `runs/`.
+    - **Deploy role:** gains `s3:ListBucket` (prefix `runs/*`) and `s3:GetObject` on `runs/*`. Its policy goes from 6,739 to 7,059 characters.
+    - **Unchanged:** the cluster stack and the node role's IAM policies.
+- **Why:**
+  - **The manual leader-kill test measured an idle cluster** (docs/aws.md, first AWS run). A failover's cost to clients shows only under load: in-flight two-phase commits, retries, latency spikes. That needs the kill timed against a running load, and recorded on both sides.
+  - **Orchestrating from the runner keeps the nodes' permissions as they are.** Only the runner can reach every node: it holds the deploy role's `ssm:SendCommand`. A script on node 1 could not kill another node's paxosd without SSH, or SSM rights for the node role.
+  - **Kill time is recorded on the victim, samples on node 1, both against Amazon Time Sync.** The SSM delay before the kill (a second or two) does not enter the measurement.
+  - **loadgen from the same image** keeps the workload the one the benchmarks and chaos runs use. It is pinned by the same digest that was reviewed at deploy, needs no Go toolchain or extra download on the nodes, and needs no new egress.
+  - **The checkers need the logs, not just the history.** Atomicity, conservation, strict serializability and outcome checks all replay the committed logs (`chaos.LoadShards`). The history (around 10 MB) and three nodes' SQLite files (tens of MB) are far over SSM's 24,000-character output limit, so they go through S3.
+  - **Why the bucket is in the bootstrap:** it is created by the administrator who applies the bootstrap, so the deploy role needs no `s3:CreateBucket` or `PutBucketPolicy`.
+  - **Why a bucket policy:** the node role gets write access there rather than an IAM policy, which keeps the rule that the deploy role can attach nothing but `AmazonSSMManagedInstanceCore` to the node role.
+  - **The rejoin bound confirms I4 on real machines.** Before the fix a node down for 180 s needed up to 115 s; a 30 s bound leaves room for catching up under load, and fails loudly on a regression.
+- **Rejected:**
+  - **Running loadgen on the runner:** it is outside the VPC, so the nodes would need a public 7001 opening (`client_cidrs`) for GitHub's address ranges, and every request would cross the internet. Latency numbers would measure that path.
+  - **A fourth instance for loadgen:** a cleaner CPU picture, but a cluster stack change, more cost, and one more thing to forget to destroy. The CPU sharing on node 1 is stated as a caveat instead.
+  - **Chunking the files through SSM output:** no new permissions, but hundreds of commands for a run's data, slow and fragile.
+  - **SSM's own S3 output** (`OutputS3BucketName`), or CloudWatch Logs: either needs the node role to write somewhere through an IAM policy (the same grant, in a place the deploy role cannot attach today), and it captures only command output, not files.
+  - **Running the checkers on node 1:** no transfer, but it needs a checker binary in the production image, checks only node 1's replica, and keeps no copy of the evidence.
+  - **Naming the node role as the bucket policy's principal:** cleaner to read, but the role does not exist when the bootstrap is applied, and S3 rejects a policy whose principal does not exist.
+  - **Killing with `docker stop` or SIGTERM:** a graceful stop is not a failure. `docker kill -s KILL` with the restart policy off matches the manual test and the chaos runner's kill.
+- **Tradeoff:**
+  - **The image grows by 13 MB uncompressed** on every node, including nodes that never run load.
+  - **Node 1 is overloaded by design.** It runs loadgen, a paxosd that is never killed, and the observability containers on 2 vCPUs, so absolute numbers are lower than a dedicated client would see. Before/during/after comparisons within one run are still meaningful.
+  - **The nodes can now write to one S3 prefix.** A compromised node could fill it with up to a day's worth of objects; it cannot read, list or delete anything there.
+  - **No fixed placement:** the victim leads whatever the elections gave it. A run where nodes 2 and 3 lead no shard kills a node that leads nothing, and the summary says so; run it again.
+  - **One kill per run:** a single kill per run is an example, not a distribution, as in the manual test.
+
 ## Incidents
 
 Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.

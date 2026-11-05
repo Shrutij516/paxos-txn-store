@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # After destroying the cluster: lists everything still tagged
-# Project=paxos-txn-store. The bootstrap's state bucket, deploy role and
-# OIDC provider are expected to stay (the IAM ones only if the tagging API
+# Project=paxos-txn-store. The bootstrap's state and load-test buckets,
+# deploy role and OIDC provider are expected to stay (the IAM ones only if the tagging API
 # lists them); any other ARN is reported. The tagging API can keep listing deleted resources
 # for a while (terminated instances for up to an hour), so the authoritative
 # checks are EC2's own: no instance that is not terminated, and no VPC.
@@ -18,7 +18,7 @@ arns=$(aws resourcegroupstaggingapi get-resources --region "$region" \
   --tag-filters "Key=Project,Values=$tag" --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t' '\n' | sed '/^$/d' | sort)
 for arn in $arns; do
   case $arn in
-    arn:aws:s3:::$tag-tfstate-* | arn:aws:iam::*:role/$tag-deploy | arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com)
+    arn:aws:s3:::$tag-tfstate-* | arn:aws:s3:::$tag-loadtest-* | arn:aws:iam::*:role/$tag-deploy | arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com)
       echo "expected (bootstrap): $arn" ;;
     *) echo "::warning::still listed: $arn"; echo "LEFT: $arn" ;;
   esac
