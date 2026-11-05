@@ -54,6 +54,23 @@ type Transport struct {
 	wg      sync.WaitGroup
 	ctx     context.Context // canceled by Close so queued sends fail fast
 	cancel  context.CancelFunc
+	onDrop  func(shard uint32, reason string)
+}
+
+// Reasons a message to a peer is dropped, for Option WithDropHook.
+const (
+	DropQueueFull  = "send_queue_full" // the peer's outbound queue was full
+	DropSendFailed = "send_failed"     // the RPC failed or timed out
+)
+
+// Option configures a Transport.
+type Option func(*Transport)
+
+// WithDropHook makes the transport call f for every message it drops, with
+// the message's shard and one of the Drop reasons. f is called from Send
+// and from the delivery goroutines, so it must be safe for concurrent use.
+func WithDropHook(f func(shard uint32, reason string)) Option {
+	return func(t *Transport) { t.onDrop = f }
 }
 
 type peer struct {
@@ -65,8 +82,11 @@ type peer struct {
 // New connects (lazily) to every peer in addrs other than self. local
 // receives messages for self and for non-peer IDs; it is called from Send,
 // on the caller's goroutine. timeout bounds each RPC.
-func New(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(shard uint32, m paxos.Message), timeout time.Duration) (*Transport, error) {
-	t := &Transport{self: self, local: local, timeout: timeout, peers: make(map[paxos.NodeID]*peer)}
+func New(self paxos.NodeID, addrs map[paxos.NodeID]string, local func(shard uint32, m paxos.Message), timeout time.Duration, opts ...Option) (*Transport, error) {
+	t := &Transport{self: self, local: local, timeout: timeout, peers: make(map[paxos.NodeID]*peer), onDrop: func(uint32, string) {}}
+	for _, o := range opts {
+		o(t)
+	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	for id, addr := range addrs {
 		if id == self {
@@ -105,6 +125,7 @@ func (t *Transport) SendTraced(sh uint32, m paxos.Message, trace map[string]stri
 	select {
 	case p.q <- env:
 	default: // queue full: drop, Paxos will retry
+		t.onDrop(sh, DropQueueFull)
 	}
 }
 
@@ -112,7 +133,9 @@ func (t *Transport) deliver(p *peer) {
 	defer t.wg.Done()
 	for env := range p.q {
 		ctx, cancel := context.WithTimeout(t.ctx, t.timeout)
-		_, _ = p.client.Send(ctx, env) // errors are message loss
+		if _, err := p.client.Send(ctx, env); err != nil && t.ctx.Err() == nil {
+			t.onDrop(env.GetShard(), DropSendFailed) // message loss
+		}
 		cancel()
 	}
 }

@@ -34,6 +34,14 @@ func (r *Replica) TakeoverStats() (noops, recovered, contested int) {
 // before writing the state they vouch for.
 func (r *Replica) ReplyBeforePersist() { r.replyFirst = true }
 
+// RetransmitAll restores the retransmission before DECISIONS.md entry 45:
+// every heartbeat resends every unchosen slot to every peer.
+func (r *Replica) RetransmitAll() { r.retransmitAll = true }
+
+// Unvoted returns how many of this leader's unchosen slots peer to has not
+// voted for.
+func (r *Replica) Unvoted(to NodeID) int { return r.unvoted(to) }
+
 // DisableLeaderStickiness turns off PreVote and the refusal of Prepares
 // while a leader is live, as before Phase 8b.
 func (r *Replica) DisableLeaderStickiness() { r.noSticky = true }

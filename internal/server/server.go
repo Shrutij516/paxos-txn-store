@@ -162,12 +162,13 @@ func Start(cfg Config) (*Node, error) {
 	}
 	n.log = n.log.With("node", int(cfg.ID))
 	var err error
-	if n.metrics, err = registerMetrics(n.reg); err != nil {
+	if n.metrics, err = registerMetrics(n.reg, cfg.ID); err != nil {
 		return nil, err
 	}
 	// The servers never address a non-peer ID through the transport (they
 	// deliver locally first), so its local callback has nothing to do.
-	n.tr, err = grpcnet.New(cfg.ID, addrs, func(uint32, paxos.Message) {}, cfg.RPCTimeout)
+	n.tr, err = grpcnet.New(cfg.ID, addrs, func(uint32, paxos.Message) {}, cfg.RPCTimeout,
+		grpcnet.WithDropHook(func(sh uint32, reason string) { n.metrics.drop(sh, reason) }))
 	if err != nil {
 		return nil, err
 	}
@@ -421,6 +422,7 @@ func (s *shard) send(sh txn.ShardID, m paxos.Message) {
 		select {
 		case s.n.shards[sh].inbox <- inMsg{m: m, trace: s.carrier(m)}:
 		default:
+			s.n.metrics.drop(uint32(sh), DropLocalInboxFull)
 		}
 	}
 }

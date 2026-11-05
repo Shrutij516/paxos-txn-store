@@ -157,14 +157,25 @@ type LogTiming struct {
 	// ElectionBackoff times [ElectionMin, ElectionMax]. Hearing from a
 	// leader resets it. Values < 1 mean DefaultElectionBackoff.
 	ElectionBackoff int
+	// RetransmitAfter is how long a leader waits for a peer's vote on a
+	// slot before it sends that peer the slot's Accept again. Values < 1
+	// mean 2 × HeartbeatEvery.
+	RetransmitAfter int
+	// RetransmitMax caps how many Accepts a leader resends to one peer per
+	// heartbeat, oldest slot first. Values < 1 mean DefaultRetransmitMax.
+	RetransmitMax int
 }
+
+// DefaultRetransmitMax is the default cap on Accepts resent to one peer per
+// heartbeat (DECISIONS.md entry 45).
+const DefaultRetransmitMax = 8
 
 // DefaultElectionBackoff is the default cap on the election backoff.
 const DefaultElectionBackoff = 8
 
 // DefaultLogTiming suits the simulator's default delays.
 var DefaultLogTiming = LogTiming{HeartbeatEvery: 4, ElectionMin: 20, ElectionMax: 40, CatchupBatch: 64,
-	ElectionBackoff: DefaultElectionBackoff}
+	ElectionBackoff: DefaultElectionBackoff, RetransmitAfter: 8, RetransmitMax: DefaultRetransmitMax}
 
 // ReplicaConfig describes one replica.
 type ReplicaConfig struct {

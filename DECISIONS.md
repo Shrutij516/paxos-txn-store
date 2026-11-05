@@ -489,6 +489,39 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Fixed client counts:** each config has a fixed number of closed-loop clients, so throughput and latency are measured at that concurrency, not at a target arrival rate. A saturated system shows longer latencies, not dropped requests.
   - **Incomplete abort reasons:** the server-side reasons count only aborts decided at a shard leader. A transaction wounded while it held only read locks fails at its next read or write, and is counted by the client but not by reason.
 
+## 45. Bounded Accept retransmission, and a counter for every dropped peer message
+
+- **What:**
+  - **Bounded retransmission** (`sendHeartbeats` in `internal/paxos/replica.go`). The leader remembers, per unchosen slot and peer, the tick it last sent that peer the slot's Accept. On each heartbeat it resends an Accept to a peer only if:
+    - the peer has not voted for the slot in the current ballot, and
+    - the last send to that peer was at least `RetransmitAfter` ticks ago (default 2 × `HeartbeatEvery` = 8 ticks, 80 ms), and
+    - the slot is among the `RetransmitMax` (8) such slots per peer whose last send is oldest (ties go to the lower slot).
+
+    The record is per leadership: it is created when a node becomes leader, dropped when it steps down, and an entry goes when its slot is chosen. The heartbeats themselves, catch-up and two-phase commit retries are unchanged.
+  - **A drop counter:** `peer_messages_dropped_total{shard, node, reason}`, with `reason` from a fixed set of four: `send_queue_full`, `send_failed`, `inbox_full`, `local_inbox_full`. That is one series per point where a replica message can be dropped. `internal/grpcnet` reports its two through a hook (`WithDropHook`) and stays free of Prometheus. All series exist at zero from start-up, so a rate query works before the first drop.
+  - **Placement control in the benchmark.** `scripts/bench.sh` takes `PLACEMENT=concentrated|spread`, restarting each run's cluster until the leaders sit as asked, and `PAXOSD_BIN` to benchmark a given binary. It records each run's `send_queue_full` drops.
+  - **Tests:**
+    - `TestReplicaRetransmitBounded` (deterministic, one replica): a leader with 50 lost Accepts never sends a peer more than `RetransmitMax` per heartbeat, or the same slot within `RetransmitAfter`. It eventually resends every slot to every peer that has not voted, never to one that has, and stops once the slots are chosen.
+    - `TestReplicaRetransmitAllCaughtByBound`: the same check fails on the old resend-everything behaviour (a test-only switch).
+    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with spread and with concentrated leadership. Concentrated leadership must drop at most 100 messages per run on full send queues, and commit at least 80% of the spread rate. With `PAXOSD_BIN` pointing at a build of the old behaviour, it fails on both counts.
+- **Why:**
+  - **The resend loop drove the collapse.** With one node leading every shard, its per-peer send queues overflowed. Each heartbeat then resent every unchosen slot to every peer, refilling the queues it had just overflowed: congestion collapse (incident I5).
+  - **The rule resends only what has been lost.** An Accept that was answered is not resent. One that is still in flight within the timeout is not resent either. What is resent per heartbeat is capped, so retransmission traffic is bounded by peers × `RetransmitMax` per heartbeat, whatever the backlog.
+  - **Order by last send, not by slot.** The first version took the oldest *slots* first. Its own unit test showed that, with `RetransmitAfter` at two heartbeats, it cycles forever through the lowest 2 × `RetransmitMax` slots and never resends later ones while losses persist. Taking the least recently sent first visits every slot in turn.
+  - **Safety does not depend on any of this.** Which Accepts are resent, and when, cannot affect safety, because the network may already drop, delay or duplicate any message. Acceptors' rules, what they persist, how votes are counted and the one value per slot per ballot are all unchanged. Liveness holds too: every unvoted slot is resent within about ⌈backlog / `RetransmitMax`⌉ × `RetransmitAfter` ticks, and a peer that misses chosen slots still gets them from the heartbeat's commit index and catch-up. The seeded safety suites (1000 seeds), the mutation tests and the multi-process tests all pass unchanged.
+  - **Drops must be visible.** I5 was diagnosed with counters on a throwaway build. Drops are safe but, under load, they are the first sign of a feedback loop, so they belong in the metrics.
+- **Rejected:**
+  - **Resending on NACK only:** a lost Accept produces no NACK, so a timeout is needed anyway.
+  - **Per-peer in-flight windows that block new proposals:** flow control proper. It would bound the queue, not just retransmission, but it is a larger protocol-side change, and the bound on resends removed the drops.
+  - **A larger send queue:** it delays the overflow and adds latency, and resending every slot would still grow with the backlog.
+  - **Replacing serial unary RPCs with a stream or pool per peer:** it raises the transport's ceiling. It is still worth doing, but it changes the transport for every message, and it would only have hidden the unbounded resends.
+  - **Leader balancing alone:** it avoids the placement that triggered the collapse, but the same loop can start whenever one node's queues overflow, for example after a failover. See the result below for whether it is needed on top.
+  - **Labels per peer:** `reason` × `shard` is bounded and enough to see where drops happen. Per-peer series would grow with cluster size.
+- **Tradeoff:**
+  - **Slower recovery from a burst of loss.** A burst of lost Accepts is repaired at most `RetransmitMax` slots per peer per heartbeat, instead of all at once. A peer that missed 100 slots now needs about 13 heartbeats of resends (about 0.5 s) rather than one. Slots that a majority has chosen reach it sooner, through the commit index and catch-up.
+  - **More leader state:** one small map per unchosen slot, scanned and sorted per peer at each heartbeat (O(unchosen slots) per peer, as before).
+  - **A higher latency floor after a loss:** a single lost Accept now waits up to `RetransmitAfter` (80 ms) plus a heartbeat (40 ms) rather than one heartbeat. With loss rare, the median is unaffected.
+
 ## Incidents
 
 Things that broke after they were merged, and why. Every phase that finds something broken adds an entry here, with the decision entry that fixed it.

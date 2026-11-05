@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/Shrutij516/paxos-txn-store/client"
+	"github.com/Shrutij516/paxos-txn-store/internal/server"
 	"github.com/Shrutij516/paxos-txn-store/internal/testcluster"
 	"github.com/Shrutij516/paxos-txn-store/internal/txn"
 )
@@ -27,6 +29,7 @@ var wantMetrics = []string{
 	"paxos_leader_elections_total", "paxos_is_leader", "paxos_commit_latency_seconds",
 	"paxos_apply_lag_slots", "paxos_log_length_slots",
 	"txn_commits_total", "txn_cross_shard_commits_total", "txn_aborts_total",
+	"peer_messages_dropped_total",
 	"txn_prepare_phase_seconds", "txn_decide_phase_seconds", "txn_participant_prepare_seconds",
 	"txn_outcome_query_seconds", "txn_in_doubt", "txn_wounds_total", "txn_lock_waits_total",
 	"storage_fsync_seconds", "shard_loop_queue_depth",
@@ -34,7 +37,7 @@ var wantMetrics = []string{
 
 // ownMetric reports whether a metric is the store's (not a runtime one).
 func ownMetric(name string) bool {
-	for _, p := range []string{"paxos_", "txn_", "storage_", "shard_"} {
+	for _, p := range []string{"paxos_", "txn_", "storage_", "shard_", "peer_"} {
 		if strings.HasPrefix(name, p) {
 			return true
 		}
@@ -87,8 +90,11 @@ func TestMetricLabels(t *testing.T) {
 			if ownMetric(name) {
 				own++
 				want = shards
-				if name == "txn_aborts_total" {
+				switch name {
+				case "txn_aborts_total":
 					want = shards * len(txn.AbortReasons)
+				case "peer_messages_dropped_total":
+					want = shards * len(server.DropReasons)
 				}
 			}
 			if want > 0 && len(f.GetMetric()) != want {
@@ -141,7 +147,7 @@ func checkLabels(name string, m *dto.Metric, self any) error {
 		case "node":
 			ok = v == fmt.Sprint(self)
 		case "reason":
-			ok = name == "txn_aborts_total" && reasons[v]
+			ok = (name == "txn_aborts_total" && reasons[v]) || (name == "peer_messages_dropped_total" && slices.Contains(server.DropReasons, v))
 		case "quantile":
 			ok = quantiles[v]
 		case "version":

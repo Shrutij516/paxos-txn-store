@@ -3,6 +3,8 @@ package server
 import (
 	"strconv"
 
+	"github.com/Shrutij516/paxos-txn-store/internal/grpcnet"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
@@ -51,12 +53,30 @@ type metrics struct {
 
 	fsync *prometheus.HistogramVec
 
-	reg prometheus.Registerer
+	dropped *prometheus.CounterVec // labels shard, node, reason (DropReasons)
+
+	reg  prometheus.Registerer
+	node string
 }
+
+// Reasons a peer or cross-shard message is dropped, the fixed value set of
+// peer_messages_dropped_total's reason label. Paxos and two-phase commit
+// retransmit after every drop, so drops cost latency, not safety; a steady
+// rate means a node is sending more than its peers or loops take in
+// (incident I5).
+const (
+	DropSendQueueFull  = grpcnet.DropQueueFull  // outbound queue to a peer full
+	DropSendFailed     = grpcnet.DropSendFailed // peer RPC failed or timed out
+	DropInboxFull      = "inbox_full"           // a shard's inbox full, message from a peer
+	DropLocalInboxFull = "local_inbox_full"     // a shard's inbox full, message from another shard on this node
+)
+
+// DropReasons lists every reason value.
+var DropReasons = []string{DropSendQueueFull, DropSendFailed, DropInboxFull, DropLocalInboxFull}
 
 // registerMetrics creates the node's metrics on reg. It fails if reg
 // already holds them (two nodes cannot share a registry).
-func registerMetrics(reg prometheus.Registerer) (m *metrics, err error) {
+func registerMetrics(reg prometheus.Registerer, node paxos.NodeID) (m *metrics, err error) {
 	register := func(c prometheus.Collector) {
 		if e := reg.Register(c); e != nil && err == nil {
 			err = e
@@ -96,13 +116,19 @@ func registerMetrics(reg prometheus.Registerer) (m *metrics, err error) {
 
 		fsync: histogram("storage_fsync_seconds", "Duration of each durable storage write (one SQLite transaction with an fsync).", latencyBuckets),
 
-		reg: reg,
+		reg:  reg,
+		node: strconv.Itoa(int(node)),
 	}
 	m.aborts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "txn_aborts_total",
 		Help: "Transactions aborted, counted at the leader of the deciding shard, by reason (a fixed set: txn.AbortReasons).",
 	}, append(labels, "reason"))
 	register(m.aborts)
+	m.dropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "peer_messages_dropped_total",
+		Help: "Messages for a peer or another shard that were dropped (and are left to retransmission), by the shard they belong to and reason (a fixed set: server.DropReasons).",
+	}, append(labels, "reason"))
+	register(m.dropped)
 	// The standard Go runtime and process metrics. Their only labels are
 	// bounded too: quantile on go_gc_duration_seconds, version on go_info.
 	register(collectors.NewGoCollector())
@@ -163,5 +189,14 @@ func (m *metrics) forShard(sh txn.ShardID, node paxos.NodeID) shardMetrics {
 	for _, r := range txn.AbortReasons {
 		out.aborts[r] = m.aborts.WithLabelValues(append(lv, string(r))...)
 	}
+	for _, r := range DropReasons {
+		m.dropped.WithLabelValues(append(lv, r)...) // export zeros from the start
+	}
 	return out
+}
+
+// drop counts one dropped message of shard sh. It may be called from any
+// goroutine.
+func (m *metrics) drop(sh uint32, reason string) {
+	m.dropped.WithLabelValues(strconv.Itoa(int(sh)), m.node, reason).Inc()
 }
