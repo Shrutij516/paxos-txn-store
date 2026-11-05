@@ -27,7 +27,7 @@ import (
 // standard go_* and process_* metrics on top.
 var wantMetrics = []string{
 	"paxos_leader_elections_total", "paxos_is_leader", "paxos_commit_latency_seconds",
-	"paxos_apply_lag_slots", "paxos_log_length_slots",
+	"paxos_apply_lag_slots", "paxos_log_length_slots", "paxos_accepts_in_flight",
 	"txn_commits_total", "txn_cross_shard_commits_total", "txn_aborts_total",
 	"peer_messages_dropped_total",
 	"txn_prepare_phase_seconds", "txn_decide_phase_seconds", "txn_participant_prepare_seconds",

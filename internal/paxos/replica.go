@@ -177,6 +177,24 @@ func (r *Replica) Leader() NodeID { return r.leader }
 // Ballot returns the replica's own ballot as candidate or leader.
 func (r *Replica) Ballot() Ballot { return r.ballot }
 
+// InFlight returns, while this replica leads, the most proposed slots any
+// one other replica has not yet voted for: the Accepts outstanding to its
+// slowest peer. It is 0 otherwise. Under a closed-loop load it stays near
+// the number of requests in flight; a backlog that keeps growing means
+// Accepts are lost faster than they are resent (incident I5).
+func (r *Replica) InFlight() int {
+	if r.role != leader {
+		return 0
+	}
+	most := 0
+	for _, to := range r.peers {
+		if to != r.id {
+			most = max(most, r.unvoted(to))
+		}
+	}
+	return most
+}
+
 // Commit returns the commit index: every slot up to it is known chosen.
 func (r *Replica) Commit() uint64 { return r.commit }
 

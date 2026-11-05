@@ -40,6 +40,7 @@ Latency histograms (`paxos_commit_latency_seconds`, `txn_prepare_phase_seconds`,
 | `paxos_commit_latency_seconds` | histogram | At the leader: from proposing a log entry to applying it, which is one round of Accept and Accepted messages plus the fsyncs on a majority. |
 | `paxos_apply_lag_slots` | gauge | Slots known to be committed (by this replica, or by the leader according to its last heartbeat) but not applied here. Non-zero on a follower catching up. |
 | `paxos_log_length_slots` | gauge | Committed log entries (the commit index). The log is never compacted, so this only grows. |
+| `paxos_accepts_in_flight` | gauge | At the leader: the most proposed slots any one peer has not voted for yet, that is the Accepts outstanding to its slowest peer (0 on followers). Under a closed-loop load it stays near the number of requests in flight. A value that keeps growing means Accepts are being lost faster than they are resent (incident I5). |
 
 ### Transactions
 

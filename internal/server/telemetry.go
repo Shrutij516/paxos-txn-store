@@ -167,6 +167,7 @@ func msgTxn(m paxos.Message) (txn.ID, bool) {
 func (t *telemetry) tick() {
 	t.m.applyLag.Set(float64(t.s.rep.Lag()))
 	t.m.logLength.Set(float64(t.s.rep.Commit()))
+	t.m.inFlight.Set(float64(t.s.rep.InFlight()))
 	t.m.inDoubt.Set(float64(t.s.sm.NumPrepared()))
 	if now := time.Now(); now.Sub(t.pruned) > time.Second {
 		t.pruned = now

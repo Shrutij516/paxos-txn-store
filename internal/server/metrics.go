@@ -39,6 +39,7 @@ type metrics struct {
 	commitLatency *prometheus.HistogramVec
 	applyLag      *prometheus.GaugeVec
 	logLength     *prometheus.GaugeVec
+	inFlight      *prometheus.GaugeVec
 
 	commits      *prometheus.CounterVec
 	crossCommits *prometheus.CounterVec
@@ -103,6 +104,7 @@ func registerMetrics(reg prometheus.Registerer, node paxos.NodeID) (m *metrics, 
 		commitLatency: histogram("paxos_commit_latency_seconds", "Leader: time from proposing a log entry to applying it.", latencyBuckets),
 		applyLag:      gauge("paxos_apply_lag_slots", "Slots known to be committed (here or, from heartbeats, at the leader) but not yet applied here."),
 		logLength:     gauge("paxos_log_length_slots", "Committed log entries (the commit index; the log is never compacted)."),
+		inFlight:      gauge("paxos_accepts_in_flight", "Leader: the most proposed slots any one peer has not yet voted for (0 on followers)."),
 
 		commits:      counter("txn_commits_total", "Transactions committed, counted at the leader of the shard that decides them."),
 		crossCommits: counter("txn_cross_shard_commits_total", "Of those, cross-shard transactions (counted at the coordinator shard)."),
@@ -153,6 +155,7 @@ type shardMetrics struct {
 	commitLatency prometheus.Observer
 	applyLag      prometheus.Gauge
 	logLength     prometheus.Gauge
+	inFlight      prometheus.Gauge
 	commits       prometheus.Counter
 	crossCommits  prometheus.Counter
 	aborts        map[txn.AbortReason]prometheus.Counter
@@ -174,6 +177,7 @@ func (m *metrics) forShard(sh txn.ShardID, node paxos.NodeID) shardMetrics {
 		commitLatency: m.commitLatency.WithLabelValues(lv...),
 		applyLag:      m.applyLag.WithLabelValues(lv...),
 		logLength:     m.logLength.WithLabelValues(lv...),
+		inFlight:      m.inFlight.WithLabelValues(lv...),
 		commits:       m.commits.WithLabelValues(lv...),
 		crossCommits:  m.crossCommits.WithLabelValues(lv...),
 		aborts:        map[txn.AbortReason]prometheus.Counter{},

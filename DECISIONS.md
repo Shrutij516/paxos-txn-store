@@ -503,7 +503,13 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **Tests:**
     - `TestReplicaRetransmitBounded` (deterministic, one replica): a leader with 50 lost Accepts never sends a peer more than `RetransmitMax` per heartbeat, or the same slot within `RetransmitAfter`. It eventually resends every slot to every peer that has not voted, never to one that has, and stops once the slots are chosen.
     - `TestReplicaRetransmitAllCaughtByBound`: the same check fails on the old resend-everything behaviour (a test-only switch).
-    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with spread and with concentrated leadership. Concentrated leadership must drop at most 100 messages per run on full send queues, and commit at least 60% of the spread rate. The old code reached 43–51%, the fix about 78%, so the floor sits between them. With `PAXOSD_BIN` pointing at a build of the old behaviour, it fails on both counts (47,410 drops, 51%).
+    - `TestMultiProcessConcentratedLeadership` (real processes, only with `PAXOSD_PLACEMENT=1`): it runs the benchmark load with concentrated and with spread leadership, 2 runs each, every node at `GOMAXPROCS=1`.
+      - **Pass/fail is deterministic signals only:** no peer message dropped for any reason during the load, and `paxos_accepts_in_flight` never above 128 (sampled every 100 ms).
+      - **Throughput is reported, not checked.** The concentrated/spread ratio depends on the machine.
+      - **Why one core per node:** on a fast host the old code's queues never overflowed (incident I7). With one core, the node leading every shard is the bottleneck on any host.
+      - **Measured:** the fix had 0 drops and at most 46 Accepts in flight. With `PAXOSD_BIN` set to a build of the old behaviour, it failed in all four runs on drops: 17,101 and 18,812 with one node leading, and 2,665 and 543 with spread leaders.
+      - **The in-flight bound is a sanity check only:** the closed loop also kept the old code at 44–68, so it does not separate the two builds; the drop check does.
+    - **A gauge for it:** `paxos_accepts_in_flight{shard,node}`, the most slots any one peer has not voted for, at the leader.
 - **Why:**
   - **The resend loop drove the collapse.** With one node leading every shard, its per-peer send queues overflowed. Each heartbeat then resent every unchosen slot to every peer, refilling the queues it had just overflowed: congestion collapse (incident I5).
   - **The rule resends only what has been lost.** An Accept that was answered is not resent. One that is still in flight within the timeout is not resent either. What is resent per heartbeat is capped, so retransmission traffic is bounded by peers × `RetransmitMax` per heartbeat, whatever the backlog.
@@ -640,7 +646,11 @@ Things that broke after they were merged, and why. Every phase that finds someth
     | Cross-shard 0.5 | One node | **37** txn/s, p99 1.58 s, 58,862 drops a run | **192** txn/s, p99 311 ms, 0 drops |
     | Cross-shard 0.5 | Spread | 86 txn/s, 6,802 drops a run | 247 txn/s, 0 drops |
 
-  - **Remaining gap:** concentrated cross-shard throughput is 78% of spread, short of the 80% target. It is one node doing all leader and coordinator work, not a failure: no drops, and latency stays bounded. Leader balancing was considered and not done (entry 45, Rejected).
+  - **Remaining gap, not fixed here:** concentrated cross-shard throughput is 78% of spread (192 vs 247/s), short of the 80% target. Two things cause it, and neither is a failure: there are no drops, and latency stays bounded.
+    - **CPU concentration:** in a concentrated run the leader node used about 1.4 CPU cores and each other node about 0.7. It does every shard's leader work and every coordinator's two-phase commit, on a 4-vCPU machine it shares with the other nodes and the load generator.
+    - **One serial RPC stream per peer:** all of that node's outbound traffic to each peer, for all three shards, goes through one unary RPC at a time.
+
+    Leader balancing was considered and not done (entry 45, Rejected); see Future work.
   - **Not changed:** the transport (one serial RPC per peer).
   - **Also found:** the first version of the fix resent the oldest slots first. Its unit test showed it starved later slots under persistent loss, so the fix resends the least recently sent instead.
 - **Lesson:**
@@ -670,6 +680,10 @@ Things that broke after they were merged, and why. Every phase that finds someth
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
 - **A streaming transport with batching.** Each node sends to each peer through one serial unary RPC at a time, about 2,300 messages per second per peer on the benchmark machine. That ceiling is what concentrated leadership hits first (incident I5). A bidirectional stream per peer, sending queued messages in batches, would raise it without changing Paxos.
-- **Leader balancing.** With one node leading every shard, cross-shard throughput is 78% of spread (DECISIONS.md entry 45). Leader-transfer hints, where a leader with more shards than its share hands one to a less loaded peer, would close that gap. It is not needed for correctness or stability.
+- **Leader balancing / leadership transfer.**
+  - **The gap:** with one node leading every shard, cross-shard throughput is 78% of spread (192 vs 247/s; incident I5, entry 45).
+  - **The evidence:** the leader node used about 1.4 CPU cores against about 0.7 for each other node. All of its traffic to each peer shares one serial RPC stream.
+  - **The idea:** a leader holding more shards than its share hands one to a less loaded peer. That needs a transfer protocol: catch the target up, then have it campaign with a hint so the old leader does not refuse it under stickiness.
+  - **Why it waits:** it is not needed for correctness or stability, since there are no drops and latency is bounded.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
 - **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).

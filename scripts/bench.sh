@@ -37,7 +37,7 @@ for f in sorted(glob.glob(os.path.join(out, "runs", "*", "report.json"))):
     place = open(os.path.join(run, "placement")).read().strip() if os.path.exists(os.path.join(run, "placement")) else "any"
     key = (c["profile"], c["cross_shard_ratio"], c["clients"], place)
     drops = os.path.join(run, "drops")
-    r["drops"] = float(open(drops).read() or 0) if os.path.exists(drops) else float("nan")
+    r["drops"] = float(open(drops).read().strip() or "nan") if os.path.exists(drops) else float("nan")
     rows.setdefault(key, []).append(r)
 metrics = [("txn/s", lambda r: r["committed_per_sec"]),
            ("p50 ms", lambda r: r["latency_ms"]["p50"]),
@@ -174,11 +174,16 @@ one_run() {
     -clients "$clients" -short-clients 0 -audit-percent 0 -keys "$KEYS" -profile "$profile" "${hot[@]}" \
     -cross-shard-ratio "$cross" -read-ratio "$READ_RATIO" -warmup "$WARMUP" -duration "$DURATION" \
     -seed "$seed" -out "$dir/history.jsonl" -report "$dir/report.json" > "$dir/loadgen.log" 2>&1
-  local m d=0
+  # Drops on full send queues, or nothing if the binary predates the
+  # counter (the summary then shows nan).
+  local m d=0 seen=0
   for m in "${metrics[@]}"; do
-    d=$(curl -s "http://$m/metrics" | awk -v d="$d" '/^peer_messages_dropped_total\{.*reason="send_queue_full"/ {d += $NF} END {print d}')
+    read -r d seen < <(curl -s "http://$m/metrics" | awk -v d="$d" -v s="$seen" '/^peer_messages_dropped_total\{.*reason="send_queue_full"/ {d += $NF; s = 1} END {print d, s}')
   done
-  echo "$d" > "$dir/drops"
+  if (( seen )); then echo "$d" > "$dir/drops"; else : > "$dir/drops"; fi
+  # The host: sandboxes move between machines, so runs are only comparable
+  # within one session (DECISIONS.md I7).
+  { nproc; grep -m1 'model name' /proc/cpuinfo; } > "$dir/machine"
   settle "${metrics[@]}" || touch "$dir/NOT_SETTLED"
   stop_nodes
 }
