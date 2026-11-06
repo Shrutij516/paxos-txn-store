@@ -436,7 +436,7 @@ Stop the watcher with Ctrl-C.
   - `data/node1..3/` (the SQLite files) and `check.log`.
 - **The bucket** keeps its copy 1 day.
 
-To keep a result, copy the summary into the [results section](#results-failover-under-load) of this page.
+To keep a result, copy the summary into a results section at the end of this page, like [run 2](#results-failover-under-load-run-2).
 
 **Caveats:**
 - **loadgen shares node 1's CPU.** It runs on node 1 with node 1's paxosd, Prometheus, Grafana and Jaeger, on 2 vCPUs. Node 1 is never killed, so it is busy throughout: it carries load generation and a survivor's share of the cluster's work.
@@ -568,10 +568,69 @@ How these were measured:
 - **Resolution:** 200 ms, as above.
 - **Rejoin baseline:** the rejoin times were measured before the fix and depend on when each backoff timer happened to fire, so they vary from run to run.
 
-## Results: failover under load
+## Results: failover under load (run 1)
 
-Not run yet. After a run of `aws-loadtest.yml`, record here:
-- the run ID and the image digest;
-- the run's `summary.md`;
-- the checkers' result;
-- any incident.
+aws-loadtest run 42143631868, image `sha256:39476875f7d2c6f53fc0b362e9f033ef8ec94e956dd47896fb3223258bf616f8`, **standard** CPU credits, the Phase 9c sampler. Full analysis: DECISIONS.md I19.
+
+- **The kill:** node3 (leading shards 1 and 2) at 60 s.
+- **Throughput:** 145 txn/s (p99 481 ms) before the kill. With node3 down, 1.9 and then 1.5 txn/s (p99 4.8 s and 8.8 s). 106 txn/s after the rejoin.
+- **Reported failover:** 16,728 ms for both shards. **Not trustworthy:** this sampler did not record failed reads and read the nodes one after another, so a gap in a survivor's readings could pass for a slow failover (DECISIONS.md I22).
+- **Longest stretch without a commit:** 10.8 s.
+- **Errors:** reported as 71, broken down as 46 unknown and 27 failed. Those sum to 73; the two figures disagree and are recorded as given.
+- **Rejoin:** 1.73 s.
+- **History check:** 14,175 committed transactions, no violations.
+- **Credits:** CloudWatch `CPUCreditBalance` (Minimum, 5-minute) stayed between 0 and 1.2 on all three nodes: throttled to the 20% baseline throughout.
+
+## Results: failover under load (run 2)
+
+aws-loadtest run 42164646515.
+
+- **Image:** `sha256:701ad657e2ccbfd6ffee145e94c99a59726c2f265c38ffab55012c1b7fbcf19a`.
+- **CPU credits:** unlimited.
+- **Load:** 32 clients, low contention, cross-shard 0.5, 10 s warmup, 120 s measured.
+- **The kill:** node2 (leading shards 0 and 1) at 60 s; restarted 30 s later.
+
+**Failover**, both **measured**: every survivor was read at least every 200 ms around the transition, with unread gaps of 120 to 153 ms.
+
+| Shard | Failover | New leader |
+|---|---|---|
+| 0 | 511 ms | node1 |
+| 1 | 392 ms | node3 |
+
+**Throughput and latency:**
+
+| Phase | Committed txn/s | p50 | p99 |
+|---|---|---|---|
+| before the kill | 124.2 | 43 ms | 1611 ms |
+| during (first 10 s after the kill) | 26.1 | 895 ms | 3422 ms |
+| after, node2 down (24 s) | 12.7 | 1870 ms | 9160 ms |
+| after the rejoin | 95.5 | 35 ms | 1807 ms |
+| whole window | 87.9 | | |
+
+- **Longest stretch without a commit:** 854 ms.
+- **Errors:** 13 (12 unknown outcome, 1 failed).
+- **Rejoin:** 3.31 s after the restart, which confirms the I4 fix on real machines (146 s and 32 s before it, [first AWS run](#results-first-aws-run)).
+- **History check:** 12,034 committed transactions, no violations.
+
+**Compared with run 1:**
+
+| | Run 1 (standard credits, old sampler) | Run 2 (unlimited credits, new sampler) |
+|---|---|---|
+| Failover | 16.7 s reported, not trustworthy (I22) | 511 ms and 392 ms, measured |
+| Longest stretch without a commit | 10.8 s | 854 ms |
+| Errors | 73 (46 unknown + 27 failed; reported as 71) | 13 |
+
+**Open: throughput with one node down.** With node2 down, the cluster committed 12.7 txn/s, about a tenth of the 124.2 before the kill, and recovered to 95.5 after the rejoin.
+
+- **Evidence:**
+  - **CPU:** CloudWatch `CPUUtilization` (5-minute average, basic monitoring) peaked at 78% on one node, against 42% and 52% on the others during the test.
+  - **Resolution:** the test lasted about 2 minutes, so a 5-minute average dilutes it, and the true peak was likely higher.
+- **Hypothesis (not proven):** with two of three nodes, every commit needs both survivors, so the slower survivor sets the pace for every shard.
+  - **The slower survivor:** node1 runs loadgen, Prometheus, Grafana and Jaeger next to its paxosd.
+  - **Concentration:** after the failover node1 also led shard 0, so it carried more leader work than before.
+- **What would prove it:**
+  - **A dedicated client instance:** loadgen off the cluster's nodes, run again with the same kill.
+  - **Per-process CPU on every node:** paxosd, loadgen, and each observability container, at 1 s resolution (for example `docker stats` or `pidstat` sampled during the run), not 5-minute CloudWatch averages.
+  - **Optionally, the same test with observability disabled on node1,** to separate the observability containers from loadgen.
+
+  Tracked in DECISIONS.md, Future work.
