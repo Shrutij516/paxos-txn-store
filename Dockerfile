@@ -1,4 +1,7 @@
-# paxosd image: a static binary on distroless (DECISIONS.md entry 30).
+# paxosd image: static binaries on distroless (DECISIONS.md entry 30).
+# /paxosd is the entrypoint; /loadgen rides along so a digest-pinned image
+# can also drive load from a node (scripts/aws-failover-load.sh,
+# DECISIONS.md entry 46).
 #
 #   docker build -t paxos-txn-store:dev .
 #
@@ -19,10 +22,12 @@ COPY . .
 # CGO_ENABLED=0: the SQLite driver is pure Go, so the binary is fully
 # static and needs no libc in the runtime image.
 RUN CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags="-s -w" -o /out/paxosd ./cmd/paxosd \
+    && CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags="-s -w" -o /out/loadgen ./cmd/loadgen \
     && mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/paxosd /paxosd
+COPY --from=build /out/loadgen /loadgen
 # The data directory belongs to the nonroot user (65532) so a fresh named
 # volume mounted there is writable.
 COPY --from=build --chown=65532:65532 /out/data /data

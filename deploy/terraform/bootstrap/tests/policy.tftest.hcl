@@ -66,6 +66,33 @@ override_resource {
 }
 
 override_resource {
+  target = aws_s3_bucket.loadtest
+  values = {
+    arn = "arn:aws:s3:::paxos-txn-store-loadtest-123456789012"
+  }
+}
+
+override_resource {
+  target = aws_s3_bucket_ownership_controls.loadtest
+}
+
+override_resource {
+  target = aws_s3_bucket_public_access_block.loadtest
+}
+
+override_resource {
+  target = aws_s3_bucket_server_side_encryption_configuration.loadtest
+}
+
+override_resource {
+  target = aws_s3_bucket_lifecycle_configuration.loadtest
+}
+
+override_resource {
+  target = aws_s3_bucket_policy.loadtest
+}
+
+override_resource {
   target = aws_iam_role.deploy
 }
 
@@ -133,6 +160,40 @@ run "render" {
       contains(flatten([s.Action]), "ec2:AttachInternetGateway") if s.Sid == "Ec2ManageTagged"
     ])
     error_message = "Ec2ManageTagged must allow attaching our tagged internet gateways"
+  }
+
+  # Failover-under-load outputs (DECISIONS.md entry 46): the deploy role
+  # only reads them, under runs/.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.deploy.json).Statement :
+      alltrue([for a in flatten([s.Action]) : contains(["s3:ListBucket", "s3:GetObject"], a)])
+      if anytrue([for r in flatten([s.Resource]) : strcontains(r, "paxos-txn-store-loadtest-")])
+    ])
+    error_message = "the deploy role may only list and read the loadtest bucket"
+  }
+
+  # The bucket policy lets exactly the node role write under runs/, and
+  # nothing else.
+  assert {
+    condition = one([
+      for s in jsondecode(data.aws_iam_policy_document.loadtest_bucket.json).Statement : s
+      if s.Effect == "Allow"
+      ]).Condition == {
+      StringEquals = { "aws:PrincipalAccount" = "123456789012" }
+      ArnEquals    = { "aws:PrincipalArn" = "arn:aws:iam::123456789012:role/paxos-txn-store-node" }
+    }
+    error_message = "the loadtest bucket may grant writes only to the node role of this account"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.loadtest_bucket.json).Statement :
+      s.Resource == "arn:aws:s3:::paxos-txn-store-loadtest-123456789012/runs/*" &&
+      length(setsubtract(flatten([s.Action]), ["s3:PutObject", "s3:AbortMultipartUpload"])) == 0
+      if s.Effect == "Allow"
+    ])
+    error_message = "the node role may only write objects under runs/ in the loadtest bucket"
   }
 
   assert {

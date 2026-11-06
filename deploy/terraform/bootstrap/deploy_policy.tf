@@ -224,6 +224,28 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["${aws_s3_bucket.state.arn}/${var.state_key_prefix}*.tflock"]
   }
 
+  # ---- Failover-under-load outputs (loadtest_bucket.tf) ----
+
+  # aws-loadtest.yml reads what the nodes uploaded under runs/. Read-only:
+  # the nodes write (the bucket policy), objects expire after a day.
+  statement {
+    sid       = "LoadtestBucketList"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.loadtest.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["runs/*"]
+    }
+  }
+
+  statement {
+    sid       = "LoadtestRead"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.loadtest.arn}/runs/*"]
+  }
+
   # ---- IAM: the node instance role and profile only ----
 
   # <project>-node*, not <project>-*: the deploy role is itself named

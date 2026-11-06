@@ -22,9 +22,17 @@
 // transactions per second, commit latency percentiles, abort rate (with
 // the servers' abort reasons if -metrics-addrs is set) and error counts.
 // The history file still holds every attempt, warmup included.
+//
+// With -timeline, benchmark mode also writes one JSON line per finished
+// transaction with its wall-clock end time, end-to-end latency and
+// outcome, after a header line with the wall-clock start and measured
+// window, and prints a one-line summary every second to stderr. A
+// failover test (scripts/aws-failover-load.sh) cuts the run into phases
+// around a kill with it.
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -77,6 +85,7 @@ type config struct {
 	readRatio    float64 // fraction of read-only transactions
 	crossRatio   float64 // fraction of cross-shard transactions; < 0 means unset
 	report       string  // JSON results; "" means stdout
+	timeline     string  // per-transaction JSON lines; "" means none
 	metricsAddrs []string
 	shards       int // learned at setup
 }
@@ -104,13 +113,14 @@ func run(args []string) error {
 	fs.Float64Var(&c.crossRatio, "cross-shard-ratio", -1, "benchmark: fraction of transactions whose two accounts are on different shards (unset: whatever the random pair gives)")
 	fs.StringVar(&c.report, "report", "", "benchmark: file for the JSON results (default stdout)")
 	metrics := fs.String("metrics-addrs", "", "benchmark: node /metrics addresses, comma separated, for abort reasons")
+	fs.StringVar(&c.timeline, "timeline", "", "benchmark: file for one JSON line per finished transaction (wall-clock end, latency, outcome); also prints a summary every second")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	c.addrs = strings.Split(*addrs, ",")
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "keys", "warmup", "profile", "read-ratio", "cross-shard-ratio", "hot-keys", "hot-fraction", "report", "metrics-addrs":
+		case "keys", "warmup", "profile", "read-ratio", "cross-shard-ratio", "hot-keys", "hot-fraction", "report", "metrics-addrs", "timeline":
 			c.bench = true
 		}
 	})
@@ -141,9 +151,18 @@ func run(args []string) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	var tl *timeline
+	if c.timeline != "" {
+		tf, err := os.Create(c.timeline)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tf.Close() }()
+		tl = newTimeline(tf, os.Stderr)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	s, err := runLoad(ctx, c, f)
+	s, err := runLoad(ctx, c, f, tl)
 	if err != nil {
 		return err
 	}
@@ -176,7 +195,7 @@ func (s *stats) inWindow(begin, end int64) bool { return begin >= s.winStart && 
 
 // runLoad opens the accounts and runs the clients until c.duration passes
 // or ctx ends, writing every attempt to w.
-func runLoad(ctx context.Context, c config, w *os.File) (*stats, error) {
+func runLoad(ctx context.Context, c config, w *os.File, tl *timeline) (*stats, error) {
 	hw, err := history.NewWriter(w, history.Meta{Accounts: c.accounts, Initial: c.initial, Clients: c.clients, Seed: c.seed})
 	if err != nil {
 		return nil, err
@@ -224,6 +243,14 @@ func runLoad(ctx context.Context, c config, w *os.File) (*stats, error) {
 	st.winEnd = st.winStart + int64(c.duration)
 	runCtx, stopRun := context.WithTimeout(ctx, run)
 	defer stopRun()
+	if tl != nil {
+		now := time.Now()
+		if err := tl.header(start, now.Add(c.warmup), now.Add(run)); err != nil {
+			return nil, err
+		}
+		go tl.tick(runCtx)
+		defer tl.close()
+	}
 	if c.bench && len(c.metricsAddrs) > 0 {
 		go func() {
 			select {
@@ -262,6 +289,9 @@ func runLoad(ctx context.Context, c config, w *os.File) (*stats, error) {
 				runStart := since()
 				err := cl.Run(tctx, body) // every attempt is recorded by onAttempt
 				cancel()
+				if tl != nil {
+					tl.add(time.Now(), float64(since()-runStart)/1e6, err)
+				}
 				if c.bench && err == nil {
 					if end := since(); st.inWindow(runStart, end) {
 						st.mu.Lock()
@@ -600,4 +630,100 @@ func writeReport(c config, s *stats) error {
 		return err
 	}
 	return os.WriteFile(c.report, b, 0o644)
+}
+
+// ---- Timeline ----
+
+// timeline writes one JSON line per finished transaction (client.Run, all
+// its attempts) and prints a summary of each second.
+type timeline struct {
+	mu   sync.Mutex
+	w    *bufio.Writer
+	err  error
+	out  io.Writer
+	sec  []float64 // latencies (ms) of transactions committed this second
+	errs int       // transactions that did not commit this second
+	n    int       // seconds printed
+}
+
+// timelineHeader is the first line: wall-clock times in Unix milliseconds.
+type timelineHeader struct {
+	StartMs       int64 `json:"start_unix_ms"`
+	WindowStartMs int64 `json:"window_start_unix_ms"`
+	WindowEndMs   int64 `json:"window_end_unix_ms"`
+}
+
+// timelineEntry is one finished transaction. Outcome is committed,
+// aborted (every attempt aborted), unknown or error (as in the history).
+type timelineEntry struct {
+	EndMs     int64   `json:"t"`
+	LatencyMs float64 `json:"ms"`
+	Outcome   string  `json:"outcome"`
+}
+
+func newTimeline(w, out io.Writer) *timeline {
+	return &timeline{w: bufio.NewWriter(w), out: out}
+}
+
+func (tl *timeline) header(start, winStart, winEnd time.Time) error {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	b, _ := json.Marshal(timelineHeader{start.UnixMilli(), winStart.UnixMilli(), winEnd.UnixMilli()})
+	_, err := tl.w.Write(append(b, '\n'))
+	return err
+}
+
+func (tl *timeline) add(end time.Time, ms float64, err error) {
+	e := timelineEntry{EndMs: end.UnixMilli(), LatencyMs: ms, Outcome: history.Committed}
+	switch {
+	case err == nil:
+	case errors.Is(err, client.ErrUnknown):
+		e.Outcome = history.Unknown
+	case errors.Is(err, client.ErrAborted):
+		e.Outcome = history.Aborted
+	default:
+		e.Outcome = history.Failed
+	}
+	b, _ := json.Marshal(e)
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	if _, werr := tl.w.Write(append(b, '\n')); werr != nil && tl.err == nil {
+		tl.err = werr
+	}
+	if err == nil {
+		tl.sec = append(tl.sec, ms)
+	} else {
+		tl.errs++
+	}
+}
+
+// tick prints the last second's summary every second until ctx ends.
+func (tl *timeline) tick(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			tl.mu.Lock()
+			tl.n++
+			l := summarize(tl.sec)
+			_, _ = fmt.Fprintf(tl.out, "loadgen: +%3ds %4d committed/s p50 %6.1f ms p99 %6.1f ms, %d not committed\n", tl.n, l.Count, l.P50, l.P99, tl.errs)
+			tl.sec, tl.errs = tl.sec[:0], 0
+			_ = tl.w.Flush()
+			tl.mu.Unlock()
+		}
+	}
+}
+
+func (tl *timeline) close() {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	if err := tl.w.Flush(); err != nil && tl.err == nil {
+		tl.err = err
+	}
+	if tl.err != nil {
+		log.Printf("loadgen: writing timeline: %v", tl.err)
+	}
 }
