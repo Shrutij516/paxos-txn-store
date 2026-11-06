@@ -86,6 +86,38 @@ run "secure_defaults" {
   }
 }
 
+run "standard_credits_by_default" {
+  command = plan
+
+  assert {
+    condition     = alltrue([for i in aws_instance.node : i.credit_specification[0].cpu_credits == "standard"])
+    error_message = "nodes must default to standard CPU credits (no surprise bill)"
+  }
+}
+
+run "unlimited_credits_on_request" {
+  command = plan
+
+  variables {
+    cpu_credits = "unlimited"
+  }
+
+  assert {
+    condition     = alltrue([for i in aws_instance.node : i.credit_specification[0].cpu_credits == "unlimited"])
+    error_message = "cpu_credits = unlimited must reach every node"
+  }
+}
+
+run "rejects_unknown_credit_mode" {
+  command = plan
+
+  variables {
+    cpu_credits = "burst"
+  }
+
+  expect_failures = [var.cpu_credits]
+}
+
 run "rejects_tag" {
   command = plan
 

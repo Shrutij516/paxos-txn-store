@@ -383,7 +383,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
     - paxosd not started from the digest
     - nodes that are not in three different zones, or IPs that drift
 - **Why:**
-  - **t3.small (2 GiB):** paxosd used about 0.5 GB under the chaos workload (the nightly run's sampler showed ~500 MB RSS per node). Node 1 adds Prometheus, Grafana and Jaeger, about 0.25 GB each in the same samples, and capped with `--memory` at 400, 300 and 400 MB. With Docker and the OS that does not fit in a t3.micro's 1 GiB, and it does in 2 GiB. t3.small is in the deploy role's `allowed_instance_types`. x86 matches the single-arch amd64 image. Standard credits mean a busy node is throttled instead of billed for surplus credits.
+  - **t3.small (2 GiB):** paxosd used about 0.5 GB under the chaos workload (the nightly run's sampler showed ~500 MB RSS per node). Node 1 adds Prometheus, Grafana and Jaeger, about 0.25 GB each in the same samples, and capped with `--memory` at 400, 300 and 400 MB. With Docker and the OS that does not fit in a t3.micro's 1 GiB, and it does in 2 GiB. t3.small is in the deploy role's `allowed_instance_types`. x86 matches the single-arch amd64 image. Standard credits mean a busy node is throttled instead of billed for surplus credits. (Entry 47 later made the mode a deploy input, after incident I19.)
   - **Three AZs in one region:** each shard has a replica on every node, so one zone can fail and every shard keeps a majority. One region keeps peer latency in the low milliseconds, and the bootstrap role is scoped to us-east-1. The zones are pinned by ID: picking the first three names would move subnets, and replace nodes, if a new zone sorted earlier. `use1-az3` is avoided because it lacks current instance families.
   - **Public subnets without NAT:** a NAT gateway costs about $0.045/h plus data processing, more than the three nodes together. A public IPv4 address per node costs $0.005/h and gives the same egress to GHCR, SSM and the package repositories. The security group admits nothing from outside, and nothing listens on a public interface: the instance only has its private address, and the public IP is translated by the internet gateway.
   - **Fixed private IPs:** `deploy/cluster.json` names peers statically, and paxosd has no discovery. Fixed IPs and host aliases let the same file, the same Prometheus config and the same Grafana provisioning run locally and on AWS without templating.
@@ -575,6 +575,55 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **The nodes can now write to one S3 prefix.** A compromised node could fill it with up to a day's worth of objects; it cannot read, list or delete anything there.
   - **No fixed placement:** the victim leads whatever the elections gave it. A run where nodes 2 and 3 lead no shard kills a node that leads nothing, and the summary says so; run it again.
   - **One kill per run:** a single kill per run is an example, not a distribution, as in the manual test.
+
+## 47. CPU credit mode is a deploy input: standard by default, unlimited for load tests
+
+- **What:**
+  - **A cluster variable** `cpu_credits` (`standard` | `unlimited`, default `standard`), passed to every node's `credit_specification`.
+  - **A deploy input:** `deploy.yml` takes it as a choice input and prints it on the run's summary.
+  - **Replace, don't modify:** a change of mode replaces the three nodes, through `terraform_data.cpu_credits` and `replace_triggered_by`. It does not modify them in place.
+  - **Reported with results:** `aws-loadtest.yml` records each node's credit mode in its summary (`ec2:DescribeInstanceCreditSpecifications`, already covered by `ec2:Describe*`), and warns when it is `standard`.
+  - **docs/aws.md:** the failover test now deploys with `unlimited`.
+- **Why:**
+  - **Baseline capacity is too low for the test.** With standard credits a t3.small that has spent its credits runs at 20% of each vCPU, 0.4 vCPU per node. In the first failover test the balance stayed between 0 and 1.2 on all three nodes for the whole run, and the cluster fell off a capacity cliff after the kill (incident I19). A test of failover under load has to measure the protocol, not the credit balance.
+  - **Standard stays the default.** It is right for everything else: an idle or lightly used cluster never needs the surplus, and a runaway process cannot add to the bill.
+  - **No new permission.** The mode is passed to `RunInstances`, which the deploy role already has; the first deploy passed `standard` the same way.
+  - **Why replacement:** modifying a running node's mode needs `ec2:ModifyInstanceCreditSpecification` (gap G3 in docs/aws.md), which the deploy role does not have. The cluster is redeployed rather than modified, and replacement keeps it that way. The plan says "replaced due to changes in replace_triggered_by", so a reviewer sees it before approving.
+  - **Existing clusters are unaffected.** Adding the trigger to a running cluster only creates it: checked on a scratch configuration, the nodes are not replaced.
+- **Rejected:**
+  - **Unlimited by default:** removes the cliff everywhere, but any sustained load on a forgotten cluster would add surplus charges on top of the $2 a day the $15 budget already cannot absorb.
+  - **Granting `ec2:ModifyInstanceCreditSpecification`:** switching modes in place keeps the data, but widens the deploy role for a cluster that is deployed per session and destroyed after.
+  - **A bigger or non-burstable instance:**
+    - **t3.medium:** also burstable, with the same 20% baseline per vCPU.
+    - **m7i/c7i:** not in the deploy role's allowed types, and three to four times the hourly price for the whole session, not just the test.
+  - **Waiting for credits to accrue before testing:** a t3.small earns 24 credits an hour, which barely covers its baseline. The balance in I19 never rose, and a test that must wait hours is not a test anyone runs.
+- **Tradeoff:**
+  - **Cost:** in `unlimited`, CPU above the baseline costs $0.05 per vCPU-hour. That is at most $0.08 per node-hour at 100%, or $0.24 for the cluster, and well under $0.05 for a five-minute test.
+  - **Data loss on a switch:** switching modes on a running cluster replaces all three nodes and loses their data, which is acceptable for a test cluster and is said in the plan, the input's description and docs/aws.md.
+  - **Opt-in:** standard by default means each load test has to remember to opt in. The summary's warning catches a run that did not.
+
+## 48. The client avoids an address whose last attempt failed, for a short window
+
+- **What:** the SDK remembers, per address, an attempt that failed with a transport error or a timeout. For `max(2 × AttemptTimeout, 1 s)` (1 s by default, 1 s in loadgen) it then:
+  - skips that address when it picks a node round-robin (an unknown leader, or Begin);
+  - does not follow a leader hint that names it;
+  - does not use it as a cached leader.
+
+  Any answer from the address, including "not leader", clears the mark at once. `Begin`, which any node answers, now sticks to the last node that answered it instead of rotating over all nodes on every call.
+- **Why:**
+  - **A dead node can hang instead of refusing.** A node whose process dies behind a live host, such as a container killed behind Docker's NAT, does not refuse connections: established connections are black-holed, so every attempt there costs a full AttemptTimeout.
+  - **The client kept going back to it:**
+    - **Begin** rotated over all nodes on every call, so about a third of all transactions started with a full timeout for as long as the node was down.
+    - **Rotation after a failure** could pick the same dead node again.
+    - **Stale hints:** a survivor that had not yet noticed the failure sent the client straight back.
+  - **The fix in numbers:** `TestHungNodeIsNotRetried` (one hung and one healthy fake node, 10 transactions with Begin and three reads) went from 4 attempts at the hung node and 487 ms to 1 attempt and 120 ms (incident I19).
+- **Rejected:**
+  - **gRPC keepalives**, to detect the black-holed connection: they would close it after a ping timeout of their own (seconds), but not stop the client from rotating to the address. They also add pings on every connection, which entry 43 declined.
+  - **Marking an address down until it answers again:** a slow but live leader that timed out once would be avoided indefinitely, and the client would need probes to bring it back. A short window is self-healing.
+  - **A longer window** (for example 5 s): it removes more of the cost during a long outage, but a leader that only paused (a GC pause, a CPU-throttled moment) would be avoided for that long, with every operation on its shard waiting.
+- **Tradeoff:**
+  - **Avoiding a live leader:** a leader whose attempt timed out once is avoided for up to the window even if it answers again at once. Operations on its shard bounce off followers, whose hints name it and are ignored, until the window ends: up to 1 s extra in the worst case.
+  - **One probe per window:** during a long outage each client still tries the dead address once per window.
 
 ## Incidents
 
@@ -846,6 +895,75 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Fix:** the summary says "Local processes" when there is no image.
 - **Lesson:** run every output path once, including the local one that "only tests", and read what a person would read.
 
+### I19. Failover under load on AWS took 16.7 s and the survivors nearly stopped serving
+
+(Reported as "incident I8" in the Phase 9d request; I8 was already taken by a Phase 9c entry.)
+
+- **Symptom:** the first `aws-loadtest.yml` run (42143631868, image `sha256:39476875f7d2c6f53fc0b362e9f033ef8ec94e956dd47896fb3223258bf616f8`):
+  - **Before the kill:** 145 transactions/s, p99 481 ms.
+  - **The kill:** node 3, leading shards 1 and 2, at 60 s.
+  - **Failover:** both shards went to node 2 after 16,728 ms (under 0.35 s unloaded on 2026-10-28).
+  - **With node 3 down:** 1.9, then 1.5 transactions/s, p99 4.8 s and 8.8 s, 71 errors (46 unknown, 27 failed), and a longest stretch without a commit of 10.8 s.
+  - **After the rejoin:** 106/s. The rejoin itself took 1.73 s, so the I4 fix is confirmed on AWS.
+  - **History check:** 14,175 committed, no violations.
+  - **CloudWatch `CPUCreditBalance`** (Minimum, 5-minute) stayed between 0 and 1.2 on all three nodes for the whole test.
+- **Root cause:**
+  1. **CPU credits (the main cause).** The nodes ran t3.small in standard credit mode with no credits, so each was throttled to its 20% baseline: 0.4 vCPU per node. That is enough for three nodes at moderate load, but not for two.
+     - **Where the load went:** after the kill, node 2 led all three shards (the I5 shape) and coordinated every two-phase commit. Node 1 ran loadgen, Prometheus, Grafana and Jaeger next to its paxosd.
+     - **The cliff:** offered load from 32 closed-loop clients was above that capacity, and the cluster fell into a timeout regime. Client attempts (500 ms in loadgen) and peer RPCs (200 ms) expired, the work was retried, and goodput collapsed. The collapse is a cliff, not a slowdown in proportion to the CPU lost.
+  2. **The client went back to the dead node** (contributing). paxosd runs in Docker with `-p 7001:7001`. After `docker kill`, peers' and clients' established connections to node 3 are still NATed to an address that no longer exists: they are black-holed, not refused. Every client attempt there costs a full AttemptTimeout, and the client kept making them:
+     - Begin rotated over all nodes on every call;
+     - rotation after a failure could pick node 3 again;
+     - a survivor that had not noticed the failure hinted node 3.
+
+     A black-holed address stays that way until node 3 restarts, which matches "slow until the rejoin, then 106/s".
+- **Evidence:** a local reproduction with each node in a cgroup v1 CPU quota (node 1's group also holding loadgen), the AWS placement (node 3 leading two shards, node 2 one, node 1 none), and the AWS timing (kill at 60 s of a 120 s window, restart 30 s later):
+
+  | CPU per node | Victim | Before kill | First 10 s after | Failover | Longest commit gap |
+  |---|---|---|---|---|---|
+  | 0.4 | refused (SIGKILL) | 86 txn/s | 48 txn/s | 0.85 s | 0.9 s |
+  | 0.4 | black-holed (SIGSTOP) | 83 txn/s | 67 txn/s | 0.63 s | 0.7 s |
+  | 0.2 | black-holed (SIGSTOP) | **3.7** txn/s, p50 3.5 s, 106 errors | 15 txn/s | 1.25 s | 1.1 s |
+  | 0.2, client attempt timeout 5 s | black-holed | 10.2 txn/s | 9.7 txn/s | 0.72 s | 2.7 s |
+
+  - **0.4 vs 0.2 CPU:** at 0.4 CPU the cluster survives the kill. At 0.2 it is already collapsed before any kill, with the AWS outage's signature: seconds of latency, timeouts, unknown outcomes. Halving the CPU cut throughput 20-fold, the cliff described above.
+  - **Ruled out as the cause of the stall:**
+    - **Election timing:** one election per shard, and failover of at most 1.6 s in every local run, at 0.2 CPU too.
+    - **Head-of-line blocking of elections behind data in the shard inboxes:** node 1's inboxes peaked at 211 messages.
+    - **Retries alone:** the 5 s attempt timeout softened the collapse but did not prevent it.
+  - **The client's part:** measured by `TestHungNodeIsNotRetried`: 4 attempts at a hung node (487 ms for 10 transactions) before the fix, 1 (120 ms) after.
+  - **Not explained:**
+    - **The 16.7 s failover:** no local run took more than 1.6 s. Both shards reported the same time and the same new leader, which fits the sampler not reading node 2 for that long: it gives each node's `/metrics` 200 ms, and a throttled node 2 rendering its metrics could miss that repeatedly.
+    - **The commit gap is real:** the 10.8 s gap without a commit comes from the client's own timeline.
+    - **To settle it:** the run's `leaders.txt` shows how long node 2 went without a reading, if the artifact is still there. The next run, in `unlimited` mode, will show it directly.
+- **Fix:**
+  - **Infrastructure (entry 47):**
+    - `cpu_credits` is a cluster variable and a deploy input, and the failover test deploys with `unlimited`.
+    - The load-test summary records the nodes' credit mode and warns on `standard`.
+    - No new deploy-role permission.
+  - **Code (entry 48):** the client avoids an address whose last attempt failed, for `max(2 × AttemptTimeout, 1 s)`:
+    - Begin sticks to a node that answers;
+    - rotation skips the failed address;
+    - stale hints naming it are not followed.
+
+    `TestHungNodeIsNotRetried` fails before and passes after.
+  - **Not changed:**
+    - **Leadership concentration:** node 2 leading every shard after the failover is the I5 shape. Leader balancing stays in Future work.
+    - **loadgen on node 1** stays, with its caveat.
+- **Lesson:**
+  - **Know the capacity you test on.** A burstable instance's capacity is its baseline, not its peak, so a failover test on t3 in standard mode measures the credit balance. Record the credit mode and balance with every result.
+  - **Losing a node also removes capacity.** A failover test under load measures whether the survivors have enough capacity, as well as how fast leadership moves. Leadership concentrating on one node makes that capacity smaller still.
+  - **Fixed timeouts plus retries make overload a cliff.** Below some capacity, work that times out is redone, and goodput falls to almost nothing. A test should report where that cliff is, not only one point on either side of it.
+  - **A dead process does not always refuse connections.** Behind NAT it can black-hole them, and a client must not keep going back to an address that just timed out.
+
+### I20. The I17 lesson was repeated: `git stash` used to run a test against the old code
+
+- **Symptom:** to show that `TestHungNodeIsNotRetried` fails without the client fix, the fix in `client/client.go` was set aside with `git stash push client/client.go`, the test run, and the fix restored with `git stash pop`.
+- **Root cause:** habit. I17 (Phase 9c) concluded "never move uncommitted work out of the way to look at another revision" a day earlier, and the shortcut was taken again.
+- **Evidence:** the test output was 4 attempts and FAIL with the old code, then PASS with the fix. `git status` after the pop showed `client/client.go` modified and `client/hung_test.go` untracked, as before. Nothing was lost.
+- **Fix:** none needed for the code. For the procedure: build the old revision in a scratch copy (`git archive HEAD | tar -x -C <scratch>`), add the new test there, and run it. That is how the scratch loadgen builds in this same investigation were made.
+- **Lesson:** a lesson written down is not yet a habit. Before any command that moves uncommitted work (stash, checkout of a path, reset), stop and use a scratch copy instead.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
@@ -855,5 +973,6 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **The evidence:** the leader node used about 1.4 CPU cores against about 0.7 for each other node. All of its traffic to each peer shares one serial RPC stream.
   - **The idea:** a leader holding more shards than its share hands one to a less loaded peer. That needs a transfer protocol: catch the target up, then have it campaign with a hint so the old leader does not refuse it under stickiness.
   - **Why it waits:** it is not needed for correctness or stability, since there are no drops and latency is bounded.
+  - **Seen again on AWS:** after the failover in incident I19, node 2 led all three shards on a CPU-throttled node.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
 - **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).

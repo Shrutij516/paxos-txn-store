@@ -330,6 +330,9 @@ run_main() {
     [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "node1 reports no image digest: $digest" >&2; exit 1; }
     IMAGE=ghcr.io/shrutij516/paxos-txn-store@$digest
     echo "image=$IMAGE" >>"$ev"
+    # standard credits throttle a node that has spent them (incident I19).
+    echo "cpu_credits=$(aws ec2 describe-instance-credit-specifications --instance-ids "${IDS[1]}" "${IDS[2]}" "${IDS[3]}" \
+      --query 'InstanceCreditSpecifications[].CpuCredits' --output text | tr -s '\t ' '\n' | sort -u | paste -sd/)" >>"$ev"
   fi
   {
     echo "run=$RUN"

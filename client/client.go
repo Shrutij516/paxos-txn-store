@@ -108,7 +108,17 @@ type Client struct {
 	conns   map[string]*grpc.ClientConn
 	leaders map[int]string // cached leader address per shard
 	next    int            // round-robin position when a leader is unknown
-	shards  int            // learned from Begin
+	// down holds, per address, until when to avoid it: an attempt there
+	// failed (a transport error or a timeout). A node whose process died
+	// behind a live host (a container killed behind Docker's NAT) does not
+	// refuse connections: every attempt there hangs for a whole
+	// AttemptTimeout, so retrying it by rotation or by a stale hint
+	// stalls the caller (DECISIONS.md I19). Any answer from the address
+	// clears it.
+	down    map[string]time.Time
+	downFor time.Duration
+	beginAt string // the address that last answered Begin
+	shards  int    // learned from Begin
 	rng     *rand.Rand
 }
 
@@ -149,6 +159,7 @@ func New(addrs []string, opts Options) (*Client, error) {
 			)),
 		},
 		conns: map[string]*grpc.ClientConn{}, leaders: map[int]string{},
+		down: map[string]time.Time{}, downFor: max(2*opts.AttemptTimeout, time.Second),
 		rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}, nil
 }
@@ -201,20 +212,74 @@ func (c *Client) stub(addr string) (txnv1.TxnClient, error) {
 func (c *Client) target(sh int) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if a, ok := c.leaders[sh]; ok {
+	if a, ok := c.leaders[sh]; ok && !c.isDown(a) {
 		return a
+	}
+	return c.rotate()
+}
+
+// rotate returns the next address round-robin, skipping addresses that
+// failed recently unless all did. c.mu is held.
+func (c *Client) rotate() string {
+	for range c.addrs {
+		a := c.addrs[c.next%len(c.addrs)]
+		c.next++
+		if !c.isDown(a) {
+			return a
+		}
 	}
 	a := c.addrs[c.next%len(c.addrs)]
 	c.next++
 	return a
 }
 
+// isDown reports whether an attempt at addr failed within downFor. c.mu
+// is held.
+func (c *Client) isDown(addr string) bool {
+	until, ok := c.down[addr]
+	if ok && time.Now().After(until) {
+		delete(c.down, addr)
+		return false
+	}
+	return ok
+}
+
+// answered and failedAt record whether an attempt at addr got any answer.
+func (c *Client) answered(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.down, addr)
+}
+
+func (c *Client) failedAt(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.down[addr] = time.Now().Add(c.downFor)
+	if c.beginAt == addr {
+		c.beginAt = ""
+	}
+}
+
+// beginTarget picks the node for Begin, which any node answers: the last
+// one that did, so a dead node is not tried again in rotation.
+func (c *Client) beginTarget() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.beginAt != "" && !c.isDown(c.beginAt) {
+		return c.beginAt
+	}
+	c.beginAt = c.rotate()
+	return c.beginAt
+}
+
 // redirect records what a failed attempt at addr taught about the shard's
 // leader. It reports whether the hint names a new node to try right away.
+// A hint naming an address that just failed is stale (the answering node
+// has not yet noticed its leader is gone) and is not followed.
 func (c *Client) redirect(sh int, addr string, hint *txnv1.LeaderHint) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if h := hint.GetAddr(); h != "" && h != addr {
+	if h := hint.GetAddr(); h != "" && h != addr && !c.isDown(h) {
 		c.leaders[sh] = h
 		return true
 	}
@@ -277,9 +342,11 @@ func (c *Client) onShard(ctx context.Context, sh int,
 		cancel()
 		switch out {
 		case done:
+			c.answered(addr)
 			c.learned(sh, addr)
 			return nil
 		case notLeader:
+			c.answered(addr)
 			last = fmt.Errorf("%s does not lead shard %d", addr, sh)
 			if c.redirect(sh, addr, hint) {
 				continue // a fresh hint: follow it at once
@@ -289,6 +356,7 @@ func (c *Client) onShard(ctx context.Context, sh int,
 				return err // the request itself is wrong; retrying cannot help
 			}
 			last = err
+			c.failedAt(addr)
 			c.redirect(sh, addr, nil)
 		}
 		if err := c.sleep(ctx, backoff); err != nil {
@@ -338,7 +406,7 @@ func (c *Client) beginRPC(ctx context.Context, ts uint64) (*Txn, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("client: begin: %w (last error: %v)", err, last)
 		}
-		addr := c.target(0)
+		addr := c.beginTarget()
 		stub, err := c.stub(addr)
 		if err != nil {
 			return nil, err
@@ -347,6 +415,7 @@ func (c *Client) beginRPC(ctx context.Context, ts uint64) (*Txn, error) {
 		r, err := stub.Begin(actx, &txnv1.BeginRequest{Ts: ts})
 		cancel()
 		if err == nil && r.GetShards() > 0 {
+			c.answered(addr)
 			c.mu.Lock()
 			c.shards = int(r.GetShards())
 			c.mu.Unlock()
@@ -356,6 +425,7 @@ func (c *Client) beginRPC(ctx context.Context, ts uint64) (*Txn, error) {
 			}, nil
 		}
 		last = err
+		c.failedAt(addr)
 		c.redirect(0, addr, nil)
 		if c.sleep(ctx, backoff) == nil {
 			backoff = min(backoff*2, c.opts.BackoffMax)

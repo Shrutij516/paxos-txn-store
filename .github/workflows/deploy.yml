@@ -12,6 +12,11 @@ on:
         description: "paxosd image digest (sha256:...). Empty: the image release.yml pushed for the selected commit."
         required: false
         default: ""
+      cpu_credits:
+        description: "CPU credit mode of the nodes: standard (throttled to baseline when credits run out) or unlimited (full speed, surplus billed; use for load tests). Changing it on a running cluster replaces all three nodes."
+        type: choice
+        options: [standard, unlimited]
+        default: standard
 
 permissions:
   contents: read
@@ -69,7 +74,10 @@ jobs:
       - name: terraform plan
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
-        run: terraform plan -var "image_digest=$DIGEST" -out=cluster.tfplan
+          CPU_CREDITS: ${{ inputs.cpu_credits }}
+        run: |
+          echo "cpu credits: \`$CPU_CREDITS\`" >> "$GITHUB_STEP_SUMMARY"
+          terraform plan -var "image_digest=$DIGEST" -var "cpu_credits=$CPU_CREDITS" -out=cluster.tfplan
 
       - name: show the plan
         run: |

@@ -110,6 +110,7 @@ def main(out):
     summary = {
         "run": ev.get("run"),
         "image": ev.get("image"),
+        "cpu_credits": ev.get("cpu_credits"),
         "config": {k: ev.get(k) for k in ("warmup_s", "duration_s", "kill_at_s", "down_s", "clients", "keys", "cross", "profile")},
         "leaders_before_kill": ev.get("leaders_before_kill"),
         "most_shards_node": ev.get("most_shards_node"),
@@ -129,7 +130,7 @@ def main(out):
     md = []
     md.append(f"### Failover under load: run {summary['run']}")
     md.append("")
-    where = f"Image `{summary['image']}`" if summary["image"] else "Local processes"
+    where = f"Image `{summary['image']}`, CPU credits `{summary['cpu_credits']}`" if summary["image"] else "Local processes"
     md.append(f"{where}. Load: {ev.get('clients')} clients, {ev.get('profile')} contention, cross-shard {ev.get('cross')}, "
               f"{ev.get('keys')} accounts; {ev.get('warmup_s')} s warmup, {ev.get('duration_s')} s measured. "
               f"Leaders before the kill (shard:node): {ev.get('leaders_before_kill')}.")
@@ -159,6 +160,9 @@ def main(out):
     md.append("- Latency is end to end per committed transaction (retries included), attributed to the phase in which it finished.")
     md.append(f"- **Settled** (every node ready, nothing in doubt) before the logs were copied: {'yes' if summary['settled'] else 'NO'}.")
     md.append("- Caveat: loadgen runs on node 1 and shares its CPU with node 1's paxosd.")
+    if summary["cpu_credits"] and "standard" in summary["cpu_credits"]:
+        md.append("- **Warning:** the nodes use standard CPU credits; a node that has spent them is throttled to 20% of each vCPU "
+                  "(incident I19). Check CloudWatch CPUCreditBalance, or deploy with cpu_credits = unlimited.")
     text = "\n".join(md) + "\n"
     open(os.path.join(out, "summary.md"), "w").write(text)
     print(text)
