@@ -624,6 +624,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
 - **Tradeoff:**
   - **Avoiding a live leader:** a leader whose attempt timed out once is avoided for up to the window even if it answers again at once. Operations on its shard bounce off followers, whose hints name it and are ignored, until the window ends: up to 1 s extra in the worst case.
   - **One probe per window:** during a long outage each client still tries the dead address once per window.
+  - **When every address is in the window**, the client does not stall or wait for a window to end. It tries the address whose failure is oldest, so it cycles through the nodes in the order they failed (incident I23).
 
 ## Incidents
 
@@ -935,7 +936,7 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **Not explained:**
     - **The 16.7 s failover:** no local run took more than 1.6 s. Both shards reported the same time and the same new leader, which fits the sampler not reading node 2 for that long: it gives each node's `/metrics` 200 ms, and a throttled node 2 rendering its metrics could miss that repeatedly.
     - **The commit gap is real:** the 10.8 s gap without a commit comes from the client's own timeline.
-    - **To settle it:** the run's `leaders.txt` shows how long node 2 went without a reading, if the artifact is still there. The next run, in `unlimited` mode, will show it directly.
+    - **To settle it:** the run's `leaders.txt` shows how long node 2 went without a reading, if the artifact is still there. The next run will show it directly: the sampler now logs every read, and the report marks a failover time measured only when no survivor went unread around it (incident I22).
 - **Fix:**
   - **Infrastructure (entry 47):**
     - `cpu_credits` is a cluster variable and a deploy input, and the failover test deploys with `unlimited`.
@@ -978,6 +979,56 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Lesson:**
   - **A test failure must carry its own evidence.** Temporary directories vanish, and a failure message that does not say whether the process was alive leaves only guesses.
   - **Don't hide a flake.** Rerunning until green is not a fix. Recording it and making it diagnosable is.
+
+### I22. The failover sampler could make a failover look slower than it was
+
+- **Symptom:** in incident I19, AWS reported 16,728 ms of failover for both shards, with the same new leader. No local reproduction took more than 1.6 s, and the sampler offered a way to produce such a number without a slow election.
+- **Root cause:** the sampler (Phase 9c) had three flaws:
+  - **No record of failed reads.** A read that timed out or failed left no trace, so a long gap in a survivor's readings looked like "not yet leader" and the first successful read after it became the failover time.
+  - **Sequential reads.** It read the three nodes one after another in one loop. The black-holed victim's read took its full timeout on every round, delaying the survivors' samples too.
+  - **A tight per-read timeout.** 200 ms is not much margin for a CPU-throttled node rendering `/metrics`.
+- **Evidence:**
+  - **The code:** the old sampler (`curl -s -m 0.2` in one `for` loop, output only on success).
+  - **Read latency under throttling:** at 0.2 CPU per node under the benchmark load, reads took a p99 of 90 ms and a maximum of 92 ms. At 0.4 CPU the node running loadgen reached 88 ms.
+  - **Whether it applied to I19 is not established:** that run did not log failed reads, which is the point of the fix.
+- **Fix:**
+  - **Sampler:** one loop per node, each reading every 100 ms with a 1 s timeout. Every read goes to `reads.txt` with its outcome (ok, timeout, error) and latency.
+  - **Report:**
+    - a shard's failover is **measured** only if every survivor was read successfully at least every 200 ms, from 100 ms before the kill to 100 ms after the new leader was first seen;
+    - otherwise it is **uncertain**, with a range and each survivor's longest unread gap;
+    - a table gives each node's reads, timeouts, errors, latency and longest unread gap.
+  - **Checked:**
+    - **Measured:** a local run reported 322 ms, with survivor gaps of 111 and 123 ms.
+    - **Uncertain:** the same run with node 3's reads deleted for 2 s after the kill reported "217 to 322 ms, uncertain, node3 2061".
+- **Lesson:**
+  - **A measurement must record its own failures.** A probe that is silent when it cannot see turns blindness into a result.
+  - **Sample independent things independently.** One slow target must not set everyone's sampling rate.
+
+### I23. The client's avoid list ignored failure order when every node was in it
+
+- **Symptom:** found in review of entry 48. When every address had failed within the avoid window, `rotate` fell back to plain round-robin, taking whatever address the position pointed at, not the one that had failed longest ago. It still tried an address on every call, so it did not stall, but it did not prefer the node most likely to have recovered.
+- **Root cause:** the fallback was written as "no address qualifies, so take the next one" without considering which one to take.
+- **Evidence:** `TestRotateAllAvoidedPicksOldestFailure` sets all three addresses as avoided, with the round-robin position on the most recent failure. Run against the committed code in a scratch copy: "rotate = a:1, want b:1".
+- **Fix:** with every address avoided, `rotate` returns the one whose failure is oldest.
+  - **The unit test** checks that choice, and that every call returns an address.
+  - **`TestAllNodesAvoidedStillTried`:** two hung nodes, one of which recovers after its second attempt. Begin succeeds in about 520 ms, after three attempts at each node, well inside the 1 s window, so nothing waited for a window to end.
+- **Lesson:** an exclusion list needs an explicit rule for when it excludes everything. "Never stall" and "which one first" are both part of it.
+
+### I24. The first all-avoided test had a time budget that ignored backoff
+
+- **Symptom:** the first version of `TestAllNodesAvoidedStillTried` failed: "Begin took 993ms: it waited instead of retrying". The log showed six attempts, alternating between the nodes, so the client had kept retrying.
+- **Root cause:** the 900 ms budget counted five 100 ms attempt timeouts and forgot the client's randomized exponential backoff between attempts (20 ms doubling), which added about 0.4 s.
+- **Evidence:** the six attempts in the log; with the backoff at 1–5 ms the same test took 519–521 ms in three runs.
+- **Fix:** the test sets `BackoffBase` 1 ms and `BackoffMax` 5 ms, so its time is the attempts' own. A client that waited for the 1 s window could not finish under 900 ms.
+- **Lesson:** a timing assertion must account for every delay in the path. Check the log before concluding that the code, not the test, is wrong.
+
+### I25. A cleanup command removed directories through unchecked shell variables
+
+- **Symptom:** a measurement command began with `rm -rf $d`, with `d` assigned earlier in the same command, and also removed data directories inside a loop. The tool's safety check blocked it. The command was not run, so nothing was deleted.
+- **Root cause:** a habit of resetting scratch directories with `rm -rf` on a variable. If the variable were empty or wrong, the command would delete something else entirely.
+- **Evidence:** the blocked command.
+- **Fix:** the measurement was rewritten as a script with no removals: `mktemp -d` for a fresh directory per run, and distinct data directory names per configuration. The only cleanup left is `rmdir` of the empty cgroups it created.
+- **Lesson:** do not reset a directory by deleting it through a variable. Create a fresh one with `mktemp -d`. If something must be removed, remove a literal, verified path.
 
 ## Future work
 

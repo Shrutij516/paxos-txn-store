@@ -420,7 +420,7 @@ Stop the watcher with Ctrl-C.
    - 10 s warmup, then 120 s measured;
    - a per-second line of throughput and latency in its log, and a timeline of every transaction.
 
-   A sampler also starts on node 1 (a transient systemd unit). It reads `paxos_is_leader` from every node every 100 ms.
+   A sampler also starts on node 1 (a transient systemd unit). It runs one loop per node, so a dead or slow node cannot delay the others, and every 100 ms each loop reads its node's `/metrics` with a 1 s timeout. Every read is logged with its outcome (ok, timeout, error) and latency, and successful reads add the node's `paxos_is_leader` values.
 3. **Chooses and kills the victim.** 60 s into the measured window, it picks the node leading the most shards. If that is node 1, it takes whichever of nodes 2 and 3 leads more (ties go to the lower ID), so loadgen survives. The victim's restart policy is turned off, then its paxosd is `SIGKILL`ed with `docker kill -s KILL`, and the kill time is recorded on the victim.
 4. **Restarts the victim** 30 s later (restart policy back on, `docker start`) and times it until `/readyz` answers 200.
 5. **Settles.** When loadgen ends, it waits until every node is ready with nothing in doubt.
@@ -432,7 +432,7 @@ Stop the watcher with Ctrl-C.
 - **The workflow artifact `aws-loadtest-<run id>-<attempt>`,** kept 1 day. It holds:
   - `summary.md` and `summary.json`;
   - `events.env` (victim, kill, restart and ready times);
-  - `leaders.txt` (every sample), `timeline.jsonl`, `report.json`, `history.jsonl` and `loadgen.log`;
+  - `reads.txt` (every metrics read: start time, node, ok/timeout/error, latency), `leaders.txt` (what each successful read showed), `timeline.jsonl`, `report.json`, `history.jsonl` and `loadgen.log`;
   - `data/node1..3/` (the SQLite files) and `check.log`.
 - **The bucket** keeps its copy 1 day.
 
@@ -444,6 +444,10 @@ To keep a result, copy the summary into the [results section](#results-failover-
   - **What happened:** in incident I19 the balance stayed between 0 and 1.2 on all three nodes from launch, through the whole test.
   - **Run in `unlimited`** (step 1). Otherwise compare runs only when CloudWatch `CPUCreditBalance` (Minimum, 5-minute) stayed well above 0, and record it with the results.
 - **Clocks.** Failover times compare the victim's clock (kill) with node 1's clock (samples). Both use Amazon Time Sync, which keeps them within about a millisecond. The 100 ms sample interval dominates the error.
+- **Measured or uncertain** (incident I22). A failover time is **measured** only if every survivor was read successfully at least every 200 ms (no missed 100 ms sample) from 100 ms before the kill to 100 ms after the new leader was first seen.
+  - **Otherwise it is uncertain:** the take-over may have come during a survivor's unread gap. The summary then gives a range (from the new leader's previous successful read to the read that showed it leading) and each survivor's longest unread gap.
+  - **The read table:** reads, timeouts, errors and latency per node, and each survivor's longest unread gap after the kill.
+  - **The 1 s timeout:** locally, at 0.2 CPU per node under the benchmark load, reads took up to 92 ms, so 200 ms had little margin and AWS's throttling may be coarser. A read slower than 100 ms only delays that node's next sample, and the gap rule then reports it.
 - **Tracing is on.** The nodes trace at the deployed `-trace-sample 0.1`, which adds a little to every request.
 
 ### Destroying

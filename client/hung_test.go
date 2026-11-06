@@ -21,12 +21,15 @@ import (
 type fakeNode struct {
 	txnv1.UnimplementedTxnServer
 	hung  bool
+	ok    atomic.Bool // set by recover: a hung node answers from then on
 	calls atomic.Int64
 }
 
+func (f *fakeNode) recover() { f.ok.Store(true) }
+
 func (f *fakeNode) wait(ctx context.Context) error {
 	f.calls.Add(1)
-	if f.hung {
+	if f.hung && !f.ok.Load() {
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -102,5 +105,45 @@ func TestHungNodeIsNotRetried(t *testing.T) {
 	t.Logf("%d transactions in %v; attempts at the hung node: %d", txns, took.Round(time.Millisecond), hung.calls.Load())
 	if n := hung.calls.Load(); n > 1 {
 		t.Fatalf("the hung node got %d attempts (each a %v timeout), want at most 1", n, attempt)
+	}
+}
+
+// TestAllNodesAvoidedStillTried: when every node has failed within the
+// avoid window, the client keeps trying them (oldest failure first) and
+// succeeds as soon as one answers, without waiting for a window to end.
+func TestAllNodesAvoidedStillTried(t *testing.T) {
+	a, b := &fakeNode{hung: true}, &fakeNode{hung: true}
+	addrs := []string{serveFake(t, a), serveFake(t, b)}
+	const attempt = 100 * time.Millisecond // avoid window: max(2 x 100 ms, 1 s) = 1 s
+	// Tiny backoff, so the time taken is the attempts' own: a client that
+	// waited for an avoid window to end could not finish under 1 s.
+	cl, err := client.New(addrs, client.Options{AttemptTimeout: attempt, BackoffBase: time.Millisecond, BackoffMax: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+
+	// Both nodes hang until b has failed twice; then b answers.
+	go func() {
+		for b.calls.Load() < 2 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		b.recover()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := cl.Begin(ctx); err != nil {
+		t.Fatalf("Begin with every node avoided: %v", err)
+	}
+	took := time.Since(start)
+	t.Logf("Begin succeeded after %v; attempts: a %d, b %d", took.Round(time.Millisecond), a.calls.Load(), b.calls.Load())
+	if a.calls.Load() < 2 || b.calls.Load() < 3 {
+		t.Fatalf("attempts a=%d b=%d: the client stopped retrying nodes in the avoid window", a.calls.Load(), b.calls.Load())
+	}
+	// About five 100 ms timeouts, well inside the 1 s avoid window of the
+	// first failure: nothing waited for a window to end.
+	if took > 900*time.Millisecond {
+		t.Fatalf("Begin took %v: it waited instead of retrying the oldest failure", took)
 	}
 }

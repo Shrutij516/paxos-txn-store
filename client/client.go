@@ -219,7 +219,9 @@ func (c *Client) target(sh int) string {
 }
 
 // rotate returns the next address round-robin, skipping addresses that
-// failed recently unless all did. c.mu is held.
+// failed recently. If every address failed recently it returns the one
+// whose failure is oldest, so a client never stalls on its avoid list: it
+// keeps trying, in the order the nodes failed. c.mu is held.
 func (c *Client) rotate() string {
 	for range c.addrs {
 		a := c.addrs[c.next%len(c.addrs)]
@@ -228,9 +230,13 @@ func (c *Client) rotate() string {
 			return a
 		}
 	}
-	a := c.addrs[c.next%len(c.addrs)]
-	c.next++
-	return a
+	oldest := c.addrs[0]
+	for _, a := range c.addrs[1:] {
+		if c.down[a].Before(c.down[oldest]) {
+			oldest = a
+		}
+	}
+	return oldest
 }
 
 // isDown reports whether an attempt at addr failed within downFor. c.mu
