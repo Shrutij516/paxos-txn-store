@@ -80,7 +80,7 @@ func rejoin(t *testing.T, bin string, down time.Duration) time.Duration {
 	}()
 	for _, p := range procs {
 		if _, ok := awaitReady(t, p, 30*time.Second); !ok {
-			t.Fatalf("node %d never became ready", p.id)
+			t.Fatalf("node %d never became ready: %s", p.id, p.why())
 		}
 	}
 
@@ -122,6 +122,21 @@ func rejoin(t *testing.T, bin string, down time.Duration) time.Duration {
 	}
 	t.Logf("node %d ready %v after its restart (down %v)", victim.id, took.Round(10*time.Millisecond), down)
 	return took
+}
+
+// why describes a node that did not become ready, for the failure
+// message: whether its process exited, and the end of its log (t.TempDir
+// is gone afterwards). An early exit is often a port that freeAddr handed
+// out and something else took first (DECISIONS.md I21).
+func (p *proc) why() string {
+	state := "still running"
+	select {
+	case <-p.exited:
+		state = fmt.Sprintf("exited: %v", p.err)
+	default:
+	}
+	b, _ := os.ReadFile(p.log)
+	return fmt.Sprintf("process %s; log ends:\n%s", state, b[max(0, len(b)-2000):])
 }
 
 // awaitReady polls p's /readyz every 100 ms until it answers 200 or limit

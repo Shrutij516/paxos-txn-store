@@ -964,6 +964,21 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Fix:** none needed for the code. For the procedure: build the old revision in a scratch copy (`git archive HEAD | tar -x -C <scratch>`), add the new test there, and run it. That is how the scratch loadgen builds in this same investigation were made.
 - **Lesson:** a lesson written down is not yet a habit. Before any command that moves uncommitted work (stash, checkout of a path, reset), stop and use a scratch copy instead.
 
+### I21. `TestMultiProcessRejoin` failed once: a node never became ready at startup
+
+- **Symptom:** in the Phase 9d full-suite run (`go test ./...`, every package at once), `TestMultiProcessRejoin/down=1m0s` failed 30 s in. "node 1 at +0s: no answer", then "node 1 never became ready". That was at first startup, before any kill.
+- **Root cause:** not established; the evidence was lost.
+  - **What was lost:** the test's `t.TempDir()`, with the node's log, is deleted when the test ends, and the failure message said nothing about the process.
+  - **What it was not:** the Phase 9d client change. The test does not use the client.
+  - **The likely candidate, unconfirmed:** `freeAddr` binds port 0, reads the port and closes it. The two downtime subtests start their clusters in parallel, and the other packages' tests bind ports at the same time. Another listener can take the port before paxosd binds it, and that node then exits at startup and never answers.
+- **Evidence:**
+  - **Did not reproduce:** run alone right after, the test passed (ready 0.61 s and 0.91 s after the restarts), and so did the whole `cmd/paxosd` package (219 s).
+  - **Not the throttling experiments:** no process was left over from them, and the shell was not in one of their CPU-capped cgroups.
+- **Fix:** diagnosability, since the cause cannot be fixed without first being seen. When a node never becomes ready, `TestMultiProcessRejoin` now reports whether its process exited (and how) and the end of its log (`proc.why`). The next occurrence will show a bind error, a crash or a slow start.
+- **Lesson:**
+  - **A test failure must carry its own evidence.** Temporary directories vanish, and a failure message that does not say whether the process was alive leaves only guesses.
+  - **Don't hide a flake.** Rerunning until green is not a fix. Recording it and making it diagnosable is.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
