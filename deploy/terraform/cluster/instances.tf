@@ -44,6 +44,12 @@ locals {
   }) }
 }
 
+# Changes when var.cpu_credits does, so the nodes are replaced (see the
+# instances' lifecycle).
+resource "terraform_data" "cpu_credits" {
+  input = var.cpu_credits
+}
+
 resource "aws_instance" "node" {
   #checkov:skip=CKV_AWS_88:public IPv4 is the nodes' only route out (no NAT gateway, DECISIONS.md entry 41); the security group admits nothing from outside the cluster
   #checkov:skip=CKV_AWS_126:detailed monitoring costs extra; paxosd exports its own metrics to Prometheus on node 1
@@ -59,10 +65,12 @@ resource "aws_instance" "node" {
   ebs_optimized               = true
   monitoring                  = false
 
-  # Standard credits: a busy node is throttled instead of billed for
-  # surplus credits (t3 defaults to unlimited).
+  # Standard by default: a busy node is throttled instead of billed for
+  # surplus credits (t3 defaults to unlimited). unlimited for load tests
+  # (DECISIONS.md entry 47, incident I19). The mode goes to RunInstances
+  # only; see terraform_data.cpu_credits for changing it.
   credit_specification {
-    cpu_credits = "standard"
+    cpu_credits = var.cpu_credits
   }
 
   metadata_options {
@@ -98,6 +106,11 @@ resource "aws_instance" "node" {
     # disk goes with it). A newer AMI likewise must not replace running
     # nodes.
     ignore_changes = [ami, user_data_base64]
+
+    # A new credit mode replaces the nodes rather than modifying them: the
+    # deploy role is not allowed ec2:ModifyInstanceCreditSpecification
+    # (gap G3 in docs/aws.md), and the plan shows the replacement.
+    replace_triggered_by = [terraform_data.cpu_credits]
   }
 
   tags = { Name = each.value.name }

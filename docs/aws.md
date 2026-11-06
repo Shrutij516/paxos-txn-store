@@ -213,7 +213,7 @@ The cluster stack was checked against `deploy/terraform/bootstrap/deploy_policy.
 |---|---|---|---|
 | G1 | `ec2:AttachInternetGateway`, `ec2:DetachInternetGateway` on `internet-gateway/*` | attaching the IGW (create), detaching it (destroy) | **Fixed:** both actions are now in `Ec2ManageTagged`, which covers our tagged gateways and VPCs. |
 | G2 | `iam:PassRole` while calling `iam:AddRoleToInstanceProfile` | putting the node role into the instance profile | **Fixed:** the condition is now `StringEqualsIfExists`. It still allows passing the node role only, and only to EC2 when a service is named, and it no longer fails when `AddRoleToInstanceProfile` sends no service. |
-| G3 | `ec2:ModifyInstanceCreditSpecification` | only when `credit_specification` changes after create (the create passes it to `RunInstances`) | Not needed now. |
+| G3 | `ec2:ModifyInstanceCreditSpecification` | only when `credit_specification` changes after create (the create passes it to `RunInstances`) | Not needed: a new `cpu_credits` replaces the nodes instead (DECISIONS.md entry 47). |
 | G4 | `ec2:CreateTags` and `ec2:DeleteTags` on existing `security-group-rule/*` and `volume/*` | only when their tags change after create (for example a new default tag) | Not needed now. `Ec2ManageTagged` does not list those resource types. |
 | G5 | `ec2:CreateRoute` with the internet gateway as target | the route table's default route | Unverified: if EC2 also authorizes the gateway resource for this call, it needs `internet-gateway/*` with the same tag condition. |
 | G6 | KMS use of the `aws/ebs` key | encrypted volumes at launch | Expected to be covered by the AWS managed key's own policy, which allows EBS use by any principal in the account. Unverified. |
@@ -258,12 +258,16 @@ Prerequisites, all done once:
 
 1. **Actions → deploy → Run workflow.** Leave **Use workflow from** on `main`, since the environment only admits `main`.
 2. **image_digest:** leave it empty to deploy the image that `release.yml` pushed for the head of `main`. The workflow looks up `ghcr.io/shrutij516/paxos-txn-store:<commit sha>` anonymously and fails if there is none. If `release.yml` has not finished for that commit yet, wait for it. To deploy another build, paste its digest (`sha256:…`); the workflow checks that it exists.
-3. **Run workflow.**
+3. **cpu_credits:** `standard` (the default) or `unlimited` (DECISIONS.md entry 47).
+   - **`standard`:** a node that has spent its CPU credits is throttled to its baseline, 20% of each vCPU.
+   - **`unlimited`:** the node keeps full speed and AWS bills the surplus (see [Cost while running](#cost-while-running)). Choose it for [failover under load](#failover-under-load).
+   - **Changing it on a running cluster** replaces all three nodes, and their data with them. The plan shows `terraform_data.cpu_credits` updated and the three instances "replaced due to changes in replace_triggered_by". To avoid that, destroy first, then deploy with the new mode.
+4. **Run workflow.**
 
 **Approve the plan job:** the run shows **plan: Waiting**. Choose **Review deployments**, tick **aws**, then **Approve and deploy**. The job resolves the digest, runs `terraform plan`, and prints the plan in its log and on the run's summary page.
 
 **Read the plan, then approve the apply job:**
-- The first deploy creates 23 resources (listed below) and changes or destroys nothing.
+- The first deploy creates 24 resources (listed below) and changes or destroys nothing. A cluster deployed before Phase 9d gets 1 to add on its next deploy: `terraform_data.cpu_credits`, with no change to the nodes.
 - Later deploys usually show no changes. `user_data` and the AMI are ignored after creation.
 
 Then **Review deployments → aws → Approve and deploy** for **apply**. To stop instead, choose **Reject**, or cancel the run. The saved plan expires with its artifact after 1 day.
@@ -280,11 +284,12 @@ A node that runs an older image fails the check: `user_data` only runs on first 
 
 A deploy and a destroy never run at the same time: both use the concurrency group `terraform-cluster`, and a second run waits.
 
-The first deploy creates 23 resources:
+The first deploy creates 24 resources:
 - **Network (10):** the VPC, 3 subnets, the internet gateway, the route table, 3 route table associations and the security group.
 - **Security group rules (7):** 3 ingress (7001, 9100 and 4317, from the group itself) and 4 egress (the same three ports to the group, and 443 to anywhere).
 - **IAM (3):** the role, its policy attachment and the instance profile.
 - **Nodes (3):** the instances.
+- **Credit mode (1):** `terraform_data.cpu_credits`, which only records the mode so that changing it replaces the nodes. It makes no AWS call.
 
 ### Reaching the nodes: Session Manager
 
@@ -396,7 +401,9 @@ Stop the watcher with Ctrl-C.
 
 **Steps:**
 
-1. **Deploy.** Run **Actions → deploy → Run workflow** on `main` with **image_digest** empty, then approve **plan** and **apply** as in [Deploying](#deploying). Wait until the smoke check is green on all three nodes.
+1. **Deploy** with **cpu_credits: unlimited.** Run **Actions → deploy → Run workflow** on `main` with **image_digest** empty and **cpu_credits** `unlimited`, then approve **plan** and **apply** as in [Deploying](#deploying). Wait until the smoke check is green on all three nodes.
+   - **Why unlimited:** with `standard` credits, the first AWS run (incident I19) ran throttled to the 20% baseline from launch, and the survivors nearly stopped serving after the kill.
+   - **Running cluster in `standard`:** destroy it first rather than switching modes, so the replacement is deliberate.
 2. **Run the test.** **Actions → aws-loadtest → Run workflow** on `main`. The defaults are 120 s measured, kill at 60 s, 30 s down and 32 clients. **Run workflow**, then **Review deployments → aws → Approve and deploy**. It takes about 5 minutes.
 3. **Read the results.** They are on the run's summary page:
    - the failover table, one row per shard the victim led;
@@ -413,7 +420,7 @@ Stop the watcher with Ctrl-C.
    - 10 s warmup, then 120 s measured;
    - a per-second line of throughput and latency in its log, and a timeline of every transaction.
 
-   A sampler also starts on node 1 (a transient systemd unit). It reads `paxos_is_leader` from every node every 100 ms.
+   A sampler also starts on node 1 (a transient systemd unit). It runs one loop per node, so a dead or slow node cannot delay the others, and every 100 ms each loop reads its node's `/metrics` with a 1 s timeout. Every read is logged with its outcome (ok, timeout, error) and latency, and successful reads add the node's `paxos_is_leader` values.
 3. **Chooses and kills the victim.** 60 s into the measured window, it picks the node leading the most shards. If that is node 1, it takes whichever of nodes 2 and 3 leads more (ties go to the lower ID), so loadgen survives. The victim's restart policy is turned off, then its paxosd is `SIGKILL`ed with `docker kill -s KILL`, and the kill time is recorded on the victim.
 4. **Restarts the victim** 30 s later (restart policy back on, `docker start`) and times it until `/readyz` answers 200.
 5. **Settles.** When loadgen ends, it waits until every node is ready with nothing in doubt.
@@ -425,7 +432,7 @@ Stop the watcher with Ctrl-C.
 - **The workflow artifact `aws-loadtest-<run id>-<attempt>`,** kept 1 day. It holds:
   - `summary.md` and `summary.json`;
   - `events.env` (victim, kill, restart and ready times);
-  - `leaders.txt` (every sample), `timeline.jsonl`, `report.json`, `history.jsonl` and `loadgen.log`;
+  - `reads.txt` (every metrics read: start time, node, ok/timeout/error, latency), `leaders.txt` (what each successful read showed), `timeline.jsonl`, `report.json`, `history.jsonl` and `loadgen.log`;
   - `data/node1..3/` (the SQLite files) and `check.log`.
 - **The bucket** keeps its copy 1 day.
 
@@ -433,8 +440,14 @@ To keep a result, copy the summary into the [results section](#results-failover-
 
 **Caveats:**
 - **loadgen shares node 1's CPU.** It runs on node 1 with node 1's paxosd, Prometheus, Grafana and Jaeger, on 2 vCPUs. Node 1 is never killed, so it is busy throughout: it carries load generation and a survivor's share of the cluster's work.
-- **CPU credits.** The nodes are t3.small with standard credits. A long or repeated run can use up the credit balance and be throttled to the 20% baseline, which shows as a throughput drop unrelated to the kill. Compare runs only when CloudWatch `CPUCreditBalance` is not near 0.
+- **CPU credits.** In `standard` mode, a t3.small that has spent its credits is throttled to 20% of each vCPU.
+  - **What happened:** in incident I19 the balance stayed between 0 and 1.2 on all three nodes from launch, through the whole test.
+  - **Run in `unlimited`** (step 1). Otherwise compare runs only when CloudWatch `CPUCreditBalance` (Minimum, 5-minute) stayed well above 0, and record it with the results.
 - **Clocks.** Failover times compare the victim's clock (kill) with node 1's clock (samples). Both use Amazon Time Sync, which keeps them within about a millisecond. The 100 ms sample interval dominates the error.
+- **Measured or uncertain** (incident I22). A failover time is **measured** only if every survivor was read successfully at least every 200 ms (no missed 100 ms sample) from 100 ms before the kill to 100 ms after the new leader was first seen.
+  - **Otherwise it is uncertain:** the take-over may have come during a survivor's unread gap. The summary then gives a range (from the new leader's previous successful read to the read that showed it leading) and each survivor's longest unread gap.
+  - **The read table:** reads, timeouts, errors and latency per node, and each survivor's longest unread gap after the kill.
+  - **The 1 s timeout:** locally, at 0.2 CPU per node under the benchmark load, reads took up to 92 ms, so 200 ms had little margin and AWS's throttling may be coarser. A read slower than 100 ms only delays that node's next sample, and the gap rule then reports it.
 - **Tracing is on.** The nodes trace at the deployed `-trace-sample 0.1`, which adds a little to every request.
 
 ### Destroying
@@ -511,6 +524,14 @@ us-east-1, on-demand:
 | **Total** | **about $0.083** |
 
 That is about $2.00 a day, or $61 a month if left running, which is far over the $15 budget. Deploy for a session, then destroy. Traffic between AZs ($0.01/GB each way) adds to this under load.
+
+**`cpu_credits = unlimited`** adds a charge only for CPU above the baseline: surplus credits at $0.05 per vCPU-hour (Linux, t3, us-east-1).
+- **Per node:** a t3.small has 2 vCPUs with a 20% baseline each, so a node at 100% uses at most 1.6 vCPU-hours of surplus per hour, or $0.08.
+- **Whole cluster:** all three nodes saturated cost at most $0.24 an hour extra.
+- **A failover test** (about 5 minutes of load, plus deploy and first boot) adds well under $0.05.
+- **An idle cluster** stays near its baseline and adds about nothing.
+
+Surplus credits of a terminated instance are billed when it is terminated, so destroying the cluster does not avoid the charge, but it does stop it from growing.
 
 ## Results: first AWS run
 

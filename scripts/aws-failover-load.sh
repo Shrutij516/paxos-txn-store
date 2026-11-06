@@ -73,22 +73,42 @@ node_start() {
     setsid "$LOADGEN_BIN" $(loadgen_args "$dir" "$addrs" "$maddrs") >"$dir/loadgen.log" 2>&1 </dev/null &
     echo $! >"$dir/loadgen.pid"
   fi
-  # Sampler: every 100 ms, each node's paxos_is_leader series as
-  # "<unix ms> <node> <shard> <value>". A node that does not answer within
-  # 200 ms is skipped for that round.
+  # Sampler: one loop per node, so a slow or black-holed node cannot delay
+  # the others' samples. Every 100 ms (or right after a read that took
+  # longer) each loop reads its node's /metrics with a 1 s timeout and
+  # appends one line per read to reads.txt, "<start unix ms> <node>
+  # <ok|timeout|error> <latency ms>", and on success the node's
+  # paxos_is_leader series to leaders.txt, "<start unix ms> <node> <shard>
+  # <value>". The report trusts a failover time only if every survivor
+  # was read without gaps around it (incident I22).
   cat >"$dir/sampler.sh" <<SAMPLER
 #!/bin/bash
 IFS=, read -ra ms <<< "$maddrs"
-while [ ! -e "$dir/stop-sampler" ]; do
-  for m in "\${ms[@]}"; do
-    t=\$(date +%s%3N)
-    curl -s -m 0.2 "http://\$m/metrics" | awk -v t="\$t" '/^paxos_is_leader\\{/ {
-      match(\$0, /node="[0-9]+"/); n = substr(\$0, RSTART + 6, RLENGTH - 7)
-      match(\$0, /shard="[0-9]+"/); s = substr(\$0, RSTART + 7, RLENGTH - 8)
-      print t, n, s, \$NF }'
-  done >> "$dir/leaders.txt"
-  sleep 0.1
-done
+loop() {
+  local n=\$1 m=\$2 t0 t1 rc code body
+  body=\$(mktemp)
+  while [ ! -e "$dir/stop-sampler" ]; do
+    t0=\$(date +%s%3N)
+    code=\$(curl -s -o "\$body" -w '%{http_code}' -m 1 "http://\$m/metrics"); rc=\$?
+    t1=\$(date +%s%3N)
+    if [ \$rc -eq 0 ] && [ "\$code" = 200 ]; then
+      echo "\$t0 \$n ok \$((t1 - t0))" >> "$dir/reads.txt"
+      awk -v t="\$t0" '/^paxos_is_leader\\{/ {
+        match(\$0, /node="[0-9]+"/); n = substr(\$0, RSTART + 6, RLENGTH - 7)
+        match(\$0, /shard="[0-9]+"/); s = substr(\$0, RSTART + 7, RLENGTH - 8)
+        print t, n, s, \$NF }' "\$body" >> "$dir/leaders.txt"
+    elif [ \$rc -eq 28 ]; then
+      echo "\$t0 \$n timeout \$((t1 - t0))" >> "$dir/reads.txt"
+    else
+      echo "\$t0 \$n error \$((t1 - t0))" >> "$dir/reads.txt"
+    fi
+    left=\$((100 - (t1 - t0)))
+    if [ \$left -gt 0 ]; then sleep "0.\$(printf '%03d' \$left)"; fi
+  done
+  rm -f "\$body"
+}
+for i in "\${!ms[@]}"; do loop \$((i + 1)) "\${ms[\$i]}" & done
+wait
 SAMPLER
   chmod 755 "$dir/sampler.sh"
   # A transient systemd unit, so the sampler outlives the SSM command.
@@ -330,6 +350,9 @@ run_main() {
     [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "node1 reports no image digest: $digest" >&2; exit 1; }
     IMAGE=ghcr.io/shrutij516/paxos-txn-store@$digest
     echo "image=$IMAGE" >>"$ev"
+    # standard credits throttle a node that has spent them (incident I19).
+    echo "cpu_credits=$(aws ec2 describe-instance-credit-specifications --instance-ids "${IDS[1]}" "${IDS[2]}" "${IDS[3]}" \
+      --query 'InstanceCreditSpecifications[].CpuCredits' --output text | tr -s '\t ' '\n' | sort -u | paste -sd/)" >>"$ev"
   fi
   {
     echo "run=$RUN"
@@ -388,7 +411,7 @@ run_main() {
   on 1 finish "$RUN" "$MADDRS" | tee -a "$OUT/node-steps.log" | grep -E '^(settled_ms|loadgen_exit)=' >>"$ev" || true
 
   if [[ $MODE == local ]]; then
-    cp "$NODE_WORK/$RUN"/{timeline.jsonl,report.json,history.jsonl,loadgen.log,leaders.txt} "$OUT/"
+    cp "$NODE_WORK/$RUN"/{timeline.jsonl,report.json,history.jsonl,loadgen.log,leaders.txt,reads.txt} "$OUT/"
     for n in 1 2 3; do
       mkdir -p "$OUT/data/node$n"
       cp "$LOCAL_DIR/data/n$n"/node-*-shard-*.db* "$OUT/data/node$n/"

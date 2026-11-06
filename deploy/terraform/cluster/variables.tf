@@ -26,6 +26,17 @@ variable "instance_type" {
   default     = "t3.small"
 }
 
+variable "cpu_credits" {
+  description = "CPU credit mode of the t3 nodes (DECISIONS.md entry 47). standard: a node that has spent its credits is throttled to its baseline (20% of each vCPU on a t3.small). unlimited: it keeps full speed and surplus credits are billed. Changing it replaces all three nodes (and their data); the deploy role does not modify credit settings in place."
+  type        = string
+  default     = "standard"
+
+  validation {
+    condition     = contains(["standard", "unlimited"], var.cpu_credits)
+    error_message = "cpu_credits must be standard or unlimited."
+  }
+}
+
 variable "client_cidrs" {
   description = "IPv4 CIDRs allowed to reach the nodes' client port (7001). Empty: no access from outside the cluster."
   type        = list(string)
