@@ -590,6 +590,7 @@ Each entry records What we chose, Why, what we Rejected, and the Tradeoff we acc
   - **No new permission.** The mode is passed to `RunInstances`, which the deploy role already has; the first deploy passed `standard` the same way.
   - **Why replacement:** modifying a running node's mode needs `ec2:ModifyInstanceCreditSpecification` (gap G3 in docs/aws.md), which the deploy role does not have. The cluster is redeployed rather than modified, and replacement keeps it that way. The plan says "replaced due to changes in replace_triggered_by", so a reviewer sees it before approving.
   - **Existing clusters are unaffected.** Adding the trigger to a running cluster only creates it: checked on a scratch configuration, the nodes are not replaced.
+  - **Correction (incident I26):** that same behaviour means a cluster deployed before this entry gets *no* replacement when its mode changes in the same deploy that creates the trigger. The plan then shows the trigger added and the three instances' credit mode changed in place ("1 to add, 3 to change"), which needs `ec2:ModifyInstanceCreditSpecification` and would fail. Replacement only works once the trigger exists in the state. For such a cluster, destroy and redeploy.
 - **Rejected:**
   - **Unlimited by default:** removes the cliff everywhere, but any sustained load on a forgotten cluster would add surplus charges on top of the $2 a day the $15 budget already cannot absorb.
   - **Granting `ec2:ModifyInstanceCreditSpecification`:** switching modes in place keeps the data, but widens the deploy role for a cluster that is deployed per session and destroyed after.
@@ -903,7 +904,7 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Symptom:** the first `aws-loadtest.yml` run (42143631868, image `sha256:39476875f7d2c6f53fc0b362e9f033ef8ec94e956dd47896fb3223258bf616f8`):
   - **Before the kill:** 145 transactions/s, p99 481 ms.
   - **The kill:** node 3, leading shards 1 and 2, at 60 s.
-  - **Failover:** both shards went to node 2 after 16,728 ms (under 0.35 s unloaded on 2026-10-28).
+  - **Failover:** both shards went to node 2 after 16,728 ms (under 0.35 s unloaded on 2026-10-29 UTC; first written here as 2026-10-28, the evening before in US time).
   - **With node 3 down:** 1.9, then 1.5 transactions/s, p99 4.8 s and 8.8 s, 71 errors (46 unknown, 27 failed), and a longest stretch without a commit of 10.8 s.
   - **After the rejoin:** 106/s. The rejoin itself took 1.73 s, so the I4 fix is confirmed on AWS.
   - **History check:** 14,175 committed, no violations.
@@ -1030,6 +1031,35 @@ Things that broke after they were merged, and why. Every phase that finds someth
 - **Fix:** the measurement was rewritten as a script with no removals: `mktemp -d` for a fresh directory per run, and distinct data directory names per configuration. The only cleanup left is `rmdir` of the empty cgroups it created.
 - **Lesson:** do not reset a directory by deleting it through a variable. Create a fresh one with `mktemp -d`. If something must be removed, remove a literal, verified path.
 
+### I26. The cluster was left running for about 3 hours after a test
+
+- **Symptom:** after failover run 1, the destroy workflow was not run, and the cluster kept running for about 3 hours. The next deploy, with `cpu_credits = unlimited` for run 2, planned **1 to add, 3 to change** instead of the expected replacement. That was caught at plan review: the deploy was cancelled before apply, the cluster was destroyed, and then redeployed fresh.
+- **Root cause:**
+  - **An operator slip:** the documented order is deploy, test, destroy (docs/aws.md, Failover under load), and the last step was skipped.
+  - **A design gap it exposed:** the cluster had been deployed before entry 47, so its state had no `terraform_data.cpu_credits`. Creating the trigger does not count as a change to it, so `replace_triggered_by` did not fire. The new mode then showed as an in-place update of the three instances' `credit_specification`. That apply needs `ec2:ModifyInstanceCreditSpecification`, which the deploy role does not have (gap G3), so it would most likely have failed partway.
+- **Evidence:**
+  - **The plan's counts:** 1 add is the trigger; 3 change is the instances.
+  - **The trigger behaviour:** entry 47's scratch check found exactly that, "adding the trigger to a running cluster only creates it".
+  - **Cost:** about 3 hours at the documented rate of about $0.083 an hour is roughly $0.25, in standard mode, so no surplus credits.
+- **Fix:**
+  - **This time:** destroy, then a fresh deploy with `unlimited`, which created the trigger and the instances together.
+  - **Docs:**
+    - entry 47 now carries a correction: on a cluster deployed before entry 47, change the mode by destroying and redeploying;
+    - docs/aws.md already says to destroy first rather than switch modes on a running cluster.
+  - **Not fixed here (docs-only phase):** two descriptions still say a change "replaces all three nodes" without that exception: the `cpu_credits` variable in `deploy/terraform/cluster/variables.tf` and the `cpu_credits` input in `.github/workflows/deploy.yml`.
+- **Lesson:**
+  - **Destroy is part of the test, not an afterthought.** Leaving a cluster up costs money and changes what the next plan does.
+  - **Read the plan's counts against what you expect.** Here "1 add, 3 change" instead of "replace" was the only warning, and it was enough.
+  - **Test a migration path from the state that actually exists.** The trigger's design was checked from an empty state and from a state that already had the trigger, but not from the state of a cluster created before it.
+
+### I27. A deployment gate was approved twice
+
+- **Symptom:** during the run 2 session, an approval click on a workflow's `aws` environment gate showed GitHub's "problem approving one of the gates".
+- **Root cause:** a second approval of a gate that had already been approved, most likely from a page that had not refreshed.
+- **Evidence:** the error message. The workflow ran once, as approved, and nothing ran twice.
+- **Fix:** none needed; it was harmless. GitHub refuses the second approval.
+- **Lesson:** refresh the run page before approving. The required-reviewer gate protects against the opposite mistake, but a stale page can still mislead about what is waiting.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
@@ -1040,5 +1070,13 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **The idea:** a leader holding more shards than its share hands one to a less loaded peer. That needs a transfer protocol: catch the target up, then have it campaign with a hint so the old leader does not refuse it under stickiness.
   - **Why it waits:** it is not needed for correctness or stability, since there are no drops and latency is bounded.
   - **Seen again on AWS:** after the failover in incident I19, node 2 led all three shards on a CPU-throttled node.
+- **Throughput with two of three nodes.** In AWS failover run 2 (docs/aws.md, results run 2), the cluster committed 12.7 txn/s with node2 down, against 124.2 before the kill and 95.5 after the rejoin.
+  - **Evidence so far:** CloudWatch `CPUUtilization` (5-minute average, basic monitoring) peaked at 78% on one node, against 42% and 52% on the others. The test lasted about 2 minutes, so the true peak was likely higher.
+  - **Hypothesis (unproven):** with two nodes every commit needs both survivors, so the slower survivor sets the pace. node1 also runs loadgen, Prometheus, Grafana and Jaeger, and after the failover it led shard 0 as well.
+  - **To prove or refute it:**
+    - rerun with loadgen on a dedicated client instance;
+    - record per-process CPU (paxosd, loadgen, each observability container) at 1 s resolution on every node;
+    - optionally rerun with observability off on node1.
+  - **If it holds:** the client and observability placement on AWS, not the protocol, explains most of the drop.
 - **Mutual TLS between nodes and for clients.** Each node gets a certificate signed by a cluster CA; peers verify each other's node ID from the certificate, and clients verify the server (optionally with client certificates). Replaces the insecure credentials from entry 16.
 - **Resharding.** Move from hash sharding to range sharding with a replicated shard map, and split or move ranges while transactions keep running (for example by preparing a move as a transaction on both the old and new owner).
