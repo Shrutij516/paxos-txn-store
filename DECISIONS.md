@@ -743,6 +743,109 @@ Things that broke after they were merged, and why. Every phase that finds someth
   - **A benchmark baseline belongs to its machine.** Before comparing against a number from another session, re-measure the baseline in the same session and record the host with every run.
   - **Make the negative test independent of the machine.** A negative test that depends on the machine being slow can pass vacuously. Make it create its own overload instead.
 
+### I8. The failover script refused a good image: "no /loadgen"
+
+- **Symptom:** in the first Docker run of the AWS-mode node steps, `node start` with the newly built image (which has `/loadgen`) stopped with "the running image has no /loadgen".
+- **Root cause:** the check ran `docker run --entrypoint /loadgen <image> -h | grep -q 'Usage of loadgen'`.
+  - **`loadgen -h` exits 1:** `flag.ErrHelp` reaches `log.Fatalf`.
+  - **`pipefail` was set,** so the pipeline failed on docker's exit status even though grep matched.
+- **Evidence:** the same image ran `/loadgen -h` by hand and printed its usage; the old image (no `/loadgen`) failed the same way, so the check could not tell the two apart.
+- **Fix:** capture the output first (`usage=$(docker run … -h 2>&1 || true)`), then test it for "Usage of loadgen". Re-run: the new image passes, the pre-9c image is refused.
+- **Lesson:**
+  - **Know the probe's exit code.** A probe of a binary's presence must not depend on that binary's exit code for `-h`; check the output.
+  - **Watch `pipefail` in checks.** Under `pipefail`, `cmd | grep -q` also tests `cmd`.
+
+### I9. The phase table's "Aborted" column was 0 in every phase while the run had 70 aborts
+
+- **Symptom:** the first local summary showed 0 aborted in each of the four phases, against 70 aborted attempts for the whole window.
+- **Root cause:** the phase rows counted timeline entries with outcome `aborted`. A timeline entry is a whole `client.Run`, which retries aborted attempts. Only a transaction whose every attempt aborted is `aborted`, and with 20 attempts that practically never happens. The whole-window figure comes from loadgen's report, which counts attempts.
+- **Evidence:** phases 0+0+0+0 against 70 in `report.json`. After the fix, the phases sum to 71 (one attempt sits on the window edge).
+- **Fix:** `aws-failover-report.py` counts aborted attempts per phase from `history.jsonl`. Attempt finish times are converted to wall-clock time with the timeline header's `start_unix_ms`. The column is renamed "Aborted attempts", and errors per phase are explained as transactions that never committed.
+- **Lesson:** two numbers in one table must count the same unit. Check that the parts add up to the whole before trusting a breakdown.
+
+### I10. The timeline's outcome names did not match the history's
+
+- **Symptom:** `TestTimeline` failed: expected `"outcome":"failed"`, got `"error"`.
+- **Root cause:** the code correctly reused the history's outcome constants, whose `Failed` value is the string `"error"`. The test expectation and the doc comment assumed the constant's name was its value.
+- **Evidence:** `history/history.go`: `Failed = "error"`.
+- **Fix:** the test expects `"error"`, and the comment says the outcomes are "as in the history".
+- **Lesson:** when a format reuses another's constants, write expectations from the constants' values, not their names.
+
+### I11. The node upload would have failed: `tar --wildcards` does not expand when creating
+
+- **Symptom:** found in review, before any run. Reproduced afterwards: `tar -C /data -czf - --wildcards 'node-*-shard-*.db*'` exits 2 with "Cannot stat: No such file or directory".
+- **Root cause:** `--wildcards` applies to member names when extracting or listing. When creating, the arguments are file names, and nothing expands the pattern.
+- **Evidence:** the repro on a scratch directory: the old form failed. The new form, `(cd /data && tar -czf - node-*-shard-*.db*)`, archived `node-1-shard-0.db` and its `-wal`.
+- **Fix:** let the shell expand the glob in the data directory.
+- **Lesson:** the AWS-only path cannot run here, so every command in it needs a local repro, even one that looks obviously right.
+
+### I12. The first draft of the failover script carried a broken, unused function
+
+- **Symptom:** found in review. `aws_cluster()` set `IMAGE` from a command substitution that ran an unrelated SSM help call, and duplicated the instance lookup that `run_main` does properly.
+- **Root cause:** a first draft of the instance discovery, superseded inside `run_main` but not deleted. It was never called, so no test would have hit it.
+- **Evidence:** the function in the draft; no callers.
+- **Fix:** removed. One code path discovers the nodes and reads the image digest from node 1.
+- **Lesson:** delete superseded drafts at once. Dead code in a deploy script is a trap for the next edit, which may well call it.
+
+### I13. A slow rejoin would have skipped the history check
+
+- **Symptom:** found in review. In `aws-loadtest.yml` the rejoin-bound step came before the chaos-checker step. A rejoin over 30 s would fail the job and skip the safety check of the run.
+- **Root cause:** steps were added in the order they were written, and a failed step skips the ones after it.
+- **Evidence:** the step order in the first version of the workflow.
+- **Fix:** the checkers run right after the summary, and the rejoin gate runs after them with `if: ${{ !cancelled() }}`. The artifact upload stays `if: always()`.
+- **Lesson:** order gates so that a performance failure never hides a correctness result. Correctness checks run first.
+
+### I14. The destroy workflow's leftover check would have flagged the new bucket
+
+- **Symptom:** found in review. `scripts/aws-leftovers.sh`, run by `destroy.yml`, warns on every resource tagged `Project=paxos-txn-store` except the bootstrap's state bucket, deploy role and OIDC provider. The new load-test bucket carries the tag through the bootstrap's `default_tags`.
+- **Root cause:** a new bootstrap resource, and a list of expected leftovers kept in a separate file.
+- **Evidence:** the `case` patterns in `aws-leftovers.sh`, and the bootstrap provider's `default_tags`.
+- **Fix:** `arn:aws:s3:::paxos-txn-store-loadtest-*` is expected. The docs' cleanup check says so too.
+- **Lesson:** adding a resource means checking every place that lists resources: cleanup checks, docs counts, expected plans.
+
+### I15. A lint run reported success while tflint had failed
+
+- **Symptom:** running tflint on both stacks printed `Failed to initialize plugins; Plugin "aws" not found`, followed by `tflint bootstrap rc=0` and `tflint cluster rc=0`.
+- **Root cause:**
+  - **The failure:** the run overrode `TFLINT_PLUGIN_DIR` with a directory that had no plugin.
+  - **Why it looked green:** the loop piped tflint into `tail` and printed `$?`, which was `tail`'s status.
+- **Evidence:** the output above. Re-run with the default plugin directory and without the pipe: both stacks clean, with real exit codes.
+- **Fix:** tflint re-run correctly, clean. Checks whose status matters run unpiped, or with `PIPESTATUS`.
+- **Lesson:**
+  - **Never pipe a check into `tail` when its exit status is the result.**
+  - **Read the output, not just the status.** An error message next to "rc=0" is a red flag.
+
+### I16. A local test harness left orphaned paxosd processes
+
+- **Symptom:** after testing the SSM command encoding against three scratch processes, `kill $(cat pidfile)` reported "No such process" for all three. `pgrep` then showed the paxosd processes still there (as zombies once killed by name).
+- **Root cause:** the processes were started from an interactive shell with job control on, where each background job is its own process group leader. `setsid` then forks to make a new session, so `$!` was the PID of the short-lived `setsid` parent, not paxosd.
+- **Evidence:** "No such process" for the saved PIDs; `pgrep -fa paxosd` afterwards.
+- **Fix:** cleaned up with `pkill -f`. The script's own local mode is not affected: a non-interactive script has no job control, so `setsid` execs without forking. Its kill step did kill the right node in both local runs.
+- **Lesson:** `setsid cmd & echo $!` is reliable only without job control. For a harness, record the PID from inside, or use `setsid -f` with a pid file the process writes.
+
+### I17. Measuring the deploy policy's size put the working tree at risk
+
+- **Symptom:** to measure the policy's size on `main`, the uncommitted 9c changes were set aside with `git stash` while a copy of the old bootstrap was taken, then restored with `git stash pop`. The probe also failed twice:
+  - `terraform test` rejects an assertion with `condition = false`;
+  - the copy of `main`'s bootstrap had no provider cache.
+- **Root cause:** a shortcut. Stashing the whole working tree to read old files, when `git archive origin/main …` reads them without touching it.
+- **Evidence:** `git status` after the pop showed every change intact; untracked files were never stashed. Nothing was lost.
+- **Fix:**
+  - **Reading old files:** `git archive origin/main deploy/terraform/bootstrap | tar -x` into the scratchpad.
+  - **The probe:** an assertion that references the policy and can never hold, with the length in its message.
+  - **Provider cache:** copied from the working copy.
+
+  Measured: 6,739 characters on `main`, 7,059 on this branch.
+- **Lesson:** never move uncommitted work out of the way to look at another revision. `git show` and `git archive` read any revision without touching the working tree.
+
+### I18. The local summary printed "Image `None`"
+
+- **Symptom:** the first local summary's first line read "Image `None`".
+- **Root cause:** a local run has no image, and Python formatted the missing value as `None`.
+- **Evidence:** the first local `summary.md`.
+- **Fix:** the summary says "Local processes" when there is no image.
+- **Lesson:** run every output path once, including the local one that "only tests", and read what a person would read.
+
 ## Future work
 
 - **Power-loss testing with LazyFS.** The simulator and the SIGKILL test cover process crashes, where the OS page cache survives. They cannot show what happens when unsynced data in the page cache is lost. LazyFS (a FUSE file system from the Jepsen project that keeps writes in its own cache until fsync and can drop everything unsynced on command) would let a test cut "power" at arbitrary points and check that every acknowledged promise, vote and commit survives. That would test the argument in entry 12 instead of relying on it, and would catch a regression to `synchronous=NORMAL`.
